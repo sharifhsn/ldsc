@@ -25,13 +25,23 @@ pub fn scan_ldscore(path: &str) -> Result<LazyFrame> {
     Ok(lf)
 }
 
+/// Build a per-chromosome path from `prefix`, `chr`, and `suffix`.
+///
+/// If `prefix` contains `@`, it is used as a placeholder for the chromosome number
+/// (matching Python LDSC behaviour: `ld/chr@_scores` → `ld/chr22_scores.l2.ldscore.gz`).
+/// Otherwise the chromosome number is appended after the prefix.
+fn make_chr_path(prefix: &str, chr: u8, suffix: &str) -> String {
+    if prefix.contains('@') {
+        format!("{}{}", prefix.replace('@', &chr.to_string()), suffix)
+    } else {
+        format!("{}{}{}", prefix, chr, suffix)
+    }
+}
+
 /// Return the chromosomes (1–22) for which `{prefix}{chr}{suffix}` exists.
 pub fn get_present_chrs(prefix: &str, suffix: &str) -> Vec<u8> {
     (1u8..=22)
-        .filter(|chr| {
-            let path = format!("{}{}{}", prefix, chr, suffix);
-            std::path::Path::new(&path).exists()
-        })
+        .filter(|chr| std::path::Path::new(&make_chr_path(prefix, *chr, suffix)).exists())
         .collect()
 }
 
@@ -47,7 +57,7 @@ pub fn read_m_total(prefix: &str, suffix: &str) -> Result<f64> {
 
     let mut total = 0.0f64;
     for chr in chrs {
-        let path = format!("{}{}{}", prefix, chr, suffix);
+        let path = make_chr_path(prefix, chr, suffix);
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading M file '{}'", path))?;
         let m: f64 = content
@@ -76,7 +86,7 @@ pub fn read_m_vec(prefix: &str, suffix: &str) -> Result<Vec<f64>> {
 
     let mut totals: Vec<f64> = Vec::new();
     for chr in chrs {
-        let path = format!("{}{}{}", prefix, chr, suffix);
+        let path = make_chr_path(prefix, chr, suffix);
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading M file '{}'", path))?;
         let vals: Vec<f64> = content
@@ -113,7 +123,7 @@ pub fn concat_chrs(prefix: &str, suffix: &str) -> Result<LazyFrame> {
     let frames: Vec<LazyFrame> = chrs
         .iter()
         .map(|chr| {
-            let path = format!("{}{}{}", prefix, chr, suffix);
+            let path = make_chr_path(prefix, *chr, suffix);
             LazyCsvReader::new(path.as_str().into())
                 .with_separator(b'\t')
                 .with_has_header(true)
