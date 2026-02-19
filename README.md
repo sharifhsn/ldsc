@@ -11,6 +11,52 @@ identical numerical output and a 7× speedup on LD score computation.
 
 ---
 
+## Quick Start
+
+The typical LDSC workflow — preprocess summary statistics, then estimate heritability or genetic
+correlation — mirrors the [upstream wiki tutorial](https://github.com/bulik/ldsc/wiki/Heritability-and-Genetic-Correlation).
+
+**Step 1: Download pre-computed European LD scores** (skip `ldscore` for European GWAS)
+
+```bash
+wget https://data.broadinstitute.org/alkesgroup/LDSCORE/eur_w_ld_chr.tar.bz2
+wget https://data.broadinstitute.org/alkesgroup/LDSCORE/w_hm3.snplist.bz2
+tar -jxvf eur_w_ld_chr.tar.bz2   # inner .l2.ldscore.gz files are already gzip-compressed
+bunzip2 w_hm3.snplist.bz2
+```
+
+**Step 2: Pre-process summary statistics**
+
+```bash
+ldsc munge-sumstats \
+  --sumstats my_gwas.txt \
+  --n 50000 \
+  --merge-alleles w_hm3.snplist \
+  --out my_trait
+```
+
+**Step 3a: Estimate heritability**
+
+```bash
+ldsc h2 \
+  --h2 my_trait.sumstats.gz \
+  --ref-ld-chr eur_w_ld_chr/ \
+  --w-ld-chr eur_w_ld_chr/ \
+  --out my_trait_h2
+```
+
+**Step 3b: Estimate genetic correlation**
+
+```bash
+ldsc rg \
+  --rg trait1.sumstats.gz,trait2.sumstats.gz \
+  --ref-ld-chr eur_w_ld_chr/ \
+  --w-ld-chr eur_w_ld_chr/ \
+  --out trait1_vs_trait2
+```
+
+---
+
 ## Installation
 
 ```bash
@@ -63,7 +109,13 @@ null value is (e.g. `BETA,0`, `OR,1`, `Z,0`). Without this flag the tool auto-de
 
 ### ldscore
 
-Computes LD scores from a PLINK binary file set.
+Computes LD scores from a PLINK binary file set (`.bed/.bim/.fam`).
+
+> **Tip for European GWAS:** Pre-computed 1000G phase 3 LD scores are available from the
+> [Broad LDSCORE page](https://data.broadinstitute.org/alkesgroup/LDSCORE/). Download
+> `eur_w_ld_chr.tar.bz2`; after `tar -jxvf`, the inner `.l2.ldscore.gz` files are already
+> gzip-compressed and work directly with `ldsc`. Non-European populations require computing
+> your own LD scores from an appropriate reference panel.
 
 ```bash
 ldsc ldscore \
@@ -90,14 +142,24 @@ Estimates SNP heritability.
 ```bash
 ldsc h2 \
   --h2 trait.sumstats.gz \
-  --ref-ld-chr eur_ldscores/chr \
-  --w-ld-chr eur_ldscores/chr \
+  --ref-ld-chr eur_w_ld_chr/ \
+  --w-ld-chr eur_w_ld_chr/ \
   --out results
 ```
+
+`--ref-ld-chr prefix` appends the chromosome number then `.l2.ldscore.gz`. So
+`--ref-ld-chr eur_w_ld_chr/` reads `eur_w_ld_chr/1.l2.ldscore.gz` … `eur_w_ld_chr/22.l2.ldscore.gz`.
+If the chromosome number falls in the middle of the filename, use `@` as a placeholder:
+`--ref-ld-chr ld/chr@_scores` → `ld/chr1_scores.l2.ldscore.gz`, etc.
+The same convention applies to `--w-ld-chr`.
 
 Common options: `--no-intercept`, `--intercept-h2 VALUE`, `--two-step 30`, `--chisq-max 80`,
 `--samp-prev 0.1 --pop-prev 0.01` (liability-scale conversion),
 `--print-coefficients` (partitioned h2: per-annotation τ and enrichment).
+
+> **Partitioned h2 note:** The standard baseline model workflow from the upstream wiki requires
+> `--overlap-annot` (for overlapping annotation categories) and `--frqfile-chr` (for per-category
+> M_5_50 computation). These flags are not yet implemented; see [Unimplemented Features](#unimplemented-features).
 
 ### rg
 
@@ -106,10 +168,12 @@ Estimates genetic correlations across all pairs from a list of summary statistic
 ```bash
 ldsc rg \
   --rg trait1.sumstats.gz,trait2.sumstats.gz,trait3.sumstats.gz \
-  --ref-ld-chr eur_ldscores/chr \
-  --w-ld-chr eur_ldscores/chr \
+  --ref-ld-chr eur_w_ld_chr/ \
+  --w-ld-chr eur_w_ld_chr/ \
   --out results
 ```
+
+`--ref-ld-chr` / `--w-ld-chr` follow the same prefix convention as `h2` (see above).
 
 Common options: `--no-intercept`, `--intercept-gencov 0.0,0.0` (per-pair), `--two-step 30`,
 `--samp-prev` / `--pop-prev` (comma-separated, one value per input file).
@@ -153,6 +217,22 @@ Correctness: all 1,664,851 SNPs in the full 1000G genome verified to match Pytho
 ---
 
 ## Differences from Python
+
+### Command structure
+
+Python LDSC consists of three separate scripts; this crate consolidates them into subcommands of a
+single `ldsc` binary:
+
+| Python | Rust |
+|--------|------|
+| `python munge_sumstats.py --sumstats … --out …` | `ldsc munge-sumstats --sumstats … --out …` |
+| `python ldsc.py --l2 --bfile … --out …` | `ldsc ldscore --bfile … --out …` |
+| `python ldsc.py --h2 … --ref-ld-chr …` | `ldsc h2 --h2 … --ref-ld-chr …` |
+| `python ldsc.py --rg … --ref-ld-chr …` | `ldsc rg --rg … --ref-ld-chr …` |
+| `python make_annot.py --bimfile … --bed-file …` | `ldsc make-annot --bimfile … --bed-file …` |
+
+Python's `--l2` flag (LD score estimation mode) becomes the `ldscore` subcommand. The `--h2` and
+`--rg` flags (regression modes) become `h2` and `rg` subcommands.
 
 ### Flag renames
 
