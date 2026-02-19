@@ -8,15 +8,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # sccache wraps rustc and caches individual compilation units.
-  # CARGO_INCREMENTAL=0 is required: incremental artifacts conflict with sccache.
-  # SCCACHE_GHA_ENABLED is intentionally NOT set: with it enabled, sccache calls
-  # the GHA artifact cache API on every rustc invocation — if the API is down the
-  # server fails to start and the entire build fails.  Without it, sccache uses a
-  # local disk cache; mozilla-actions/sccache-action saves/restores that cache via
-  # actions/cache in its post-step, which is resilient to transient API outages.
-  RUSTC_WRAPPER: "sccache"
   CARGO_INCREMENTAL: "0"
+  # Build OpenBLAS with runtime CPU dispatch so the binary works on any GHA
+  # runner generation and the cmake artifacts can be safely cached across jobs
+  # that may land on different physical machines (prevents SIGILL on cache hit).
+  OPENBLAS_DYNAMIC_ARCH: "1"
 
 jobs:
   test:
@@ -29,26 +25,15 @@ jobs:
         with:
           components: clippy
 
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-
-      - name: Cache cargo registry and git sources
-        uses: actions/cache@v4
+      # Caches ~/.cargo/registry, ~/.cargo/git, and target/ (including the
+      # cmake-built OpenBLAS static library).  Key includes rustc version and
+      # Cargo.lock hash; OPENBLAS_DYNAMIC_ARCH is baked into the key so a
+      # config change triggers a clean rebuild.
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-
-      # Cache the cmake-built OpenBLAS static library.
-      # sccache handles Rust artifacts; cmake output lives outside its scope.
-      - name: Cache OpenBLAS cmake artifacts
-        uses: actions/cache@v4
-        with:
-          path: target/release/build
-          key: ${{ runner.os }}-openblas-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-openblas-
+          env-vars: OPENBLAS_DYNAMIC_ARCH
+          cache-on-failure: true
 
       - name: Install BLAS build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake gfortran
