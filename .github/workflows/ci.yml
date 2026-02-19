@@ -8,6 +8,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # sccache wraps rustc and caches individual compilation units in GHA cache.
+  # CARGO_INCREMENTAL=0 is required: incremental artifacts conflict with sccache.
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   test:
@@ -20,23 +25,35 @@ jobs:
         with:
           components: clippy
 
-      - name: Install BLAS build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake gfortran
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
 
-      - name: Cache cargo registry
+      - name: Cache cargo registry and git sources
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Cache the cmake-built OpenBLAS static library.
+      # sccache handles Rust artifacts; cmake output lives outside its scope.
+      - name: Cache OpenBLAS cmake artifacts
+        uses: actions/cache@v4
+        with:
+          path: target/release/build
+          key: ${{ runner.os }}-openblas-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-openblas-
+
+      - name: Install BLAS build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake gfortran
 
       - name: cargo check
         run: cargo check --release
 
       - name: cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --release -- -D warnings
 
       - name: cargo test
-        run: cargo test  # ldscore_smoke is #[ignore] — needs large BED file
+        run: cargo test --release  # ldscore_smoke is #[ignore] — needs large BED file
