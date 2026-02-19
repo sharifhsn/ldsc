@@ -8,9 +8,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # sccache wraps rustc and caches individual compilation units in GHA cache.
+  # sccache wraps rustc and caches individual compilation units.
   # CARGO_INCREMENTAL=0 is required: incremental artifacts conflict with sccache.
-  SCCACHE_GHA_ENABLED: "true"
+  # SCCACHE_GHA_ENABLED is intentionally NOT set: with it enabled, sccache calls
+  # the GHA artifact cache API on every rustc invocation — if the API is down the
+  # server fails to start and the entire build fails.  Without it, sccache uses a
+  # local disk cache; mozilla-actions/sccache-action saves/restores that cache via
+  # actions/cache in its post-step, which is resilient to transient API outages.
   RUSTC_WRAPPER: "sccache"
   CARGO_INCREMENTAL: "0"
 
