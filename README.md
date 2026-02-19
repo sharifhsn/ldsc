@@ -72,6 +72,46 @@ sudo apt-get install cmake gfortran libgfortran-dev
 
 ---
 
+## Docker
+
+Pre-built images are published to the [GitHub Container Registry](https://ghcr.io/sharifhsn/ldsc)
+on every push to `main` and for each version tag:
+
+```bash
+# Latest stable release
+docker pull ghcr.io/sharifhsn/ldsc:latest
+
+# Specific version
+docker pull ghcr.io/sharifhsn/ldsc:0.1.0
+
+# Run with local data mounted
+docker run --rm \
+  -v /path/to/data:/data \
+  ghcr.io/sharifhsn/ldsc:latest \
+  h2 --h2         /data/trait.sumstats.gz \
+     --ref-ld-chr /data/eur_w_ld_chr/ \
+     --w-ld-chr   /data/eur_w_ld_chr/ \
+     --out        /data/results
+```
+
+Version tags (`v1.2.3`) produce `:1.2.3`, `:1.2`, and `:latest` image tags.
+Pushes to `main` produce a `:main` tag and a short-SHA tag (`:sha-XXXXXXX`).
+
+### Building the image locally
+
+Requires Docker with BuildKit (default since Docker 23):
+
+```bash
+docker build -t ldsc .
+```
+
+The multi-stage `Dockerfile` uses [cargo-chef](https://github.com/LukeMathWalker/cargo-chef) to
+cache dependency compilation in a separate layer, so incremental rebuilds only recompile changed
+source files. The runtime image is `debian:bookworm-slim` plus `libgfortran5` for the
+statically-linked OpenBLAS.
+
+---
+
 ## Building from source
 
 Requires a Rust toolchain (≥ 1.85; edition 2024 features used). OpenBLAS is linked statically — no
