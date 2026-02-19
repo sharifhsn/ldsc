@@ -4,7 +4,7 @@ version       = "0.1.0"
 edition       = "2024"
 description   = "LD Score Regression — fast Rust reimplementation of Bulik-Sullivan et al. LDSC"
 license       = "GPL-3.0-only"
-authors       = ["Sharif Amlani"]
+authors       = ["Sharif Haason"]
 repository    = "https://github.com/sharifhsn/ldsc"
 homepage      = "https://github.com/sharifhsn/ldsc"
 documentation = "https://github.com/sharifhsn/ldsc#readme"
@@ -52,7 +52,6 @@ flate2 = "1"
 opt-level     = 3
 lto           = "thin"
 codegen-units = 1
-debug         = false
 
 [dev-dependencies]
 tempfile = "3"
