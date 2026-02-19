@@ -1,0 +1,4 @@
+# bed-reader 1.0.6 → pyo3 0.22 → fails to detect Python 3.14+.
+# This flag instructs pyo3 to build against the stable ABI regardless.
+[env]
+PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"

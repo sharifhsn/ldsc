@@ -1,0 +1,51 @@
+{
+  "apiKeyHelper": "bash -c 'source .env && echo $ANTHROPIC_API_KEY'",
+  "permissions": {
+    "allow": [
+      "Read(//home/sharif/Code/ldsc/**)",
+      "Bash(uv run:*)",
+      "Bash(uv --version:*)",
+      "Bash(uv sync:*)",
+      "Bash(docker system:*)",
+      "Bash(docker-compose up:*)",
+      "WebFetch(domain:docs.astral.sh)",
+      "Read(//etc/**)",
+      "Bash(doas tee:*)",
+      "Bash(git -C /home/sharif/Code/ldsc log --oneline -20)",
+      "Bash(git -C /home/sharif/Code/ldsc branch:*)",
+      "Bash(cargo new:*)",
+      "Bash(cargo check:*)",
+      "mcp__plugin_rust-skills_actionbook__search_actions",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:docs.pola.rs)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo check:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(uv python:*)",
+      "Bash(conda env:*)",
+      "Read(//home/sharif/.conda/envs/**)",
+      "Bash(conda run:*)",
+      "Bash(/home/sharif/.conda/envs/ldm/bin/python:*)",
+      "Bash(uv venv:*)",
+      "Bash(uv pip install:*)",
+      "Bash(/home/sharif/Code/ldsc/.venv/bin/python:*)",
+      "Bash(plink1.9:*)",
+      "Bash(/home/sharif/Code/ldsc/ldsc/target/release/ldsc ldscore:*)",
+      "Bash(zcat:*)",
+      "Bash(cargo update:*)",
+      "Bash(cargo search:*)",
+      "Bash(bash smoke_test.sh 0.2)",
+      "Bash(bash smoke_test.sh)",
+      "Bash(bash compare_py_rust.sh)"
+    ],
+    "additionalDirectories": [
+      "/home/sharif/Code/ldsc",
+      "/home/sharif/.claude/projects/-home-sharif-Code-ldsc/memory"
+    ]
+  },
+  "enabledPlugins": {
+    "rust-skills@rust-skills": true
+  }
+}

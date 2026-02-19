@@ -1,0 +1,58 @@
+[package]
+name          = "ldsc"
+version       = "0.1.0"
+edition       = "2024"
+description   = "LD Score Regression — fast Rust reimplementation of Bulik-Sullivan et al. LDSC"
+license       = "GPL-3.0-only"
+authors       = ["Sharif Amlani"]
+repository    = "https://github.com/sharifhsn/ldsc"
+homepage      = "https://github.com/sharifhsn/ldsc"
+documentation = "https://github.com/sharifhsn/ldsc#readme"
+readme        = "README.md"
+keywords      = ["genomics", "gwas", "statistics", "bioinformatics", "ldsc"]
+categories    = ["command-line-utilities", "science"]
+exclude       = ["data/*", "*.bed", "*.bim", "*.fam", "settings*.json", "test_rust.sh"]
+
+[dependencies]
+# BED file reading — mmap-based, handles 100+ GB files without loading into RAM.
+# Uses memmap2 internally; only touched pages are paged in by the OS.
+bed-reader = { version = "1", default-features = false }
+
+# Data munging — replaces pandas in munge_sumstats.py.
+# decompress feature required for transparent .gz decompression in LazyCsvReader.
+polars = { version = "0.53", features = ["lazy", "csv", "parquet", "decompress"] }
+
+# Dense matrix algebra — replaces numpy arrays in irwls.py / jackknife.py.
+# Pin to 0.16: bed-reader 1.0.6 requires ndarray ^0.16.1 and
+# ndarray-linalg 0.17 requires ndarray ^0.16.0 — both satisfied by "0.16".
+ndarray = { version = "0.16", features = ["rayon", "blas"] }
+ndarray-linalg = { version = "0.17", features = ["openblas-static"] }
+
+# BLAS backend for ndarray::dot() matrix multiply — reuses the same OpenBLAS
+# that ndarray-linalg already links statically.
+blas-src = { version = "0.10", default-features = false, features = ["openblas"] }
+
+# Data-parallelism — parallelises block jackknife (replaces sequential for-loop + GIL)
+rayon = "1"
+
+# Statistical distributions — replaces scipy.stats.chi2 for p-value derivation.
+statrs = "0.18"
+
+# CLI argument parsing — replaces argparse in ldsc.py and munge_sumstats.py
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Gzip compression for output files (.ldscore.gz, .sumstats.gz)
+flate2 = "1"
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+debug         = false
+
+[dev-dependencies]
+tempfile = "3"
