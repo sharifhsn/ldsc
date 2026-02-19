@@ -7,13 +7,13 @@
 #   bash test_rust.sh [--build]
 #
 # For ldscore/h2/rg tests, expects 1000G reference data at:
-#   ../data/1000G_phase3_common_norel.{bed,bim,fam}
+#   data/1000G_phase3_common_norel.{bed,bim,fam}
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$SCRIPT_DIR/target/release/ldsc"
-BFILE="$SCRIPT_DIR/../data/1000G_phase3_common_norel"
+BFILE="$SCRIPT_DIR/data/1000G_phase3_common_norel"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -233,7 +233,7 @@ run_test "--gene-set-file + --gene-coord-file" \
 if [[ ! -f "${BFILE}.bim" ]]; then
     echo
     echo "  Skipping ldscore/h2/rg: data not found at ${BFILE}.{bed,bim,fam}"
-    echo "  Place 1000G_phase3_common_norel.{bed,bim,fam} in ../data/ to enable."
+    echo "  Place 1000G_phase3_common_norel.{bed,bim,fam} in data/ to enable."
 else
     # Extract chr22 SNP list and BIM (no Python — pure awk)
     awk '$1 == 22 {print $2}' "${BFILE}.bim" > "$TMP/chr22_snps.txt"
