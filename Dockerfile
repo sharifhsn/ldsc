@@ -14,7 +14,10 @@
 # only application source changes.
 
 # ── base: toolchain + tools ───────────────────────────────────────────────────
-FROM rust:1.85 AS base
+# Use the latest stable Rust so build-tool transitive deps (cargo-chef, sccache)
+# are always satisfied.  The project MSRV (1.85) constrains *users*, not this
+# build image; the compiled binary is independent of the toolchain version.
+FROM rust:1 AS base
 
 # OpenBLAS is compiled from source (ndarray-linalg openblas-static feature)
 # and statically linked into the final binary.
