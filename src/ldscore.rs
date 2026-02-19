@@ -706,7 +706,7 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
             mat
         };
 
-        let out_path = format!("{}.{}.l2.ldscore.gz", args.out, chr);
+        let out_path = format!("{}{}.l2.ldscore.gz", args.out, chr);
         write_ldscore_refs(&out_path, &chr_snps, &chr_l2, &col_names)
             .with_context(|| format!("writing output for chr {}", chr))?;
 
@@ -749,7 +749,7 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
             }
         };
 
-        let m_path = format!("{}.{}.l2.M", args.out, chr);
+        let m_path = format!("{}{}.l2.M", args.out, chr);
         std::fs::write(
             &m_path,
             m_vals
@@ -761,7 +761,7 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
         )
         .with_context(|| format!("writing M file '{}'", m_path))?;
 
-        let m_5_50_path = format!("{}.{}.l2.M_5_50", args.out, chr);
+        let m_5_50_path = format!("{}{}.l2.M_5_50", args.out, chr);
         std::fs::write(
             &m_5_50_path,
             m_5_50_vals
