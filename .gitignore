@@ -9,3 +9,5 @@
 .env
 data/
 .claude/
+
+*.sh
