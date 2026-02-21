@@ -95,6 +95,66 @@ version or HM3 list. The direction, sign, and order of magnitude are all correct
 All flag renames work as expected (`--a1-col`, `--a2-col`, auto-detection of `BETA,0`).
 The `--merge-alleles` SNP count matches upstream Python to within 0.015%.
 
+## GWASTutorial 08_LDSC (2026-02-21)
+
+Reference: https://cloufield.github.io/GWASTutorial/08_LDSC/
+
+### Downloads
+
+The tutorial uses requester-pays buckets. `gsutil` on this host fails because it requires
+Python 3.9–3.13 (this host has Python 3.14). I used the equivalent `gcloud storage cp`
+with `--billing-project=ldsc-488020`, which succeeded.
+
+Commands (executed):
+
+```bash
+mkdir -p /tmp/ldsc_tutorial_08/resource
+cd /tmp/ldsc_tutorial_08
+wget -O BBJ_LDLC.txt.gz http://jenger.riken.jp/61analysisresult_qtl_download/
+wget -O BBJ_HDLC.txt.gz http://jenger.riken.jp/47analysisresult_qtl_download/
+cd resource
+gcloud storage cp --billing-project=ldsc-488020 \
+  gs://broad-alkesgroup-public-requester-pays/LDSCORE/w_hm3.snplist.bz2 \
+  gs://broad-alkesgroup-public-requester-pays/LDSCORE/eas_ldscores.tar.bz2 .
+bunzip2 w_hm3.snplist.bz2
+tar -jxvf eas_ldscores.tar.bz2
+```
+
+### Commands run
+
+```bash
+LDSC=/home/sharif/Code/ldsc/target/release/ldsc
+EAS=/tmp/ldsc_tutorial_08/resource/eas_ldscores/
+HM3=/tmp/ldsc_tutorial_08/resource/w_hm3.snplist
+
+$LDSC munge-sumstats --sumstats BBJ_HDLC.txt.gz --merge-alleles $HM3 \
+  --a1-col ALT --a2-col REF --out BBJ_HDLC
+$LDSC munge-sumstats --sumstats BBJ_LDLC.txt.gz --merge-alleles $HM3 \
+  --a1-col ALT --a2-col REF --out BBJ_LDLC
+
+$LDSC h2 --h2 BBJ_HDLC.sumstats.gz --ref-ld-chr $EAS --w-ld-chr $EAS --out BBJ_HDLC_h2
+$LDSC h2 --h2 BBJ_LDLC.sumstats.gz --ref-ld-chr $EAS --w-ld-chr $EAS --out BBJ_LDLC_h2
+
+$LDSC rg --rg BBJ_HDLC.sumstats.gz,BBJ_LDLC.sumstats.gz \
+  --ref-ld-chr $EAS --w-ld-chr $EAS --out BBJ_rg
+```
+
+### Results
+
+| Metric | HDL-C | LDL-C |
+|---|---|---|
+| SNPs after munge | 1,020,532 | 1,020,532 |
+| SNPs after merge | 1,012,193 | 1,012,193 |
+| h² (observed) | 0.1123 (SE 0.0352) | 0.0789 (SE 0.0207) |
+| Intercept | 1.1144 | 1.0230 |
+
+rg (HDL-C vs LDL-C): **0.1662**
+
+### Unimplemented sections
+
+The tutorial’s partitioned heritability and cell-type-specific workflows still require
+`--overlap-annot`, `--frqfile-chr`, and `--h2-cts`, which are not implemented in Rust.
+
 ## Wiki-Based Validation Checklist (Python LDSC → Rust)
 
 This section maps the upstream `ldsc.wiki` expectations to the Rust CLI and notes
