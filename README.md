@@ -6,7 +6,7 @@
 [![MSRV: 1.85](https://img.shields.io/badge/rustc-1.85%2B-orange.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
 
 A compiled, statically-typed rewrite of [Bulik-Sullivan et al.'s LDSC](https://github.com/bulik/ldsc) in Rust.
-Implements five subcommands — `munge-sumstats`, `ldscore`, `h2`, `rg`, `make-annot` — with
+Implements six subcommands — `munge-sumstats`, `ldscore`, `h2`, `rg`, `make-annot`, `cts-annot` — with
 identical numerical output and a 7× speedup on LD score computation.
 
 ---
@@ -282,6 +282,20 @@ ldsc make-annot \
   --windowsize 100000
 ```
 
+### cts-annot
+
+Bins one or more continuous annotations into categories and writes a `.annot` file
+compatible with `ldscore --annot` (Python `--cts-bin` preprocessing).
+
+```bash
+ldsc cts-annot \
+  --bimfile my_data.bim \
+  --cts-bin DAF.txt,DIST.txt \
+  --cts-breaks 0.1,0.25,0.4x10,100,1000 \
+  --cts-names DAF,DIST_TO_GENE \
+  --annot-file cts.annot.gz
+```
+
 ---
 
 ## Performance
@@ -313,6 +327,7 @@ single `ldsc` binary:
 | `python ldsc.py --h2 … --ref-ld-chr …` | `ldsc h2 --h2 … --ref-ld-chr …` |
 | `python ldsc.py --rg … --ref-ld-chr …` | `ldsc rg --rg … --ref-ld-chr …` |
 | `python make_annot.py --bimfile … --bed-file …` | `ldsc make-annot --bimfile … --bed-file …` |
+| `python ldsc.py --cts-bin …` | `ldsc cts-annot …` |
 
 Python's `--l2` flag (LD score estimation mode) becomes the `ldscore` subcommand. The `--h2` and
 `--rg` flags (regression modes) become `h2` and `rg` subcommands.
@@ -338,6 +353,8 @@ Python's `--l2` flag (LD score estimation mode) becomes the `ldscore` subcommand
   streaming and ignores chunk size for munge.
 - **`--return-silly-things` / `--invert-anyway`**: accepted flags for CLI parity; Rust never clips
   results and always uses a least-squares solver.
+- **`--cts-bin` workflow**: implemented as a separate preprocessor (`ldsc cts-annot`), then
+  use `ldsc ldscore --annot`.
 
 ---
 

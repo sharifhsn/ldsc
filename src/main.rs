@@ -1,5 +1,6 @@
 mod blas;
 mod cli;
+mod cts_annot;
 mod irwls;
 mod jackknife;
 mod ldscore;
@@ -39,5 +40,6 @@ fn main() -> Result<()> {
         Command::H2(args) => regressions::run_h2(args),
         Command::Rg(args) => regressions::run_rg(args),
         Command::MakeAnnot(args) => make_annot::run(args),
+        Command::CtsAnnot(args) => cts_annot::run(args),
     }
 }

@@ -156,11 +156,7 @@ rs3\tA\tG\t1.5\t1000\n",
     .expect("write weight ldscore");
 
     let ldcts = dir.path().join("cts.ldcts");
-    fs::write(
-        &ldcts,
-        format!("CTS\t{}\n", cts.to_string_lossy()),
-    )
-    .expect("write ldcts");
+    fs::write(&ldcts, format!("CTS\t{}\n", cts.to_string_lossy())).expect("write ldcts");
 
     let status = Command::new(binary())
         .args([

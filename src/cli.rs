@@ -40,6 +40,8 @@ pub enum Command {
     Rg(RgArgs),
     /// Generate annotation files from BED regions or gene sets (replaces make_annot.py)
     MakeAnnot(MakeAnnotArgs),
+    /// Generate annotation files by binning continuous variables (Python --cts-bin)
+    CtsAnnot(CtsAnnotArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -508,4 +510,32 @@ pub struct MakeAnnotArgs {
     /// By default adjacent/overlapping intervals are merged.
     #[arg(long, default_value_t = false)]
     pub nomerge: bool,
+}
+
+// ---------------------------------------------------------------------------
+// cts-annot (continuous binning)
+// ---------------------------------------------------------------------------
+
+#[derive(Args)]
+pub struct CtsAnnotArgs {
+    /// PLINK .bim file listing the SNPs to annotate
+    #[arg(long)]
+    pub bimfile: String,
+
+    /// Comma-separated list of CTS files (SNP + value; no header)
+    #[arg(long)]
+    pub cts_bin: String,
+
+    /// Breakpoints for each CTS file: comma-separated per file, joined by 'x'.
+    /// Use N to denote negative values (Python compatibility).
+    #[arg(long)]
+    pub cts_breaks: String,
+
+    /// Optional names for each CTS variable (comma-separated).
+    #[arg(long)]
+    pub cts_names: Option<String>,
+
+    /// Output annotation file path (e.g., prefix.annot or prefix.annot.gz).
+    #[arg(long)]
+    pub annot_file: String,
 }

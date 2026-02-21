@@ -33,11 +33,21 @@ Run date: 2026-02-21
 - Implemented in `ldsc h2` via `--h2-cts`, `--ref-ld-chr-cts`, and `--print-all-cts`.
 - Uses the same default `chisq_max` heuristic as Python for partitioned regressions.
 
+### Continuous-annotation binning (`--cts-bin` workflow)
+
+**Python behavior**
+- Builds a one-hot annotation matrix by binning continuous values, then feeds it to LD score
+  estimation.
+
+**Rust status**
+- Implemented as a separate preprocessing step: `ldsc cts-annot`.
+- This generates a `.annot` file that is then used with `ldsc ldscore --annot`.
+- Keeping it separate avoids changes to the LD score hot path.
+
 ## Remaining Gaps
 
 These features remain unimplemented:
 1. `ldscore --pq-exp` (generalized per-allele weighting).
 2. `munge-sumstats --daner` / `--daner-n` (Ripke daner format).
 3. `ldscore --no-print-annot` (print suppression; low value).
-4. `ldscore --cts-bin` / `--cts-breaks` / `--cts-names` (continuous binning).
-5. `rg --intercept-h2` (fix per-trait h2 intercepts in rg).
+4. `rg --intercept-h2` (fix per-trait h2 intercepts in rg).
