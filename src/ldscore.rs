@@ -562,15 +562,7 @@ fn load_snp_set(path: &str) -> Result<HashSet<String>> {
     Ok(set)
 }
 
-unsafe extern "C" {
-    fn openblas_set_num_threads(num_threads: ::std::os::raw::c_int);
-}
-
 pub fn run(args: LdscoreArgs) -> Result<()> {
-    unsafe {
-        openblas_set_num_threads(args.blas_threads as i32);
-    }
-
     let mode = if let Some(kb) = args.ld_wind_kb {
         WindowMode::Kb(kb)
     } else if let Some(snp) = args.ld_wind_snp {

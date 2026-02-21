@@ -142,6 +142,17 @@ cargo build --release --no-default-features --features blas-openblas-system
 The system feature skips the OpenBLAS source build and links via `pkg-config`.
 Keep the default static build if you want a self-contained binary.
 
+### Runtime tuning (optional)
+
+The following global flags are available for performance tuning but are **not
+heavily battle-tested**. Use them only when needed:
+
+- `--blas-threads N`: OpenBLAS thread count (default 4; affects all subcommands).
+- `--rayon-threads N`: Rayon thread count for jackknife in `h2`/`rg`.
+- `--polars-threads N`: Polars thread count for CSV streaming in `munge-sumstats`.
+
+`ldsc --version` prints the compiled BLAS backend (e.g., `openblas-static`).
+
 ---
 
 ## Usage

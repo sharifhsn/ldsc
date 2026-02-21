@@ -1,9 +1,29 @@
 /// CLI argument definitions using clap derive macros.
 use clap::{Args, Parser, Subcommand};
 
+#[cfg(feature = "blas-openblas-static")]
+const CLI_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (openblas-static)");
+#[cfg(feature = "blas-openblas-system")]
+const CLI_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (openblas-system)");
+#[cfg(not(any(feature = "blas-openblas-static", feature = "blas-openblas-system")))]
+const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Parser)]
-#[command(name = "ldsc", about = "LD Score Regression (Rust port)", version)]
+#[command(name = "ldsc", about = "LD Score Regression (Rust port)", version = CLI_VERSION)]
 pub struct Cli {
+    /// Number of OpenBLAS threads (global; default 4).
+    /// 4 is optimal for 1000G-scale data (n~2500); increase for biobank-scale data.
+    #[arg(long, default_value_t = 4, global = true)]
+    pub blas_threads: usize,
+
+    /// Number of Rayon threads (global). Defaults to Rayon’s internal heuristic.
+    #[arg(long, global = true)]
+    pub rayon_threads: Option<usize>,
+
+    /// Number of Polars threads (global). Defaults to Polars’ internal heuristic.
+    #[arg(long, global = true)]
+    pub polars_threads: Option<usize>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -216,10 +236,6 @@ pub struct LdscoreArgs {
     #[arg(long, default_value_t = 50)]
     pub chunk_size: usize,
 
-    /// Number of OpenBLAS threads for DGEMM calls (default 4).
-    /// 4 is optimal for 1000G-scale data (n~2500); increase for biobank-scale data.
-    #[arg(long, default_value_t = 4)]
-    pub blas_threads: usize,
 }
 
 // ---------------------------------------------------------------------------

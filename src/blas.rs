@@ -2,3 +2,22 @@
 #[cfg(any(feature = "blas-openblas-static", feature = "blas-openblas-system"))]
 #[allow(unused_imports)]
 use blas_src as _;
+
+#[cfg(feature = "blas-openblas-static")]
+pub const BLAS_BACKEND: &str = "openblas-static";
+#[cfg(feature = "blas-openblas-system")]
+pub const BLAS_BACKEND: &str = "openblas-system";
+#[cfg(not(any(feature = "blas-openblas-static", feature = "blas-openblas-system")))]
+pub const BLAS_BACKEND: &str = "unknown-blas";
+
+#[cfg(any(feature = "blas-openblas-static", feature = "blas-openblas-system"))]
+unsafe extern "C" {
+    fn openblas_set_num_threads(num_threads: ::std::os::raw::c_int);
+}
+
+pub fn set_openblas_threads(num_threads: usize) {
+    #[cfg(any(feature = "blas-openblas-static", feature = "blas-openblas-system"))]
+    unsafe {
+        openblas_set_num_threads(num_threads as i32);
+    }
+}
