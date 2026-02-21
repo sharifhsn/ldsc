@@ -23,7 +23,10 @@ fn load_ld(single: Option<&str>, chr_prefix: Option<&str>, alias: &str) -> Resul
         (Some(path), _) => {
             Ok(parse::scan_ldscore(path)?.select([col("SNP"), col("L2").alias(alias)]))
         }
-        (None, Some(prefix)) => Ok(parse::concat_chrs(prefix, ".l2.ldscore.gz")?
+        (None, Some(prefix)) => Ok(parse::concat_chrs_any(
+            prefix,
+            &[".l2.ldscore.gz", ".l2.ldscore.bz2", ".l2.ldscore"],
+        )?
             .select([col("SNP"), col("L2").alias(alias)])),
         (None, None) => anyhow::bail!(
             "Must specify exactly one of --ref-ld / --ref-ld-chr (or --w-ld / --w-ld-chr)"
@@ -41,7 +44,10 @@ fn load_ld(single: Option<&str>, chr_prefix: Option<&str>, alias: &str) -> Resul
 fn load_ld_ref(single: Option<&str>, chr_prefix: Option<&str>) -> Result<LazyFrame> {
     let lf = match (single, chr_prefix) {
         (Some(path), _) => parse::scan_ldscore(path)?,
-        (None, Some(prefix)) => parse::concat_chrs(prefix, ".l2.ldscore.gz")?,
+        (None, Some(prefix)) => parse::concat_chrs_any(
+            prefix,
+            &[".l2.ldscore.gz", ".l2.ldscore.bz2", ".l2.ldscore"],
+        )?,
         (None, None) => anyhow::bail!("Must specify exactly one of --ref-ld / --ref-ld-chr"),
     };
     // Drop metadata columns, keeping SNP and all L2 annotation columns.

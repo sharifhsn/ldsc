@@ -48,7 +48,7 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct MungeArgs {
-    /// Input summary statistics file (TSV/CSV, optionally gzipped)
+    /// Input summary statistics file (TSV/CSV, optionally .gz or .bz2)
     #[arg(long)]
     pub sumstats: String,
 
@@ -196,7 +196,7 @@ pub struct LdscoreArgs {
     pub ld_wind_snp: Option<usize>,
 
     /// Annotation file prefix for partitioned LD scores.
-    /// LDSC appends .annot or .annot.gz to this prefix.
+    /// LDSC appends .annot, .annot.gz, or .annot.bz2 to this prefix.
     /// The annot file must have the same SNPs in the same order as the .bim file.
     #[arg(long)]
     pub annot: Option<String>,
@@ -244,12 +244,12 @@ pub struct LdscoreArgs {
 
 #[derive(Args)]
 pub struct H2Args {
-    /// Munged summary statistics file (.sumstats.gz)
+    /// Munged summary statistics file (.sumstats[.gz|.bz2])
     #[arg(long)]
     pub h2: String,
 
     /// LD score file prefix, per-chromosome (e.g. eas_ldscores/chr).
-    /// LDSC appends .l2.ldscore.gz and the chromosome number.
+    /// LDSC appends .l2.ldscore(.gz|.bz2) and the chromosome number.
     /// Provide exactly one of --ref-ld-chr or --ref-ld.
     #[arg(long)]
     pub ref_ld_chr: Option<String>,
@@ -344,7 +344,7 @@ pub struct H2Args {
 
 #[derive(Args)]
 pub struct RgArgs {
-    /// Comma-separated list of .sumstats.gz files
+    /// Comma-separated list of .sumstats(.gz|.bz2) files
     #[arg(long, value_delimiter = ',')]
     pub rg: Vec<String>,
 

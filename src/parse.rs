@@ -2,23 +2,59 @@
 use anyhow::{Context, Result};
 use ndarray::Array2;
 use polars::prelude::*;
+use std::fs::File;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
+use bzip2_rs::DecoderReader;
+use tempfile::Builder as TempBuilder;
+
+static BZ2_TEMPFILES: OnceLock<Mutex<Vec<tempfile::TempPath>>> = OnceLock::new();
+
+fn maybe_decompress_bz2(path: &str) -> Result<PathBuf> {
+    if !path.ends_with(".bz2") {
+        return Ok(PathBuf::from(path));
+    }
+
+    let input = File::open(path).with_context(|| format!("opening bz2 file '{}'", path))?;
+    let mut decoder = DecoderReader::new(input);
+    let mut tmp = TempBuilder::new()
+        .prefix("ldsc_bz2_")
+        .suffix(".tmp")
+        .tempfile()
+        .context("creating temp file for bz2 decompression")?;
+    std::io::copy(&mut decoder, &mut tmp)
+        .with_context(|| format!("decompressing bz2 file '{}'", path))?;
+
+    let temp_path = tmp.into_temp_path();
+    let temp_buf = temp_path.to_path_buf();
+    BZ2_TEMPFILES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("bz2 tempfiles mutex poisoned")
+        .push(temp_path);
+
+    Ok(temp_buf)
+}
 
 // ---------------------------------------------------------------------------
 // Readers
 // ---------------------------------------------------------------------------
 
-/// Scan a `.sumstats[.gz]` file as a Polars LazyFrame.
+/// Scan a `.sumstats[.gz|.bz2]` file as a Polars LazyFrame.
 pub fn scan_sumstats(path: &str) -> Result<LazyFrame> {
-    let lf = LazyCsvReader::new(path.into())
+    let resolved = maybe_decompress_bz2(path)?;
+    let lf = LazyCsvReader::new(resolved.into())
         .with_separator(b'\t')
         .with_has_header(true)
         .finish()?;
     Ok(lf)
 }
 
-/// Scan a `.ldscore[.gz]` file as a Polars LazyFrame.
+/// Scan a `.ldscore[.gz|.bz2]` file as a Polars LazyFrame.
 pub fn scan_ldscore(path: &str) -> Result<LazyFrame> {
-    let lf = LazyCsvReader::new(path.into())
+    let resolved = maybe_decompress_bz2(path)?;
+    let lf = LazyCsvReader::new(resolved.into())
         .with_separator(b'\t')
         .with_has_header(true)
         .finish()?;
@@ -128,7 +164,8 @@ pub fn concat_chrs(prefix: &str, suffix: &str) -> Result<LazyFrame> {
         .iter()
         .map(|chr| {
             let path = make_chr_path(prefix, *chr, suffix);
-            LazyCsvReader::new(path.as_str().into())
+            let resolved = maybe_decompress_bz2(&path)?;
+            LazyCsvReader::new(resolved.into())
                 .with_separator(b'\t')
                 .with_has_header(true)
                 .finish()
@@ -139,6 +176,33 @@ pub fn concat_chrs(prefix: &str, suffix: &str) -> Result<LazyFrame> {
     Ok(concat(frames, UnionArgs::default())?)
 }
 
+/// Concatenate per-chromosome LazyFrames, accepting .gz, .bz2, or plain files.
+pub fn concat_chrs_any(prefix: &str, suffixes: &[&str]) -> Result<LazyFrame> {
+    for suffix in suffixes {
+        let chrs = get_present_chrs(prefix, suffix);
+        if chrs.is_empty() {
+            continue;
+        }
+
+        let frames: Vec<LazyFrame> = chrs
+            .iter()
+            .map(|chr| {
+                let path = make_chr_path(prefix, *chr, suffix);
+                let resolved = maybe_decompress_bz2(&path)?;
+                LazyCsvReader::new(resolved.into())
+                    .with_separator(b'\t')
+                    .with_has_header(true)
+                    .finish()
+                    .map_err(anyhow::Error::from)
+            })
+            .collect::<Result<_>>()?;
+
+        return Ok(concat(frames, UnionArgs::default())?);
+    }
+
+    anyhow::bail!("No chromosome files found for prefix '{}' (tried {:?})", prefix, suffixes);
+}
+
 // ---------------------------------------------------------------------------
 // Annotation file reader
 // ---------------------------------------------------------------------------
@@ -147,21 +211,25 @@ pub fn concat_chrs(prefix: &str, suffix: &str) -> Result<LazyFrame> {
 ///
 /// Full format (`thin=false`): `CHR SNP BP CM ANNOT1 …` — skips first 4 columns.
 /// Thin format (`thin=true`): all columns are annotations.
-/// Tries `{prefix}.annot.gz` then `{prefix}.annot`.
+/// Tries `{prefix}.annot.gz`, `{prefix}.annot.bz2`, then `{prefix}.annot`.
 pub fn read_annot(prefix: &str, thin: bool) -> Result<(Array2<f64>, Vec<String>)> {
     let path = {
         let gz = format!("{}.annot.gz", prefix);
+        let bz2 = format!("{}.annot.bz2", prefix);
         let plain = format!("{}.annot", prefix);
         if std::path::Path::new(&gz).exists() {
             gz
+        } else if std::path::Path::new(&bz2).exists() {
+            bz2
         } else if std::path::Path::new(&plain).exists() {
             plain
         } else {
-            anyhow::bail!("Annotation file not found: '{}.annot[.gz]'", prefix);
+            anyhow::bail!("Annotation file not found: '{}.annot[.gz|.bz2]'", prefix);
         }
     };
 
-    let df = LazyCsvReader::new(path.as_str().into())
+    let resolved = maybe_decompress_bz2(&path)?;
+    let df = LazyCsvReader::new(resolved.into())
         .with_separator(b'\t')
         .with_has_header(true)
         .finish()

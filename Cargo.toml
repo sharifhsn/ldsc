@@ -49,6 +49,12 @@ thiserror = "2"
 # Gzip compression for output files (.ldscore.gz, .sumstats.gz)
 flate2 = "1"
 
+# Bzip2 decompression for .bz2 inputs
+bzip2-rs = "0.1.2"
+
+# Temp files for on-the-fly .bz2 decompression
+tempfile = "3"
+
 [profile.release]
 opt-level     = 3
 lto           = "thin"
@@ -77,4 +83,3 @@ blas-openblas-system = [
 ]
 
 [dev-dependencies]
-tempfile = "3"

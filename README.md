@@ -160,6 +160,7 @@ heavily battle-tested**. Use them only when needed:
 ### munge-sumstats
 
 Pre-processes GWAS summary statistics into the `.sumstats.gz` format consumed by `h2` and `rg`.
+Input summary statistics may be plain, `.gz`, or `.bz2`.
 
 ```bash
 ldsc munge-sumstats \
@@ -179,6 +180,7 @@ null value is (e.g. `BETA,0`, `OR,1`, `Z,0`). Without this flag the tool auto-de
 ### ldscore
 
 Computes LD scores from a PLINK binary file set (`.bed/.bim/.fam`).
+Annotation inputs (`.annot`) may be plain, `.gz`, or `.bz2`.
 
 > **Tip for European GWAS:** Pre-computed 1000G phase 3 LD scores are available from the
 > [Broad LDSCORE page](https://data.broadinstitute.org/alkesgroup/LDSCORE/). Download
@@ -207,6 +209,7 @@ the BIM, outputs one L2 column per annotation and corresponding `.l2.M` / `.l2.M
 ### h2
 
 Estimates SNP heritability.
+LD score inputs may be plain, `.gz`, or `.bz2`.
 
 ```bash
 ldsc h2 \
@@ -233,6 +236,7 @@ Common options: `--no-intercept`, `--intercept-h2 VALUE`, `--two-step 30`, `--ch
 ### rg
 
 Estimates genetic correlations across all pairs from a list of summary statistic files.
+LD score inputs may be plain, `.gz`, or `.bz2`.
 
 ```bash
 ldsc rg \
@@ -340,7 +344,6 @@ The following Python flags have no Rust equivalent and are not planned:
 | `h2` | `--h2-cts` / `--ref-ld-chr-cts` / `--print-all-cts` | Cell-type-specific h2 |
 | `h2` / `rg` | `--overlap-annot` / `--frqfile-chr` | Overlapping annotation categories |
 | `rg` | `--intercept-h2` | Fix per-trait h2 intercepts in rg |
-| All | `.bz2` input files | Only `.gz` supported |
 
 ---
 
