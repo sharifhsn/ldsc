@@ -14,15 +14,15 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use crate::cli::MakeAnnotArgs;
-use crate::ldscore::{parse_bim, BimRecord};
+use crate::ldscore::{BimRecord, parse_bim};
 
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
 pub fn run(args: MakeAnnotArgs) -> Result<()> {
-    let snps = parse_bim(&args.bimfile)
-        .with_context(|| format!("reading BIM '{}'", args.bimfile))?;
+    let snps =
+        parse_bim(&args.bimfile).with_context(|| format!("reading BIM '{}'", args.bimfile))?;
     println!("Read {} SNPs from '{}'", snps.len(), args.bimfile);
 
     // Build the 0/1 annotation vector.
@@ -73,10 +73,7 @@ fn annotate_from_bed(
         intervals.len(),
         bed_path
     );
-    Ok(snps
-        .iter()
-        .map(|s| annotate_snp(s, &intervals))
-        .collect())
+    Ok(snps.iter().map(|s| annotate_snp(s, &intervals)).collect())
 }
 
 /// Load BED intervals per chromosome.
@@ -89,8 +86,7 @@ fn load_bed_intervals(
     windowsize: u32,
     nomerge: bool,
 ) -> Result<HashMap<String, Vec<(u32, u32)>>> {
-    let file =
-        File::open(bed_path).with_context(|| format!("opening BED file '{}'", bed_path))?;
+    let file = File::open(bed_path).with_context(|| format!("opening BED file '{}'", bed_path))?;
     let reader = BufReader::new(file);
     let mut intervals: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
 
@@ -246,12 +242,12 @@ fn annotate_from_gene_set(
         genes_found += 1;
 
         let chr = cols[1].trim_start_matches("chr").to_string();
-        let start: u32 = cols[2].parse().with_context(|| {
-            format!("coord file line {}: invalid start '{}'", i + 1, cols[2])
-        })?;
-        let end: u32 = cols[3].parse().with_context(|| {
-            format!("coord file line {}: invalid end '{}'", i + 1, cols[3])
-        })?;
+        let start: u32 = cols[2]
+            .parse()
+            .with_context(|| format!("coord file line {}: invalid start '{}'", i + 1, cols[2]))?;
+        let end: u32 = cols[3]
+            .parse()
+            .with_context(|| format!("coord file line {}: invalid end '{}'", i + 1, cols[3]))?;
 
         let start = start.saturating_sub(windowsize);
         let end = end.saturating_add(windowsize);
@@ -271,10 +267,7 @@ fn annotate_from_gene_set(
         *ivs = merge_intervals(std::mem::take(ivs));
     }
 
-    Ok(snps
-        .iter()
-        .map(|s| annotate_snp(s, &intervals))
-        .collect())
+    Ok(snps.iter().map(|s| annotate_snp(s, &intervals)).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -305,8 +298,8 @@ fn write_annot_file(
     col_name: &str,
 ) -> Result<()> {
     if path.ends_with(".gz") {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         let file = File::create(path).with_context(|| format!("creating '{}'", path))?;
         let mut gz = GzEncoder::new(file, Compression::fast());
         write_rows(&mut gz, snps, annotation, col_name)?;
@@ -327,7 +320,11 @@ fn write_rows(
 ) -> Result<()> {
     writeln!(w, "CHR\tBP\tSNP\tCM\t{}", col_name)?;
     for (snp, &ann) in snps.iter().zip(annotation.iter()) {
-        writeln!(w, "{}\t{}\t{}\t{:.6}\t{}", snp.chr, snp.bp, snp.snp, snp.cm, ann)?;
+        writeln!(
+            w,
+            "{}\t{}\t{}\t{:.6}\t{}",
+            snp.chr, snp.bp, snp.snp, snp.cm, ann
+        )?;
     }
     Ok(())
 }

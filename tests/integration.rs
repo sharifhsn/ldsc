@@ -75,14 +75,14 @@ fn ldscore_smoke() {
                 path
             );
             // Verify there is at least one data row.
-            assert!(
-                content.lines().count() > 1,
-                "no SNP rows in {}",
-                path
-            );
+            assert!(content.lines().count() > 1, "no SNP rows in {}", path);
         }
     }
-    assert!(found >= 22, "expected ≥22 chromosome files, found {}", found);
+    assert!(
+        found >= 22,
+        "expected ≥22 chromosome files, found {}",
+        found
+    );
     eprintln!("Verified {} chromosome output files.", found);
 }
 

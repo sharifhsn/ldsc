@@ -15,65 +15,65 @@ use crate::parse;
 /// (uppercase_synonym, canonical_name) pairs.
 const CNAME_MAP: &[(&str, &str)] = &[
     // SNP identifier
-    ("SNP",          "SNP"),
-    ("MARKERNAME",   "SNP"),
-    ("SNPID",        "SNP"),
-    ("RS",           "SNP"),
-    ("RSID",         "SNP"),
-    ("RS_NUMBER",    "SNP"),
-    ("RS_NUMBERS",   "SNP"),
+    ("SNP", "SNP"),
+    ("MARKERNAME", "SNP"),
+    ("SNPID", "SNP"),
+    ("RS", "SNP"),
+    ("RSID", "SNP"),
+    ("RS_NUMBER", "SNP"),
+    ("RS_NUMBERS", "SNP"),
     // P-value
-    ("P",            "P"),
-    ("PVALUE",       "P"),
-    ("P_VALUE",      "P"),
-    ("PVAL",         "P"),
-    ("P_VAL",        "P"),
-    ("GC_PVALUE",    "P"),
+    ("P", "P"),
+    ("PVALUE", "P"),
+    ("P_VALUE", "P"),
+    ("PVAL", "P"),
+    ("P_VAL", "P"),
+    ("GC_PVALUE", "P"),
     // Allele 1 (effect allele)
-    ("A1",               "A1"),
-    ("ALLELE1",          "A1"),
-    ("ALLELE_1",         "A1"),
-    ("EFFECT_ALLELE",    "A1"),
+    ("A1", "A1"),
+    ("ALLELE1", "A1"),
+    ("ALLELE_1", "A1"),
+    ("EFFECT_ALLELE", "A1"),
     ("REFERENCE_ALLELE", "A1"),
-    ("INC_ALLELE",       "A1"),
-    ("EA",               "A1"),
+    ("INC_ALLELE", "A1"),
+    ("EA", "A1"),
     // Allele 2 (non-effect allele)
-    ("A2",                 "A2"),
-    ("ALLELE2",            "A2"),
-    ("ALLELE_2",           "A2"),
-    ("OTHER_ALLELE",       "A2"),
-    ("NON_EFFECT_ALLELE",  "A2"),
-    ("DEC_ALLELE",         "A2"),
-    ("NEA",                "A2"),
+    ("A2", "A2"),
+    ("ALLELE2", "A2"),
+    ("ALLELE_2", "A2"),
+    ("OTHER_ALLELE", "A2"),
+    ("NON_EFFECT_ALLELE", "A2"),
+    ("DEC_ALLELE", "A2"),
+    ("NEA", "A2"),
     // Sample size
-    ("N",      "N"),
-    ("WEIGHT", "N"),   // METAL convention
+    ("N", "N"),
+    ("WEIGHT", "N"), // METAL convention
     // Z-score
-    ("Z",        "Z"),
-    ("ZSCORE",   "Z"),
-    ("Z-SCORE",  "Z"),
-    ("GC_ZSCORE","Z"),
+    ("Z", "Z"),
+    ("ZSCORE", "Z"),
+    ("Z-SCORE", "Z"),
+    ("GC_ZSCORE", "Z"),
     // Regression coefficients / signed stats
-    ("BETA",          "BETA"),
-    ("B",             "BETA"),
-    ("EFFECT",        "BETA"),
-    ("EFFECTS",       "BETA"),
-    ("OR",            "OR"),
-    ("LOG_ODDS",      "LOG_ODDS"),
-    ("SIGNED_SUMSTAT","SIGNED_SUMSTAT"),
+    ("BETA", "BETA"),
+    ("B", "BETA"),
+    ("EFFECT", "BETA"),
+    ("EFFECTS", "BETA"),
+    ("OR", "OR"),
+    ("LOG_ODDS", "LOG_ODDS"),
+    ("SIGNED_SUMSTAT", "SIGNED_SUMSTAT"),
     // Standard error
-    ("SE",        "SE"),
-    ("STDERR",    "SE"),
-    ("STDERROR",  "SE"),
-    ("SE_BETA",   "SE"),
+    ("SE", "SE"),
+    ("STDERR", "SE"),
+    ("STDERROR", "SE"),
+    ("SE_BETA", "SE"),
     // Allele frequency / MAF
-    ("FRQ",  "FRQ"),
-    ("MAF",  "FRQ"),
-    ("EAF",  "FRQ"),
-    ("FRQ_U","FRQ"),
-    ("F_U",  "FRQ"),
+    ("FRQ", "FRQ"),
+    ("MAF", "FRQ"),
+    ("EAF", "FRQ"),
+    ("FRQ_U", "FRQ"),
+    ("F_U", "FRQ"),
     // Imputation quality
-    ("INFO",    "INFO"),
+    ("INFO", "INFO"),
     ("IMPINFO", "INFO"),
 ];
 
@@ -187,15 +187,15 @@ fn apply_ignore(lf: LazyFrame, ignore_csv: Option<&str>) -> Result<LazyFrame> {
 fn apply_col_overrides(lf: LazyFrame, args: &MungeArgs) -> Result<LazyFrame> {
     // (user_specified_column_name, canonical_name)
     let overrides: &[(Option<&str>, &str)] = &[
-        (args.snp_col.as_deref(),     "SNP"),
-        (args.n_col.as_deref(),       "N"),
-        (args.n_cas_col.as_deref(),   "N_CAS"),
-        (args.n_con_col.as_deref(),   "N_CON"),
-        (args.a1_col.as_deref(),      "A1"),
-        (args.a2_col.as_deref(),      "A2"),
-        (args.p_col.as_deref(),       "P"),
-        (args.frq_col.as_deref(),     "FRQ"),
-        (args.info_col.as_deref(),    "INFO"),
+        (args.snp_col.as_deref(), "SNP"),
+        (args.n_col.as_deref(), "N"),
+        (args.n_cas_col.as_deref(), "N_CAS"),
+        (args.n_con_col.as_deref(), "N_CON"),
+        (args.a1_col.as_deref(), "A1"),
+        (args.a2_col.as_deref(), "A2"),
+        (args.p_col.as_deref(), "P"),
+        (args.frq_col.as_deref(), "FRQ"),
+        (args.info_col.as_deref(), "INFO"),
     ];
 
     // Collect existing columns (no data load needed).
@@ -212,9 +212,7 @@ fn apply_col_overrides(lf: LazyFrame, args: &MungeArgs) -> Result<LazyFrame> {
     for (override_opt, canonical) in overrides {
         if let Some(user_name) = override_opt {
             // Case-insensitive match against existing columns.
-            if let Some(actual) = existing
-                .iter()
-                .find(|e| e.eq_ignore_ascii_case(user_name))
+            if let Some(actual) = existing.iter().find(|e| e.eq_ignore_ascii_case(user_name))
                 && actual != canonical
             {
                 old_names.push(actual.clone());
@@ -321,10 +319,12 @@ fn derive_z(lf: LazyFrame, signed_sumstats: Option<&str>, a1_inc: bool) -> Resul
 
     // --a1-inc: A1 always increases → Z = +|Φ⁻¹(1 − P/2)|.
     if a1_inc && has("P") {
-        let mut df = lf.collect().context("collecting for P→Z (a1-inc) conversion")?;
-        let z_col = p_always_positive(&df)
-            .context("P→Z conversion with --a1-inc")?;
-        df.with_column(z_col.into()).context("adding Z column (a1-inc)")?;
+        let mut df = lf
+            .collect()
+            .context("collecting for P→Z (a1-inc) conversion")?;
+        let z_col = p_always_positive(&df).context("P→Z conversion with --a1-inc")?;
+        df.with_column(z_col.into())
+            .context("adding Z column (a1-inc)")?;
         return Ok(df.lazy());
     }
 
@@ -338,9 +338,10 @@ fn derive_z(lf: LazyFrame, signed_sumstats: Option<&str>, a1_inc: bool) -> Resul
                 "--signed-sumstats must be COLNAME,null_value (e.g. Z,0 or OR,1)"
             );
             let col_upper = parts[0].trim().to_uppercase();
-            let null_val: f64 = parts[1].trim().parse().with_context(|| {
-                format!("parsing null value from --signed-sumstats '{}'", ss)
-            })?;
+            let null_val: f64 = parts[1]
+                .trim()
+                .parse()
+                .with_context(|| format!("parsing null value from --signed-sumstats '{}'", ss))?;
             // Case-insensitive match against actual columns.
             let actual = cols
                 .iter()
@@ -361,7 +362,8 @@ fn derive_z(lf: LazyFrame, signed_sumstats: Option<&str>, a1_inc: bool) -> Resul
             let mut df = lf.collect().context("collecting for P→Z conversion")?;
             let z_col = p_and_sign_to_z(&df, &sign_col, null_val)
                 .with_context(|| format!("P→Z using sign column '{}'", sign_col))?;
-            df.with_column(z_col.into()).context("adding Z column to DataFrame")?;
+            df.with_column(z_col.into())
+                .context("adding Z column to DataFrame")?;
             return Ok(df.lazy());
         }
     }
@@ -437,7 +439,13 @@ fn p_and_sign_to_z(df: &DataFrame, sign_col: &str, null_val: f64) -> Result<Seri
 
 /// Apply MAF/N/INFO filters, optionally remove strand-ambiguous SNPs.
 /// When `no_alleles` is true the strand-ambiguity check is skipped.
-fn filter_snps(lf: LazyFrame, maf: f64, n_min: u64, info_min: f64, no_alleles: bool) -> Result<LazyFrame> {
+fn filter_snps(
+    lf: LazyFrame,
+    maf: f64,
+    n_min: u64,
+    info_min: f64,
+    no_alleles: bool,
+) -> Result<LazyFrame> {
     let header = lf.clone().limit(0).collect()?;
     let cols = header.get_column_names();
     let has = |n: &str| cols.iter().any(|c| *c == n);
@@ -561,9 +569,11 @@ fn apply_nstudy_filter(
             "  --nstudy-min {}: filtering on column '{}'",
             min_val, actual_owned
         );
-        return Ok(
-            lf.filter(col(actual_owned.as_str()).cast(DataType::Float64).gt_eq(lit(min_val as f64)))
-        );
+        return Ok(lf.filter(
+            col(actual_owned.as_str())
+                .cast(DataType::Float64)
+                .gt_eq(lit(min_val as f64)),
+        ));
     }
     println!(
         "  Warning: --nstudy column '{}' not found in file; skipping filter",
@@ -578,8 +588,8 @@ fn apply_nstudy_filter(
 
 /// Write a DataFrame as a gzip-compressed tab-separated file.
 fn write_sumstats_gz(path: &str, df: &mut DataFrame) -> Result<()> {
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
 
     let file = File::create(path).with_context(|| format!("creating '{}'", path))?;
     let gz = GzEncoder::new(BufWriter::new(file), Compression::fast());
@@ -601,37 +611,37 @@ mod tests {
     /// cname_lookup maps known synonyms to their canonical names.
     #[test]
     fn test_cname_lookup_standard() {
-        assert_eq!(cname_lookup("SNP"),          Some("SNP"));
-        assert_eq!(cname_lookup("RSID"),         Some("SNP"));
-        assert_eq!(cname_lookup("MARKERNAME"),   Some("SNP"));
-        assert_eq!(cname_lookup("P"),            Some("P"));
-        assert_eq!(cname_lookup("PVALUE"),       Some("P"));
-        assert_eq!(cname_lookup("BETA"),         Some("BETA"));
-        assert_eq!(cname_lookup("B"),            Some("BETA"));
-        assert_eq!(cname_lookup("SE"),           Some("SE"));
-        assert_eq!(cname_lookup("STDERR"),       Some("SE"));
-        assert_eq!(cname_lookup("MAF"),          Some("FRQ"));
-        assert_eq!(cname_lookup("EAF"),          Some("FRQ"));
-        assert_eq!(cname_lookup("FRQ_U"),        Some("FRQ"));
-        assert_eq!(cname_lookup("INFO"),         Some("INFO"));
-        assert_eq!(cname_lookup("IMPINFO"),      Some("INFO"));
-        assert_eq!(cname_lookup("Z"),            Some("Z"));
-        assert_eq!(cname_lookup("ZSCORE"),       Some("Z"));
-        assert_eq!(cname_lookup("A1"),           Some("A1"));
-        assert_eq!(cname_lookup("EFFECT_ALLELE"),Some("A1"));
-        assert_eq!(cname_lookup("A2"),           Some("A2"));
+        assert_eq!(cname_lookup("SNP"), Some("SNP"));
+        assert_eq!(cname_lookup("RSID"), Some("SNP"));
+        assert_eq!(cname_lookup("MARKERNAME"), Some("SNP"));
+        assert_eq!(cname_lookup("P"), Some("P"));
+        assert_eq!(cname_lookup("PVALUE"), Some("P"));
+        assert_eq!(cname_lookup("BETA"), Some("BETA"));
+        assert_eq!(cname_lookup("B"), Some("BETA"));
+        assert_eq!(cname_lookup("SE"), Some("SE"));
+        assert_eq!(cname_lookup("STDERR"), Some("SE"));
+        assert_eq!(cname_lookup("MAF"), Some("FRQ"));
+        assert_eq!(cname_lookup("EAF"), Some("FRQ"));
+        assert_eq!(cname_lookup("FRQ_U"), Some("FRQ"));
+        assert_eq!(cname_lookup("INFO"), Some("INFO"));
+        assert_eq!(cname_lookup("IMPINFO"), Some("INFO"));
+        assert_eq!(cname_lookup("Z"), Some("Z"));
+        assert_eq!(cname_lookup("ZSCORE"), Some("Z"));
+        assert_eq!(cname_lookup("A1"), Some("A1"));
+        assert_eq!(cname_lookup("EFFECT_ALLELE"), Some("A1"));
+        assert_eq!(cname_lookup("A2"), Some("A2"));
         assert_eq!(cname_lookup("OTHER_ALLELE"), Some("A2"));
-        assert_eq!(cname_lookup("N"),            Some("N"));
-        assert_eq!(cname_lookup("WEIGHT"),       Some("N"));  // METAL convention
-        assert_eq!(cname_lookup("OR"),           Some("OR"));
+        assert_eq!(cname_lookup("N"), Some("N"));
+        assert_eq!(cname_lookup("WEIGHT"), Some("N")); // METAL convention
+        assert_eq!(cname_lookup("OR"), Some("OR"));
     }
 
     /// cname_lookup returns None for unknown names.
     #[test]
     fn test_cname_lookup_unknown() {
-        assert_eq!(cname_lookup("FOOBAR"),  None);
-        assert_eq!(cname_lookup(""),        None);
-        assert_eq!(cname_lookup("CHROM"),   None);
+        assert_eq!(cname_lookup("FOOBAR"), None);
+        assert_eq!(cname_lookup(""), None);
+        assert_eq!(cname_lookup("CHROM"), None);
         assert_eq!(cname_lookup("EFFECT_SIZE"), None);
     }
 
@@ -639,8 +649,8 @@ mod tests {
     /// Mirrors Python's clean_header uppercasing before lookup.
     #[test]
     fn test_cname_lookup_case_sensitive() {
-        assert_eq!(cname_lookup("snp"),    None);  // lowercase → no match
-        assert_eq!(cname_lookup("SNP"),    Some("SNP"));
+        assert_eq!(cname_lookup("snp"), None); // lowercase → no match
+        assert_eq!(cname_lookup("SNP"), Some("SNP"));
         assert_eq!(cname_lookup("Zscore"), None);
         assert_eq!(cname_lookup("ZSCORE"), Some("Z"));
     }

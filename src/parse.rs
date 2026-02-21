@@ -58,8 +58,8 @@ pub fn read_m_total(prefix: &str, suffix: &str) -> Result<f64> {
     let mut total = 0.0f64;
     for chr in chrs {
         let path = make_chr_path(prefix, chr, suffix);
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading M file '{}'", path))?;
+        let content =
+            std::fs::read_to_string(&path).with_context(|| format!("reading M file '{}'", path))?;
         let m: f64 = content
             .split_whitespace()
             .next()
@@ -87,8 +87,8 @@ pub fn read_m_vec(prefix: &str, suffix: &str) -> Result<Vec<f64>> {
     let mut totals: Vec<f64> = Vec::new();
     for chr in chrs {
         let path = make_chr_path(prefix, chr, suffix);
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading M file '{}'", path))?;
+        let content =
+            std::fs::read_to_string(&path).with_context(|| format!("reading M file '{}'", path))?;
         let vals: Vec<f64> = content
             .split_whitespace()
             .map(|s| {
@@ -118,7 +118,11 @@ pub fn read_m_vec(prefix: &str, suffix: &str) -> Result<Vec<f64>> {
 /// Concatenate per-chromosome LazyFrames into one.
 pub fn concat_chrs(prefix: &str, suffix: &str) -> Result<LazyFrame> {
     let chrs = get_present_chrs(prefix, suffix);
-    anyhow::ensure!(!chrs.is_empty(), "No chromosome files found for prefix '{}'", prefix);
+    anyhow::ensure!(
+        !chrs.is_empty(),
+        "No chromosome files found for prefix '{}'",
+        prefix
+    );
 
     let frames: Vec<LazyFrame> = chrs
         .iter()
@@ -175,7 +179,11 @@ pub fn read_annot(prefix: &str, thin: bool) -> Result<(Array2<f64>, Vec<String>)
         path,
         all_cols.len(),
         skip,
-        if thin { "thin format" } else { "full format: CHR SNP BP CM + annotations" }
+        if thin {
+            "thin format"
+        } else {
+            "full format: CHR SNP BP CM + annotations"
+        }
     );
 
     let col_names: Vec<String> = all_cols[skip..].iter().map(|s| s.to_string()).collect();
@@ -189,7 +197,9 @@ pub fn read_annot(prefix: &str, thin: bool) -> Result<(Array2<f64>, Vec<String>)
             .with_context(|| format!("column '{}' in annot file '{}'", name, path))?
             .cast(&DataType::Float64)
             .with_context(|| format!("casting annot column '{}' to f64", name))?;
-        let ca = s.f64().with_context(|| format!("annot column '{}' as f64", name))?;
+        let ca = s
+            .f64()
+            .with_context(|| format!("annot column '{}' as f64", name))?;
         for (i, val) in ca.into_iter().enumerate() {
             matrix[[i, j]] = val.unwrap_or(0.0);
         }
@@ -259,8 +269,8 @@ mod tests {
 
         let v = read_m_vec(&prefix, ".l2.M").unwrap();
         assert_eq!(v.len(), 2);
-        assert!((v[0] - 400.0).abs() < 0.01, "annot1 sum={}", v[0]);  // 100+300
-        assert!((v[1] - 600.0).abs() < 0.01, "annot2 sum={}", v[1]);  // 200+400
+        assert!((v[0] - 400.0).abs() < 0.01, "annot1 sum={}", v[0]); // 100+300
+        assert!((v[1] - 600.0).abs() < 0.01, "annot2 sum={}", v[1]); // 200+400
     }
 
     /// scan_ldscore can read the existing test .ldscore.gz file and returns

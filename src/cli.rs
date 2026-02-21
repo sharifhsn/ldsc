@@ -57,7 +57,6 @@ pub struct MungeArgs {
     pub keep_mhc: bool,
 
     // --- Sample size overrides -----------------------------------------------
-
     /// Fix sample size for all SNPs (overrides any N column in the file)
     #[arg(long)]
     pub n: Option<f64>,
@@ -72,7 +71,6 @@ pub struct MungeArgs {
 
     // --- Column name overrides (case-insensitive) ----------------------------
     // Use when the file uses a non-standard name not in the built-in synonym map.
-
     /// Name of the SNP ID column in the input file
     #[arg(long)]
     pub snp_col: Option<String>,

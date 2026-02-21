@@ -1,11 +1,11 @@
 mod cli;
-mod parse;
-mod munge;
-mod ldscore;
 mod irwls;
 mod jackknife;
-mod regressions;
+mod ldscore;
 mod make_annot;
+mod munge;
+mod parse;
+mod regressions;
 
 use anyhow::Result;
 use clap::Parser;

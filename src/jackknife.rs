@@ -1,9 +1,9 @@
 /// Block jackknife variance estimation using parallel IRWLS folds.
 use anyhow::Result;
-use ndarray::{s, Array1, Array2, Axis};
+use ndarray::{Array1, Array2, Axis, s};
 use rayon::prelude::*;
 
-use crate::irwls::{irwls, IrwlsResult};
+use crate::irwls::{IrwlsResult, irwls};
 
 /// Run block jackknife over `n_blocks` contiguous genomic windows.
 ///
@@ -45,8 +45,8 @@ pub fn jackknife(
             let w_lo = weights.slice(s![..lo]).to_owned();
             let w_hi = weights.slice(s![hi..]).to_owned();
 
-            let x_jack = ndarray::concatenate(Axis(0), &[x_lo.view(), x_hi.view()])
-                .expect("concatenate x");
+            let x_jack =
+                ndarray::concatenate(Axis(0), &[x_lo.view(), x_hi.view()]).expect("concatenate x");
             let y_jack =
                 ndarray::concatenate(Axis(0), &[y_lo.view(), y_hi.view()]).expect("concatenate y");
             let mut w_jack =
@@ -120,9 +120,8 @@ mod tests {
     fn test_jackknife_trivial_se() {
         // y = 2x + 1  (no noise) across 100 observations
         let n = 100usize;
-        let x: Array2<f64> = Array2::from_shape_fn((n, 2), |(i, j)| {
-            if j == 0 { i as f64 } else { 1.0 }
-        });
+        let x: Array2<f64> =
+            Array2::from_shape_fn((n, 2), |(i, j)| if j == 0 { i as f64 } else { 1.0 });
         let y: Array1<f64> = Array1::from_iter((0..n).map(|i| 2.0 * i as f64 + 1.0));
         let w = Array1::ones(n);
 
@@ -146,9 +145,13 @@ mod tests {
         // slope ≈ 1000, intercept ≈ 0.001 — ensures the column-mixing bug would
         // produce obviously wrong SEs for one of them.
         let n = 80usize;
-        let x: Array2<f64> = Array2::from_shape_fn((n, 2), |(i, j)| {
-            if j == 0 { i as f64 * 1000.0 } else { 1.0 }
-        });
+        let x: Array2<f64> =
+            Array2::from_shape_fn(
+                (n, 2),
+                |(i, j)| {
+                    if j == 0 { i as f64 * 1000.0 } else { 1.0 }
+                },
+            );
         let y: Array1<f64> = Array1::from_iter((0..n).map(|i| {
             // y = 1.0 * (1000 * i) + 0.001
             i as f64 * 1000.0 + 0.001
@@ -194,7 +197,10 @@ mod tests {
         assert_eq!(cov.shape(), [2, 2]);
         assert!(cov[[0, 0]] >= 0.0, "cov[0,0] should be ≥ 0");
         assert!(cov[[1, 1]] >= 0.0, "cov[1,1] should be ≥ 0");
-        assert!((cov[[0, 1]] - cov[[1, 0]]).abs() < 1e-12, "cov not symmetric");
+        assert!(
+            (cov[[0, 1]] - cov[[1, 0]]).abs() < 1e-12,
+            "cov not symmetric"
+        );
     }
 
     /// Known SE: 10 obs, 1 param (intercept), y = 0..9, n_blocks = 10.

@@ -20,8 +20,9 @@ use crate::parse;
 /// Used for weight LD scores (always scalar).
 fn load_ld(single: Option<&str>, chr_prefix: Option<&str>, alias: &str) -> Result<LazyFrame> {
     match (single, chr_prefix) {
-        (Some(path), _) => Ok(parse::scan_ldscore(path)?
-            .select([col("SNP"), col("L2").alias(alias)])),
+        (Some(path), _) => {
+            Ok(parse::scan_ldscore(path)?.select([col("SNP"), col("L2").alias(alias)]))
+        }
         (None, Some(prefix)) => Ok(parse::concat_chrs(prefix, ".l2.ldscore.gz")?
             .select([col("SNP"), col("L2").alias(alias)])),
         (None, None) => anyhow::bail!(
@@ -41,12 +42,14 @@ fn load_ld_ref(single: Option<&str>, chr_prefix: Option<&str>) -> Result<LazyFra
     let lf = match (single, chr_prefix) {
         (Some(path), _) => parse::scan_ldscore(path)?,
         (None, Some(prefix)) => parse::concat_chrs(prefix, ".l2.ldscore.gz")?,
-        (None, None) => anyhow::bail!(
-            "Must specify exactly one of --ref-ld / --ref-ld-chr"
-        ),
+        (None, None) => anyhow::bail!("Must specify exactly one of --ref-ld / --ref-ld-chr"),
     };
     // Drop metadata columns, keeping SNP and all L2 annotation columns.
-    let peek = lf.clone().limit(0).collect().context("peeking ref LD schema")?;
+    let peek = lf
+        .clone()
+        .limit(0)
+        .collect()
+        .context("peeking ref LD schema")?;
     let meta = ["CHR", "BP", "CM"];
     let keep: Vec<Expr> = peek
         .get_column_names()
@@ -185,7 +188,10 @@ pub fn run_h2(args: H2Args) -> Result<()> {
         .context("merging sumstats with LD scores")?;
 
     let n_total = merged.height();
-    anyhow::ensure!(n_total > 0, "No SNPs remaining after merging sumstats with LD scores");
+    anyhow::ensure!(
+        n_total > 0,
+        "No SNPs remaining after merging sumstats with LD scores"
+    );
 
     println!(
         "Loaded {} SNPs from '{}' after merging with LD scores",
@@ -193,8 +199,10 @@ pub fn run_h2(args: H2Args) -> Result<()> {
     );
 
     // Detect L2 annotation columns: everything that isn't a sumstats or weight column.
-    let non_l2_set: std::collections::HashSet<&str> =
-        ["SNP", "A1", "A2", "Z", "N", "w_l2"].iter().copied().collect();
+    let non_l2_set: std::collections::HashSet<&str> = ["SNP", "A1", "A2", "Z", "N", "w_l2"]
+        .iter()
+        .copied()
+        .collect();
     let l2_cols: Vec<String> = merged
         .get_column_names()
         .into_iter()
@@ -208,8 +216,8 @@ pub fn run_h2(args: H2Args) -> Result<()> {
         println!("  Detected K={} annotation columns (partitioned h2)", k);
     }
 
-    let chi2_raw  = extract_f64(&merged, "Z")?.mapv(|z| (z * z).max(0.0));
-    let w_l2_raw  = extract_f64(&merged, "w_l2")?.mapv(|l| l.max(0.0));
+    let chi2_raw = extract_f64(&merged, "Z")?.mapv(|z| (z * z).max(0.0));
+    let w_l2_raw = extract_f64(&merged, "w_l2")?.mapv(|l| l.max(0.0));
     let n_vec_raw = extract_f64(&merged, "N")?;
     let ref_l2_raw_k: Vec<Array1<f64>> = l2_cols
         .iter()
@@ -257,15 +265,18 @@ pub fn run_h2(args: H2Args) -> Result<()> {
     if let Some(two_step_max) = args.two_step {
         let mask1: Vec<bool> = chi2.iter().map(|&c| c <= two_step_max).collect();
         let n_s1 = mask1.iter().filter(|&&b| b).count();
-        println!("  Two-step: step 1 uses {} SNPs (chi2 <= {})", n_s1, two_step_max);
+        println!(
+            "  Two-step: step 1 uses {} SNPs (chi2 <= {})",
+            n_s1, two_step_max
+        );
 
-        let chi2_s1 = filter_by_mask(&chi2,  &mask1);
-        let l2_s1   = filter_by_mask(&ref_l2, &mask1);
-        let wl2_s1  = filter_by_mask(&w_l2,  &mask1);
-        let n_s1v   = filter_by_mask(&n_vec, &mask1);
+        let chi2_s1 = filter_by_mask(&chi2, &mask1);
+        let l2_s1 = filter_by_mask(&ref_l2, &mask1);
+        let wl2_s1 = filter_by_mask(&w_l2, &mask1);
+        let n_s1v = filter_by_mask(&n_vec, &mask1);
 
         let mut x_s1 = Array2::<f64>::zeros((n_s1, 2));
-        let mut w_s1  = Array1::<f64>::zeros(n_s1);
+        let mut w_s1 = Array1::<f64>::zeros(n_s1);
         for i in 0..n_s1 {
             x_s1[[i, 0]] = l2_s1[i];
             x_s1[[i, 1]] = 1.0;
@@ -306,12 +317,16 @@ pub fn run_h2(args: H2Args) -> Result<()> {
     let (y_reg, x_reg, fixed_intercept) = if let Some(fixed) = args.intercept_h2 {
         let y_adj = chi2.mapv(|c| c - fixed);
         let mut x = Array2::<f64>::zeros((n_obs, 1));
-        for i in 0..n_obs { x[[i, 0]] = ref_l2[i]; }
+        for i in 0..n_obs {
+            x[[i, 0]] = ref_l2[i];
+        }
         (y_adj, x, Some(fixed))
     } else if args.no_intercept {
         let y_adj = chi2.mapv(|c| c - 1.0);
         let mut x = Array2::<f64>::zeros((n_obs, 1));
-        for i in 0..n_obs { x[[i, 0]] = ref_l2[i]; }
+        for i in 0..n_obs {
+            x[[i, 0]] = ref_l2[i];
+        }
         (y_adj, x, Some(1.0f64))
     } else {
         let mut x = Array2::<f64>::zeros((n_obs, 2));
@@ -433,9 +448,7 @@ fn run_h2_partitioned(
         .context("jackknife IRWLS for partitioned h2")?;
 
     // h2_k = τ_k × M_k / N_mean
-    let h2_per_annot: Vec<f64> = (0..k)
-        .map(|j| result.est[j] * m_vec[j] / n_mean)
-        .collect();
+    let h2_per_annot: Vec<f64> = (0..k).map(|j| result.est[j] * m_vec[j] / n_mean).collect();
     let h2_total: f64 = h2_per_annot.iter().sum();
     let intercept = fixed_intercept.unwrap_or_else(|| result.est[k]);
 
@@ -456,7 +469,11 @@ fn run_h2_partitioned(
                 f64::NAN
             };
             let prop_m = m_vec[j] / m_total;
-            let enrichment = if prop_m > 1e-12 { prop_h2 / prop_m } else { f64::NAN };
+            let enrichment = if prop_m > 1e-12 {
+                prop_h2 / prop_m
+            } else {
+                f64::NAN
+            };
             // Coefficient (τ*) = τ_k / (h2_total / M_k): the per-annotation coefficient
             // normalized by mean h2 per SNP.
             let coeff = result.est[j] / n_mean;
@@ -483,7 +500,10 @@ fn run_h2_partitioned(
 // ---------------------------------------------------------------------------
 
 pub fn run_rg(args: RgArgs) -> Result<()> {
-    anyhow::ensure!(args.rg.len() >= 2, "--rg requires at least 2 sumstats files");
+    anyhow::ensure!(
+        args.rg.len() >= 2,
+        "--rg requires at least 2 sumstats files"
+    );
 
     let ref_ld = load_ld(args.ref_ld.as_deref(), args.ref_ld_chr.as_deref(), "ref_l2")?
         .collect()
@@ -498,7 +518,11 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
         println!("Using M = {:.0} from --m-snps", m);
         Some(m)
     } else if let Some(prefix) = &args.ref_ld_chr {
-        let suffix = if args.not_m_5_50 { ".l2.M" } else { ".l2.M_5_50" };
+        let suffix = if args.not_m_5_50 {
+            ".l2.M"
+        } else {
+            ".l2.M_5_50"
+        };
         match parse::read_m_total(prefix, suffix) {
             Ok(m) => {
                 println!("Read M = {:.0} from {} files", m, suffix);
@@ -537,8 +561,11 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
                 JoinArgs::new(JoinType::Inner),
             );
 
-        let ss2 = parse::scan_sumstats(file2)?
-            .select([col("SNP"), col("Z").alias("Z2"), col("N").alias("N2")]);
+        let ss2 = parse::scan_sumstats(file2)?.select([
+            col("SNP"),
+            col("Z").alias("Z2"),
+            col("N").alias("N2"),
+        ]);
 
         let merged = ss1
             .join(
@@ -556,19 +583,22 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
             continue;
         }
 
-        let z1_raw    = extract_f64(&merged, "Z1")?;
-        let z2_raw    = extract_f64(&merged, "Z2")?;
-        let prod_raw  = &z1_raw * &z2_raw;
+        let z1_raw = extract_f64(&merged, "Z1")?;
+        let z2_raw = extract_f64(&merged, "Z2")?;
+        let prod_raw = &z1_raw * &z2_raw;
         let ref_l2_raw = extract_f64(&merged, "ref_l2")?.mapv(|l| l.max(0.0));
-        let w_l2_raw   = extract_f64(&merged, "w_l2")?.mapv(|l| l.max(0.0));
-        let n1_raw    = extract_f64(&merged, "N1")?;
-        let n2_raw    = extract_f64(&merged, "N2")?;
+        let w_l2_raw = extract_f64(&merged, "w_l2")?.mapv(|l| l.max(0.0));
+        let n1_raw = extract_f64(&merged, "N1")?;
+        let n2_raw = extract_f64(&merged, "N2")?;
 
         let (prod, ref_l2, w_l2, n1, n2) = if let Some(chisq_max) = args.chisq_max {
             let mask: Vec<bool> = prod_raw.iter().map(|&p| p.abs() <= chisq_max).collect();
             let n_removed = mask.iter().filter(|&&b| !b).count();
             if n_removed > 0 {
-                println!("  Removed {} SNPs with |Z1*Z2| > {:.1}", n_removed, chisq_max);
+                println!(
+                    "  Removed {} SNPs with |Z1*Z2| > {:.1}",
+                    n_removed, chisq_max
+                );
             }
             (
                 filter_by_mask(&prod_raw, &mask),
@@ -595,22 +625,25 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
         // Per-trait liability-scale prevalences (one per file in --rg).
         let samp_prev1 = args.samp_prev.get(pair_idx).copied();
         let samp_prev2 = args.samp_prev.get(pair_idx + 1).copied();
-        let pop_prev1  = args.pop_prev.get(pair_idx).copied();
-        let pop_prev2  = args.pop_prev.get(pair_idx + 1).copied();
+        let pop_prev1 = args.pop_prev.get(pair_idx).copied();
+        let pop_prev2 = args.pop_prev.get(pair_idx + 1).copied();
 
         let (gencov, gencov_intercept) = if let Some(two_step_max) = args.two_step {
             let mask1: Vec<bool> = prod.iter().map(|&p| p.abs() <= two_step_max).collect();
             let n_s1 = mask1.iter().filter(|&&b| b).count();
-            println!("  Two-step: step 1 uses {} SNPs (|Z1*Z2| <= {})", n_s1, two_step_max);
+            println!(
+                "  Two-step: step 1 uses {} SNPs (|Z1*Z2| <= {})",
+                n_s1, two_step_max
+            );
 
             let prod_s1 = filter_by_mask(&prod, &mask1);
-            let l2_s1   = filter_by_mask(&ref_l2, &mask1);
-            let wl2_s1  = filter_by_mask(&w_l2,  &mask1);
-            let n1_s1   = filter_by_mask(&n1, &mask1);
-            let n2_s1   = filter_by_mask(&n2, &mask1);
+            let l2_s1 = filter_by_mask(&ref_l2, &mask1);
+            let wl2_s1 = filter_by_mask(&w_l2, &mask1);
+            let n1_s1 = filter_by_mask(&n1, &mask1);
+            let n2_s1 = filter_by_mask(&n2, &mask1);
 
             let mut x_s1 = Array2::<f64>::zeros((n_s1, 2));
-            let mut w_s1  = Array1::<f64>::zeros(n_s1);
+            let mut w_s1 = Array1::<f64>::zeros(n_s1);
             for i in 0..n_s1 {
                 x_s1[[i, 0]] = l2_s1[i];
                 x_s1[[i, 1]] = 1.0;
@@ -623,8 +656,8 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
             println!("  Two-step: step 1 intercept = {:.4}", intercept_fixed);
 
             let prod2 = prod.mapv(|p| p - intercept_fixed);
-            let mut x2  = Array2::<f64>::zeros((n_obs_filtered, 1));
-            let mut w2  = Array1::<f64>::zeros(n_obs_filtered);
+            let mut x2 = Array2::<f64>::zeros((n_obs_filtered, 1));
+            let mut w2 = Array1::<f64>::zeros(n_obs_filtered);
             for i in 0..n_obs_filtered {
                 x2[[i, 0]] = ref_l2[i];
                 let v = (w_l2[i] / m_snps + 1.0 / n1[i] + 1.0 / n2[i]).max(1e-9);
@@ -632,17 +665,24 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
             }
             let res2 = jackknife::jackknife(&x2, &prod2, &w2, args.n_blocks, 2)
                 .with_context(|| format!("jackknife step 2 gencov {} vs {}", file1, file2))?;
-            (res2.est[0] * m_snps / (n1_mean * n2_mean).sqrt(), intercept_fixed)
+            (
+                res2.est[0] * m_snps / (n1_mean * n2_mean).sqrt(),
+                intercept_fixed,
+            )
         } else {
             let pair_intercept = args.intercept_gencov.get(pair_idx).copied();
             let (y_reg, x_cov, fixed_intercept) = if let Some(fixed) = pair_intercept {
                 let y_adj = prod.mapv(|p| p - fixed);
                 let mut x = Array2::<f64>::zeros((n_obs_filtered, 1));
-                for i in 0..n_obs_filtered { x[[i, 0]] = ref_l2[i]; }
+                for i in 0..n_obs_filtered {
+                    x[[i, 0]] = ref_l2[i];
+                }
                 (y_adj, x, Some(fixed))
             } else if args.no_intercept {
                 let mut x = Array2::<f64>::zeros((n_obs_filtered, 1));
-                for i in 0..n_obs_filtered { x[[i, 0]] = ref_l2[i]; }
+                for i in 0..n_obs_filtered {
+                    x[[i, 0]] = ref_l2[i];
+                }
                 (prod.clone(), x, Some(0.0f64))
             } else {
                 let mut x = Array2::<f64>::zeros((n_obs_filtered, 2));
@@ -697,7 +737,10 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
             f64::NAN
         };
 
-        println!("  gencov = {:.4}  (intercept: {:.4})", gencov, gencov_intercept);
+        println!(
+            "  gencov = {:.4}  (intercept: {:.4})",
+            gencov, gencov_intercept
+        );
         println!("  h2({}) = {:.4}", file1, h2_1);
         println!("  h2({}) = {:.4}", file2, h2_2);
         println!("  rg = {:.4}", rg);
@@ -715,8 +758,10 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
             } else {
                 f64::NAN
             };
-            println!("  Liability-scale h2_1={:.4}  h2_2={:.4}  rg={:.4}",
-                h2_1_liab, h2_2_liab, rg_liab);
+            println!(
+                "  Liability-scale h2_1={:.4}  h2_2={:.4}  rg={:.4}",
+                h2_1_liab, h2_2_liab, rg_liab
+            );
         }
     }
 
@@ -727,12 +772,13 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
 // Jackknife diagnostic printer (--print-cov / --print-delete-vals)
 // ---------------------------------------------------------------------------
 
-fn print_jackknife_diagnostics(result: &crate::irwls::IrwlsResult, print_cov: bool, print_delete_vals: bool) {
-    if print_cov
-        && let Some(cov) = &result.jknife_cov
-    {
-        println!("\nJackknife covariance matrix ({n}×{n}):",
-            n = cov.nrows());
+fn print_jackknife_diagnostics(
+    result: &crate::irwls::IrwlsResult,
+    print_cov: bool,
+    print_delete_vals: bool,
+) {
+    if print_cov && let Some(cov) = &result.jknife_cov {
+        println!("\nJackknife covariance matrix ({n}×{n}):", n = cov.nrows());
         for i in 0..cov.nrows() {
             let row: Vec<String> = (0..cov.ncols())
                 .map(|j| format!("{:.6e}", cov[[i, j]]))
@@ -740,11 +786,12 @@ fn print_jackknife_diagnostics(result: &crate::irwls::IrwlsResult, print_cov: bo
             println!("  {}", row.join("  "));
         }
     }
-    if print_delete_vals
-        && let Some(dv) = &result.delete_values
-    {
-        println!("\nJackknife delete values ({} blocks × {} params):",
-            dv.nrows(), dv.ncols());
+    if print_delete_vals && let Some(dv) = &result.delete_values {
+        println!(
+            "\nJackknife delete values ({} blocks × {} params):",
+            dv.nrows(),
+            dv.ncols()
+        );
         for k in 0..dv.nrows() {
             let row: Vec<String> = (0..dv.ncols())
                 .map(|j| format!("{:.6}", dv[[k, j]]))
@@ -782,7 +829,9 @@ fn run_h2_scalar(
     let (y, x) = if let Some(fixed) = fixed_intercept {
         let y_adj = chi2.mapv(|c| c - fixed);
         let mut x = Array2::<f64>::zeros((n_obs, 1));
-        for i in 0..n_obs { x[[i, 0]] = ref_l2[i]; }
+        for i in 0..n_obs {
+            x[[i, 0]] = ref_l2[i];
+        }
         (y_adj, x)
     } else {
         let mut x = Array2::<f64>::zeros((n_obs, 2));
@@ -816,7 +865,9 @@ fn extract_f64(df: &DataFrame, name: &str) -> Result<Array1<f64>> {
     let ca = series
         .cast(&DataType::Float64)
         .with_context(|| format!("casting column '{}' to f64", name))?;
-    let ca = ca.f64().with_context(|| format!("column '{}' as f64 chunked array", name))?;
+    let ca = ca
+        .f64()
+        .with_context(|| format!("column '{}' as f64 chunked array", name))?;
     let vec: Vec<f64> = ca.into_iter().map(|v| v.unwrap_or(f64::NAN)).collect();
     Ok(Array1::from_vec(vec))
 }
@@ -956,6 +1007,11 @@ mod tests {
         assert!((z_pos - 3.0).abs() < 1e-9);
         assert!((z_neg + 3.0).abs() < 1e-9);
         // p-value is two-sided so should be the same magnitude
-        assert!((p_pos - p_neg).abs() < 1e-9, "p_pos={} p_neg={}", p_pos, p_neg);
+        assert!(
+            (p_pos - p_neg).abs() < 1e-9,
+            "p_pos={} p_neg={}",
+            p_pos,
+            p_neg
+        );
     }
 }
