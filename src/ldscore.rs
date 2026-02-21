@@ -11,11 +11,11 @@
 /// yields one column per annotation; `.M`/`.M_5_50` files are tab-separated.
 use anyhow::{Context, Result};
 use bed_reader::{Bed, ReadOptions};
-use ndarray::{s, Array1, Array2, Axis, ShapeBuilder};
+use ndarray::{Array1, Array2, Axis, ShapeBuilder, s};
 use std::collections::{HashSet, VecDeque};
-use std::ops::AddAssign;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write as IoWrite};
+use std::ops::AddAssign;
 
 use crate::cli::LdscoreArgs;
 use crate::parse;
@@ -164,9 +164,7 @@ fn get_block_lefts_f64(coords: &[f64], max_dist: f64) -> Vec<usize> {
 
 /// Fixed-SNP window: block_left[i] = max(0, i - half_window).
 fn get_block_lefts_snp(m: usize, half_window: usize) -> Vec<usize> {
-    (0..m)
-        .map(|i| i.saturating_sub(half_window))
-        .collect()
+    (0..m).map(|i| i.saturating_sub(half_window)).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -179,14 +177,22 @@ fn get_block_lefts_snp(m: usize, half_window: usize) -> Vec<usize> {
 /// Works on f32; caller casts to f64 into the pre-allocated `b_mat`.
 fn normalize_col(col: &mut Array1<f32>, n: usize) -> f64 {
     let (sum, count) = col.iter().fold((0f64, 0usize), |(s, c), &v| {
-        if v.is_nan() { (s, c) } else { (s + v as f64, c + 1) }
+        if v.is_nan() {
+            (s, c)
+        } else {
+            (s + v as f64, c + 1)
+        }
     });
     let avg = if count > 0 { sum / count as f64 } else { 0.0 };
     let freq = (avg / 2.0).clamp(0.0, 1.0);
     let maf = freq.min(1.0 - freq);
 
     for v in col.iter_mut() {
-        if v.is_nan() { *v = avg as f32; } else { *v -= avg as f32; }
+        if v.is_nan() {
+            *v = avg as f32;
+        } else {
+            *v -= avg as f32;
+        }
     }
 
     let var: f64 = col.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / n as f64;
@@ -247,7 +253,7 @@ fn compute_ldscore_global(
     let mut ring_next: usize = 0;
     let mut window: VecDeque<(usize, usize)> = VecDeque::new(); // (snp_idx, ring_slot)
 
-    let mut b_mat = Array2::<f64>::zeros((n_indiv, chunk_c));              // C-order for BLAS
+    let mut b_mat = Array2::<f64>::zeros((n_indiv, chunk_c)); // C-order for BLAS
     let mut col_buf = Array1::<f32>::zeros(n_indiv);
     let mut a_buf = Array2::<f64>::zeros((n_indiv, max_window_size.max(1)).f()); // F-order
 
@@ -259,7 +265,11 @@ fn compute_ldscore_global(
             let c = chunk_end - chunk_start;
 
             let a_left = block_left[chunk_start];
-            while window.front().map(|(idx, _)| *idx < a_left).unwrap_or(false) {
+            while window
+                .front()
+                .map(|(idx, _)| *idx < a_left)
+                .unwrap_or(false)
+            {
                 window.pop_front();
             }
 
@@ -276,7 +286,8 @@ fn compute_ldscore_global(
                 } else {
                     builder.read(bed)
                 };
-                result.with_context(|| format!("reading BED chunk [{},{})", chunk_start, chunk_end))?
+                result
+                    .with_context(|| format!("reading BED chunk [{},{})", chunk_start, chunk_end))?
             };
 
             {
@@ -296,11 +307,19 @@ fn compute_ldscore_global(
             let bb: Array2<f64> = b_slice.t().dot(&b_slice);
             for j in 0..c {
                 let j_g = chunk_start + j;
-                let pq_j = if per_allele { 2.0 * maf_per_snp[j_g] * (1.0 - maf_per_snp[j_g]) } else { 1.0 };
+                let pq_j = if per_allele {
+                    2.0 * maf_per_snp[j_g] * (1.0 - maf_per_snp[j_g])
+                } else {
+                    1.0
+                };
                 l2_scalar[j_g] += pq_j; // diagonal: r(j,j) = 1
                 for k in 0..j {
                     let k_g = chunk_start + k;
-                    let pq_k = if per_allele { 2.0 * maf_per_snp[k_g] * (1.0 - maf_per_snp[k_g]) } else { 1.0 };
+                    let pq_k = if per_allele {
+                        2.0 * maf_per_snp[k_g] * (1.0 - maf_per_snp[k_g])
+                    } else {
+                        1.0
+                    };
                     let r2u = r2_unbiased(bb[[k, j]] / n, n_indiv);
                     l2_scalar[j_g] += r2u * pq_k;
                     l2_scalar[k_g] += r2u * pq_j;
@@ -315,10 +334,18 @@ fn compute_ldscore_global(
                 }
                 let ab: Array2<f64> = a_buf.slice(s![.., ..w]).t().dot(&b_slice);
                 for (wi, (k_g, _)) in window.iter().enumerate() {
-                    let pq_k = if per_allele { 2.0 * maf_per_snp[*k_g] * (1.0 - maf_per_snp[*k_g]) } else { 1.0 };
+                    let pq_k = if per_allele {
+                        2.0 * maf_per_snp[*k_g] * (1.0 - maf_per_snp[*k_g])
+                    } else {
+                        1.0
+                    };
                     for j in 0..c {
                         let j_g = chunk_start + j;
-                        let pq_j = if per_allele { 2.0 * maf_per_snp[j_g] * (1.0 - maf_per_snp[j_g]) } else { 1.0 };
+                        let pq_j = if per_allele {
+                            2.0 * maf_per_snp[j_g] * (1.0 - maf_per_snp[j_g])
+                        } else {
+                            1.0
+                        };
                         let r2u = r2_unbiased(ab[[wi, j]] / n, n_indiv);
                         l2_scalar[j_g] += r2u * pq_k;
                         l2_scalar[*k_g] += r2u * pq_j;
@@ -334,8 +361,7 @@ fn compute_ldscore_global(
             }
         }
 
-        let l2 = Array2::from_shape_vec((m, 1), l2_scalar)
-            .expect("shape matches");
+        let l2 = Array2::from_shape_vec((m, 1), l2_scalar).expect("shape matches");
         return Ok((l2, maf_per_snp));
     }
 
@@ -355,7 +381,11 @@ fn compute_ldscore_global(
         let c = chunk_end - chunk_start;
 
         let a_left = block_left[chunk_start];
-        while window.front().map(|(idx, _)| *idx < a_left).unwrap_or(false) {
+        while window
+            .front()
+            .map(|(idx, _)| *idx < a_left)
+            .unwrap_or(false)
+        {
             window.pop_front();
         }
 
@@ -446,8 +476,10 @@ fn compute_ldscore_global(
                 annot_window.to_owned()
             };
 
-            l2.slice_mut(s![a_left_idx..chunk_start, ..]).add_assign(&r2u_ab.dot(&annot_chunk_eff));
-            l2.slice_mut(s![chunk_start..chunk_end, ..]).add_assign(&r2u_ab.t().dot(&annot_window_eff));
+            l2.slice_mut(s![a_left_idx..chunk_start, ..])
+                .add_assign(&r2u_ab.dot(&annot_chunk_eff));
+            l2.slice_mut(s![chunk_start..chunk_end, ..])
+                .add_assign(&r2u_ab.t().dot(&annot_window_eff));
         }
 
         for j in 0..c {
@@ -483,8 +515,8 @@ fn write_ldscore_refs(
     l2: &Array2<f64>,
     col_names: &[String],
 ) -> Result<()> {
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
 
     let file = File::create(path).with_context(|| format!("creating output '{}'", path))?;
     let mut gz = GzEncoder::new(file, Compression::fast());
@@ -535,7 +567,9 @@ unsafe extern "C" {
 }
 
 pub fn run(args: LdscoreArgs) -> Result<()> {
-    unsafe { openblas_set_num_threads(args.blas_threads as i32); }
+    unsafe {
+        openblas_set_num_threads(args.blas_threads as i32);
+    }
 
     let mode = if let Some(kb) = args.ld_wind_kb {
         WindowMode::Kb(kb)
@@ -549,10 +583,9 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
     let fam_path = format!("{}.fam", args.bfile);
     let bed_path = format!("{}.bed", args.bfile);
 
-    let all_snps_raw = parse_bim(&bim_path)
-        .with_context(|| format!("parsing BIM '{}'", bim_path))?;
-    let n_indiv = count_fam(&fam_path)
-        .with_context(|| format!("counting FAM '{}'", fam_path))?;
+    let all_snps_raw =
+        parse_bim(&bim_path).with_context(|| format!("parsing BIM '{}'", bim_path))?;
+    let n_indiv = count_fam(&fam_path).with_context(|| format!("counting FAM '{}'", fam_path))?;
 
     println!(
         "Loaded {} SNPs, {} individuals from '{}'",
@@ -601,8 +634,10 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
         let mut col_names: Vec<String> = Vec::new();
         for chr in &chrs {
             let chr_prefix = format!("{}{}", prefix, chr);
-            let (mat, names) = parse::read_annot(&chr_prefix, args.thin_annot)
-                .with_context(|| format!("reading annotation for chr{} (prefix '{}')", chr, prefix))?;
+            let (mat, names) =
+                parse::read_annot(&chr_prefix, args.thin_annot).with_context(|| {
+                    format!("reading annotation for chr{} (prefix '{}')", chr, prefix)
+                })?;
             if col_names.is_empty() {
                 col_names = names;
             }
@@ -633,8 +668,8 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
 
     // --keep: subset individuals for LD computation.
     let iid_indices: Option<Array1<isize>> = if let Some(ref keep_path) = args.keep {
-        let fam_ids = parse_fam(&fam_path)
-            .with_context(|| format!("parsing FAM '{}'", fam_path))?;
+        let fam_ids =
+            parse_fam(&fam_path).with_context(|| format!("parsing FAM '{}'", fam_path))?;
         Some(
             load_individual_indices(keep_path, &fam_ids)
                 .with_context(|| format!("loading keep file '{}'", keep_path))?,
@@ -717,34 +752,33 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
             .collect();
 
         let m_vals: Vec<f64> = match &annot_result {
-            Some((annot, _)) => {
-                (0..col_names.len())
-                    .map(|k| {
-                        chr_snps_all
-                            .iter()
-                            .map(|s| annot[[bed_idx_to_pos[&s.bed_idx], k]])
-                            .sum::<f64>()
-                    })
-                    .collect()
-            }
+            Some((annot, _)) => (0..col_names.len())
+                .map(|k| {
+                    chr_snps_all
+                        .iter()
+                        .map(|s| annot[[bed_idx_to_pos[&s.bed_idx], k]])
+                        .sum::<f64>()
+                })
+                .collect(),
             None => vec![chr_snps_all.len() as f64],
         };
 
         let m_5_50_vals: Vec<f64> = match &annot_result {
-            Some((annot, _)) => {
-                (0..col_names.len())
-                    .map(|k| {
-                        chr_snps_all
-                            .iter()
-                            .zip(chr_maf_all.iter())
-                            .filter(|(_, maf)| **maf >= 0.05)
-                            .map(|(s, _)| annot[[bed_idx_to_pos[&s.bed_idx], k]])
-                            .sum::<f64>()
-                    })
-                    .collect()
-            }
+            Some((annot, _)) => (0..col_names.len())
+                .map(|k| {
+                    chr_snps_all
+                        .iter()
+                        .zip(chr_maf_all.iter())
+                        .filter(|(_, maf)| **maf >= 0.05)
+                        .map(|(s, _)| annot[[bed_idx_to_pos[&s.bed_idx], k]])
+                        .sum::<f64>()
+                })
+                .collect(),
             None => {
-                let m_5_50 = chr_maf_all.iter().filter(|&&m| (0.05..=0.5).contains(&m)).count();
+                let m_5_50 = chr_maf_all
+                    .iter()
+                    .filter(|&&m| (0.05..=0.5).contains(&m))
+                    .count();
                 vec![m_5_50 as f64]
             }
         };
@@ -797,10 +831,7 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
 /// Strand-ambiguous allele pairs (A/T, C/G) — excluded from regression by default.
 #[allow(dead_code)]
 pub fn is_strand_ambiguous(a1: &str, a2: &str) -> bool {
-    matches!(
-        (a1, a2),
-        ("A", "T") | ("T", "A") | ("C", "G") | ("G", "C")
-    )
+    matches!((a1, a2), ("A", "T") | ("T", "A") | ("C", "G") | ("G", "C"))
 }
 
 /// Return the complement nucleotide.
@@ -832,8 +863,8 @@ mod tests {
         use tempfile::NamedTempFile;
 
         let mut f = NamedTempFile::new().unwrap();
-        write!(f, "1\trs123\t0.5\t12345\tA\tG\n").unwrap();
-        write!(f, "1\trs456\t1.0\t99999\tC\tT\n").unwrap();
+        writeln!(f, "1\trs123\t0.5\t12345\tA\tG").unwrap();
+        writeln!(f, "1\trs456\t1.0\t99999\tC\tT").unwrap();
 
         let recs = parse_bim(f.path().to_str().unwrap()).unwrap();
         assert_eq!(recs.len(), 2);
@@ -870,7 +901,10 @@ mod tests {
     fn test_normalize_col_constant() {
         let mut col = Array1::from_vec(vec![2.0f32, 2.0, 2.0, 2.0]);
         normalize_col(&mut col, 4);
-        assert!(col.iter().all(|&v| v == 0.0), "constant column should be all zeros");
+        assert!(
+            col.iter().all(|&v| v == 0.0),
+            "constant column should be all zeros"
+        );
     }
 
     #[test]
@@ -882,7 +916,11 @@ mod tests {
         let mean: f64 = col.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
         let var: f64 = col.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n as f64;
         assert!(mean.abs() < 1e-5, "mean should be ~0, got {}", mean);
-        assert!((var - 1.0).abs() < 1e-5, "variance should be ~1, got {}", var);
+        assert!(
+            (var - 1.0).abs() < 1e-5,
+            "variance should be ~1, got {}",
+            var
+        );
     }
 
     // -- Allele helpers ------------------------------------------------------
