@@ -45,3 +45,20 @@ jobs:
 
       - name: cargo test
         run: cargo test --release  # ldscore_smoke is #[ignore] — needs large BED file
+
+      - name: Dump OpenBLAS build logs on failure
+        if: failure()
+        run: |
+          echo "Searching for OpenBLAS build logs..."
+          find target -type f \( -name out.log -o -name err.log \) -print || true
+          for f in $(find target -type f \( -name out.log -o -name err.log \) -print); do
+            echo "===== $f ====="
+            tail -n 200 "$f" || true
+          done
+          if [ -d "$HOME/.local/share" ]; then
+            find "$HOME/.local/share" -type f \( -name out.log -o -name err.log \) -print || true
+            for f in $(find "$HOME/.local/share" -type f \( -name out.log -o -name err.log \) -print); do
+              echo "===== $f ====="
+              tail -n 200 "$f" || true
+            done
+          fi
