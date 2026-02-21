@@ -62,6 +62,14 @@ pub struct MungeArgs {
     #[arg(long)]
     pub merge_alleles: Option<String>,
 
+    /// Parse Stephan Ripke's daner format (infer N_cas/N_con from FRQ_A_/FRQ_U_ headers).
+    #[arg(long, default_value_t = false)]
+    pub daner: bool,
+
+    /// Parse newer daner format (uses Nca/Nco columns for N_cas/N_con).
+    #[arg(long, default_value_t = false)]
+    pub daner_n: bool,
+
     /// Minimum sample size to retain a SNP (0 → Python default: 90th percentile / 1.5)
     #[arg(long, default_value_t = 0.0)]
     pub n_min: f64,
@@ -234,10 +242,19 @@ pub struct LdscoreArgs {
     #[arg(long)]
     pub keep: Option<String>,
 
-    /// Compute per-allele LD scores: weight each r² by 2·p·(1−p) of the source SNP.
-    /// L2[i] = Σ_j r²_unbiased(i,j) × 2·p_j·(1−p_j).
+    /// Compute per-allele LD scores: weight each r² by p·(1−p) of the source SNP.
+    /// L2[i] = Σ_j r²_unbiased(i,j) × p_j·(1−p_j).
     #[arg(long, default_value_t = false)]
     pub per_allele: bool,
+
+    /// Generalized per-allele weighting: weight each r² by (p·(1−p))^S.
+    /// Equivalent to --per-allele when S=1; incompatible with --per-allele.
+    #[arg(long)]
+    pub pq_exp: Option<f64>,
+
+    /// No-op (accepted for Python CLI parity): Rust does not emit annot matrices in ldscore.
+    #[arg(long, default_value_t = false)]
+    pub no_print_annot: bool,
 
     /// Number of SNPs to process per BLAS chunk (default 50).
     /// Larger values change the window approximation slightly.
@@ -449,6 +466,10 @@ pub struct RgArgs {
     /// If fewer values than pairs are given, remaining pairs are freely estimated.
     #[arg(long, value_delimiter = ',')]
     pub intercept_gencov: Vec<f64>,
+
+    /// Fix per-trait h2 intercepts (comma-separated, one per trait in --rg order).
+    #[arg(long, value_delimiter = ',')]
+    pub intercept_h2: Vec<f64>,
 
     /// Skip allele consistency checking between summary statistic files.
     /// When set, skips allele alignment and mismatch filtering.

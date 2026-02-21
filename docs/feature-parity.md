@@ -44,10 +44,13 @@ Run date: 2026-02-21
 - This generates a `.annot` file that is then used with `ldsc ldscore --annot`.
 - Keeping it separate avoids changes to the LD score hot path.
 
-## Remaining Gaps
+## Additional Parity Flags
 
-These features remain unimplemented:
-1. `ldscore --pq-exp` (generalized per-allele weighting).
-2. `munge-sumstats --daner` / `--daner-n` (Ripke daner format).
-3. `ldscore --no-print-annot` (print suppression; low value).
-4. `rg --intercept-h2` (fix per-trait h2 intercepts in rg).
+These previously missing flags are now implemented:
+1. `ldscore --pq-exp` (generalized per-allele weighting). Output column names and `.M` files
+   include the `_S{exp}` suffix, matching Python.
+2. `munge-sumstats --daner` / `--daner-n` (Ripke daner formats). `--daner` infers `N_cas/N_con`
+   from FRQ headers; `--daner-n` consumes `Nca/Nco` columns.
+3. `rg --intercept-h2` (fix per-trait h2 intercepts in rg).
+4. `ldscore --no-print-annot` is accepted for CLI parity and emits a warning (Rust does not
+   generate `.annot` from `ldscore`).

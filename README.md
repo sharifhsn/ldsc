@@ -177,6 +177,7 @@ Key flags: `--signed-sumstats COLNAME,null_value` tells the tool which column ca
 null value is (e.g. `BETA,0`, `OR,1`, `Z,0`). Without this flag the tool auto-detects from BETA/LOG_ODDS/OR/Z columns.
 `--a1-inc` skips the signed column and treats all Z-scores as positive (A1 is always the risk allele).
 `--merge-alleles` enforces allele concordance (mismatches are removed), matching Python behavior.
+Use `--daner` or `--daner-n` for Ripke daner formats (infers N from FRQ_[A/U] headers or Nca/Nco columns).
 
 ### ldscore
 
@@ -199,6 +200,7 @@ ldsc ldscore \
   [--maf 0.01 --maf-pre] \
   [--keep keep_individuals.txt] \
   [--per-allele] \
+  [--pq-exp 1.0] \
   [--blas-threads 4]
 ```
 
@@ -209,6 +211,10 @@ Window flags are mutually exclusive: `--ld-wind-cm` (genetic distance, default 1
 
 Partitioned LD scores with `--annot prefix`: expects `{prefix}{chr}.annot[.gz]` for each chromosome present in
 the BIM, outputs one L2 column per annotation and corresponding `.l2.M` / `.l2.M_5_50` files.
+
+`--per-allele` is equivalent to `--pq-exp 1` (weights each r² by p·(1−p)). Use `--pq-exp S` to
+apply (p·(1−p))^S weighting; output columns and `.M` files receive a `_S{S}` suffix.
+`--no-print-annot` is accepted for Python CLI parity but is a no-op (warns when used).
 
 ### h2
 
@@ -258,7 +264,7 @@ ldsc rg \
 
 `--ref-ld-chr` / `--w-ld-chr` follow the same prefix convention as `h2` (see above).
 
-Common options: `--no-intercept`, `--intercept-gencov 0.0,0.0` (per-pair), `--two-step 30`,
+Common options: `--no-intercept`, `--intercept-h2 1,1,1` (one per trait), `--intercept-gencov 0.0,0.0` (per-pair), `--two-step 30`,
 `--samp-prev` / `--pop-prev` (comma-separated, one value per input file).
 
 ### make-annot
@@ -352,22 +358,20 @@ Python's `--l2` flag (LD score estimation mode) becomes the `ldscore` subcommand
 - **`--chunksize`**: Python requires explicit chunking for large files; Rust uses Polars LazyFrame
   streaming and ignores chunk size for munge.
 - **`--return-silly-things` / `--invert-anyway`**: accepted flags for CLI parity; Rust never clips
-  results and always uses a least-squares solver.
+  results and always uses a least-squares solver (warnings emitted).
+- **`--no-print-annot`**: accepted for CLI parity but does not affect output (warning emitted).
 - **`--cts-bin` workflow**: implemented as a separate preprocessor (`ldsc cts-annot`), then
   use `ldsc ldscore --annot`.
 
 ---
 
-## Unimplemented Features
+## No-op Flags (Warned)
 
-The following Python flags have no Rust equivalent and are not planned:
+The following Python flags are accepted for CLI parity but do not change behavior in Rust:
 
-| Subcommand | Flag | Reason |
-|------------|------|--------|
-| `munge-sumstats` | `--daner` / `--daner-n` | Ripke daner format; niche use case |
-| `ldscore` | `--pq-exp` | Generalised per-allele weighting; rare |
-| `ldscore` | `--no-print-annot` | Print-suppression flag; trivial |
-| `rg` | `--intercept-h2` | Fix per-trait h2 intercepts in rg |
+- `ldscore --no-print-annot` (cts-annot always writes output)
+- `h2/rg --return-silly-things`
+- `h2/rg --invert-anyway`
 
 ---
 

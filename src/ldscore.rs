@@ -221,7 +221,7 @@ fn compute_ldscore_global(
     chunk_c: usize,
     annot: Option<&Array2<f64>>,
     iid_indices: Option<&Array1<isize>>,
-    per_allele: bool,
+    pq_exp: Option<f64>,
     yes_really: bool,
 ) -> Result<(Array2<f64>, Vec<f64>)> {
     let m = all_snps.len();
@@ -314,16 +314,18 @@ fn compute_ldscore_global(
             let bb: Array2<f64> = b_slice.t().dot(&b_slice);
             for j in 0..c {
                 let j_g = chunk_start + j;
-                let pq_j = if per_allele {
-                    2.0 * maf_per_snp[j_g] * (1.0 - maf_per_snp[j_g])
+                let pq_j = if let Some(exp) = pq_exp {
+                    let p = maf_per_snp[j_g];
+                    (p * (1.0 - p)).powf(exp)
                 } else {
                     1.0
                 };
                 l2_scalar[j_g] += pq_j; // diagonal: r(j,j) = 1
                 for k in 0..j {
                     let k_g = chunk_start + k;
-                    let pq_k = if per_allele {
-                        2.0 * maf_per_snp[k_g] * (1.0 - maf_per_snp[k_g])
+                    let pq_k = if let Some(exp) = pq_exp {
+                        let p = maf_per_snp[k_g];
+                        (p * (1.0 - p)).powf(exp)
                     } else {
                         1.0
                     };
@@ -341,15 +343,17 @@ fn compute_ldscore_global(
                 }
                 let ab: Array2<f64> = a_buf.slice(s![.., ..w]).t().dot(&b_slice);
                 for (wi, (k_g, _)) in window.iter().enumerate() {
-                    let pq_k = if per_allele {
-                        2.0 * maf_per_snp[*k_g] * (1.0 - maf_per_snp[*k_g])
+                    let pq_k = if let Some(exp) = pq_exp {
+                        let p = maf_per_snp[*k_g];
+                        (p * (1.0 - p)).powf(exp)
                     } else {
                         1.0
                     };
                     for j in 0..c {
                         let j_g = chunk_start + j;
-                        let pq_j = if per_allele {
-                            2.0 * maf_per_snp[j_g] * (1.0 - maf_per_snp[j_g])
+                        let pq_j = if let Some(exp) = pq_exp {
+                            let p = maf_per_snp[j_g];
+                            (p * (1.0 - p)).powf(exp)
                         } else {
                             1.0
                         };
@@ -427,11 +431,12 @@ fn compute_ldscore_global(
 
         let annot_chunk = annot.slice(s![chunk_start..chunk_end, ..]);
 
-        // Scale annotation rows by 2p(1−p) for --per-allele.
-        let annot_chunk_eff: Array2<f64> = if per_allele {
+        // Scale annotation rows by (p·(1−p))^S for --pq-exp / --per-allele.
+        let annot_chunk_eff: Array2<f64> = if let Some(exp) = pq_exp {
             let mut eff = annot_chunk.to_owned();
             for j in 0..c {
-                let pq = 2.0 * maf_per_snp[chunk_start + j] * (1.0 - maf_per_snp[chunk_start + j]);
+                let p = maf_per_snp[chunk_start + j];
+                let pq = (p * (1.0 - p)).powf(exp);
                 eff.row_mut(j).mapv_inplace(|v| v * pq);
             }
             eff
@@ -472,10 +477,11 @@ fn compute_ldscore_global(
             }
 
             let annot_window = annot.slice(s![a_left_idx..chunk_start, ..]);
-            let annot_window_eff: Array2<f64> = if per_allele {
+            let annot_window_eff: Array2<f64> = if let Some(exp) = pq_exp {
                 let mut eff = annot_window.to_owned();
                 for (wi, (w_g, _)) in window.iter().enumerate() {
-                    let pq = 2.0 * maf_per_snp[*w_g] * (1.0 - maf_per_snp[*w_g]);
+                    let p = maf_per_snp[*w_g];
+                    let pq = (p * (1.0 - p)).powf(exp);
                     eff.row_mut(wi).mapv_inplace(|v| v * pq);
                 }
                 eff
@@ -591,6 +597,15 @@ fn write_ldscore_refs(
     Ok(())
 }
 
+fn format_m_vals(vals: &[f64]) -> String {
+    let joined = vals
+        .iter()
+        .map(|v| format!("{v}"))
+        .collect::<Vec<_>>()
+        .join("\t");
+    format!("{joined}\n")
+}
+
 // ---------------------------------------------------------------------------
 // SNP set loader (--extract / --print-snps)
 // ---------------------------------------------------------------------------
@@ -615,6 +630,22 @@ fn load_snp_set(path: &str) -> Result<HashSet<String>> {
 }
 
 pub fn run(args: LdscoreArgs) -> Result<()> {
+    if args.no_print_annot {
+        println!(
+            "WARNING: --no-print-annot is a no-op in the Rust port; \
+             cts-annot always writes an annot file."
+        );
+    }
+    if args.per_allele && args.pq_exp.is_some() {
+        anyhow::bail!(
+            "Cannot set both --per-allele and --pq-exp (--per-allele is equivalent to --pq-exp 1)."
+        );
+    }
+    let pq_exp = if args.per_allele {
+        Some(1.0)
+    } else {
+        args.pq_exp
+    };
     let mode = if let Some(kb) = args.ld_wind_kb {
         WindowMode::Kb(kb)
     } else if let Some(snp) = args.ld_wind_snp {
@@ -796,7 +827,7 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
         chunk_c,
         annot_ref,
         iid_indices.as_ref(),
-        args.per_allele,
+        pq_exp,
         args.yes_really,
     )
     .context("computing LD scores")?;
@@ -808,10 +839,21 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
         .map(|(i, s)| (s.bed_idx, i))
         .collect();
 
+    let scale_suffix = pq_exp.map(|exp| format!("_S{}", exp)).unwrap_or_default();
     let col_names: Vec<String> = match &annot_result {
-        None => vec!["L2".to_string()],
-        Some((_, names)) => names.iter().map(|n| format!("{}L2", n)).collect(),
+        None => vec![format!("L2{}", scale_suffix)],
+        Some((_, names)) => names
+            .iter()
+            .map(|n| format!("{}L2{}", n, scale_suffix))
+            .collect(),
     };
+
+    let pq_per_snp: Option<Vec<f64>> = pq_exp.map(|exp| {
+        maf_per_snp
+            .iter()
+            .map(|&p| (p * (1.0 - p)).powf(exp))
+            .collect()
+    });
 
     let mut chrs: Vec<u8> = all_snps
         .iter()
@@ -863,11 +905,30 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
                 .map(|k| {
                     chr_snps_all
                         .iter()
-                        .map(|s| annot[[bed_idx_to_pos[&s.bed_idx], k]])
+                        .map(|s| {
+                            let pos = bed_idx_to_pos[&s.bed_idx];
+                            let base = annot[[pos, k]];
+                            if let Some(pq) = pq_per_snp.as_ref() {
+                                base * pq[pos]
+                            } else {
+                                base
+                            }
+                        })
                         .sum::<f64>()
                 })
                 .collect(),
-            None => vec![chr_snps_all.len() as f64],
+            None => {
+                if let Some(pq) = pq_per_snp.as_ref() {
+                    vec![
+                        chr_snps_all
+                            .iter()
+                            .map(|s| pq[bed_idx_to_pos[&s.bed_idx]])
+                            .sum::<f64>(),
+                    ]
+                } else {
+                    vec![chr_snps_all.len() as f64]
+                }
+            }
         };
 
         let m_5_50_vals: Vec<f64> = match &annot_result {
@@ -877,42 +938,45 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
                         .iter()
                         .zip(chr_maf_all.iter())
                         .filter(|(_, maf)| **maf >= 0.05)
-                        .map(|(s, _)| annot[[bed_idx_to_pos[&s.bed_idx], k]])
+                        .map(|(s, _)| {
+                            let pos = bed_idx_to_pos[&s.bed_idx];
+                            let base = annot[[pos, k]];
+                            if let Some(pq) = pq_per_snp.as_ref() {
+                                base * pq[pos]
+                            } else {
+                                base
+                            }
+                        })
                         .sum::<f64>()
                 })
                 .collect(),
             None => {
-                let m_5_50 = chr_maf_all
-                    .iter()
-                    .filter(|&&m| (0.05..=0.5).contains(&m))
-                    .count();
-                vec![m_5_50 as f64]
+                if let Some(pq) = pq_per_snp.as_ref() {
+                    vec![
+                        chr_snps_all
+                            .iter()
+                            .zip(chr_maf_all.iter())
+                            .filter(|(_, maf)| **maf >= 0.05)
+                            .map(|(s, _)| pq[bed_idx_to_pos[&s.bed_idx]])
+                            .sum::<f64>(),
+                    ]
+                } else {
+                    let m_5_50 = chr_maf_all
+                        .iter()
+                        .filter(|&&m| (0.05..=0.5).contains(&m))
+                        .count();
+                    vec![m_5_50 as f64]
+                }
             }
         };
 
         let m_path = format!("{}{}.l2.M", args.out, chr);
-        std::fs::write(
-            &m_path,
-            m_vals
-                .iter()
-                .map(|v| format!("{:.0}", v))
-                .collect::<Vec<_>>()
-                .join("\t")
-                + "\n",
-        )
-        .with_context(|| format!("writing M file '{}'", m_path))?;
+        std::fs::write(&m_path, format_m_vals(&m_vals))
+            .with_context(|| format!("writing M file '{}'", m_path))?;
 
         let m_5_50_path = format!("{}{}.l2.M_5_50", args.out, chr);
-        std::fs::write(
-            &m_5_50_path,
-            m_5_50_vals
-                .iter()
-                .map(|v| format!("{:.0}", v))
-                .collect::<Vec<_>>()
-                .join("\t")
-                + "\n",
-        )
-        .with_context(|| format!("writing M_5_50 file '{}'", m_5_50_path))?;
+        std::fs::write(&m_5_50_path, format_m_vals(&m_5_50_vals))
+            .with_context(|| format!("writing M_5_50 file '{}'", m_5_50_path))?;
 
         println!(
             "chr {}: {} SNPs → {} (M={}, M_5_50={})",
@@ -921,12 +985,12 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
             out_path,
             m_vals
                 .iter()
-                .map(|v| format!("{:.0}", v))
+                .map(|v| format!("{v}"))
                 .collect::<Vec<_>>()
                 .join(","),
             m_5_50_vals
                 .iter()
-                .map(|v| format!("{:.0}", v))
+                .map(|v| format!("{v}"))
                 .collect::<Vec<_>>()
                 .join(","),
         );
@@ -1119,6 +1183,16 @@ mod tests {
         code(gt[0]) | (code(gt[1]) << 2) | (code(gt[2]) << 4) | (code(gt[3]) << 6)
     }
 
+    fn read_gz(path: &str) -> String {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let file = std::fs::File::open(path).expect("open gz");
+        let mut decoder = GzDecoder::new(file);
+        let mut s = String::new();
+        decoder.read_to_string(&mut s).expect("read gz");
+        s
+    }
+
     #[test]
     fn test_maf_pre_changes_m_counts() {
         let dir = tempfile::tempdir().unwrap();
@@ -1140,6 +1214,8 @@ mod tests {
             print_snps: None,
             keep: None,
             per_allele: false,
+            pq_exp: None,
+            no_print_annot: false,
             chunk_size: 50,
             yes_really: true,
         };
@@ -1148,5 +1224,47 @@ mod tests {
         let m_path = format!("{}1.l2.M", out);
         let m = std::fs::read_to_string(m_path).unwrap();
         assert_eq!(m.trim(), "1", "pre-filter should keep 1 SNP");
+    }
+
+    #[test]
+    fn test_pq_exp_writes_scaled_m_and_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = write_plink_small(dir.path());
+        let out_dir = tempfile::tempdir().unwrap();
+        let out = out_dir.path().join("out").to_string_lossy().to_string();
+
+        let args = LdscoreArgs {
+            bfile: prefix,
+            out: out.clone(),
+            ld_wind_cm: 1.0,
+            ld_wind_kb: None,
+            ld_wind_snp: Some(1),
+            annot: None,
+            thin_annot: false,
+            extract: None,
+            maf: None,
+            maf_pre: false,
+            print_snps: None,
+            keep: None,
+            per_allele: false,
+            pq_exp: Some(1.0),
+            no_print_annot: false,
+            chunk_size: 50,
+            yes_really: true,
+        };
+        run(args).unwrap();
+
+        let m_path = format!("{}1.l2.M", out);
+        let m = std::fs::read_to_string(m_path).unwrap();
+        assert!(m.trim().starts_with("0.25"));
+
+        let m_5_50_path = format!("{}1.l2.M_5_50", out);
+        let m_5_50 = std::fs::read_to_string(m_5_50_path).unwrap();
+        assert!(m_5_50.trim().starts_with("0.25"));
+
+        let ld_path = format!("{}1.l2.ldscore.gz", out);
+        let content = read_gz(&ld_path);
+        let header = content.lines().next().unwrap_or("");
+        assert!(header.contains("L2_S1"));
     }
 }

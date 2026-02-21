@@ -86,11 +86,19 @@ fn cname_lookup(upper: &str) -> Option<&'static str> {
 // ---------------------------------------------------------------------------
 
 pub fn run(args: MungeArgs) -> Result<()> {
+    let mut args = args;
     if args.no_alleles && args.merge_alleles.is_some() {
         anyhow::bail!("--no-alleles and --merge-alleles are not compatible");
     }
+    if args.daner && args.daner_n {
+        anyhow::bail!(
+            "--daner and --daner-n are not compatible. Use --daner for sample size from \
+             FRQ_A/FRQ_U headers, use --daner-n for values from Nca/Nco columns"
+        );
+    }
     let lf = parse::scan_sumstats(&args.sumstats)?;
     let lf = apply_ignore(lf, args.ignore.as_deref())?;
+    let lf = apply_daner_overrides(lf, &mut args)?;
     // Apply user overrides before synonym map so non-standard names are canonicalised.
     let lf = apply_col_overrides(lf, &args)?;
     let lf = normalize_columns(lf)?;
@@ -173,6 +181,98 @@ fn apply_ignore(lf: LazyFrame, ignore_csv: Option<&str>) -> Result<LazyFrame> {
         .collect();
 
     Ok(lf.select(keep_cols))
+}
+
+fn drop_columns(lf: LazyFrame, drop_cols: &[String]) -> Result<LazyFrame> {
+    if drop_cols.is_empty() {
+        return Ok(lf);
+    }
+    let header = lf.clone().limit(0).collect()?;
+    let keep_cols: Vec<Expr> = header
+        .get_column_names()
+        .iter()
+        .filter(|c| !drop_cols.iter().any(|d| d.as_str() == c.as_str()))
+        .map(|c| col(c.as_str()))
+        .collect();
+    Ok(lf.select(keep_cols))
+}
+
+// ---------------------------------------------------------------------------
+// daner format helpers (--daner / --daner-n)
+// ---------------------------------------------------------------------------
+
+fn apply_daner_overrides(lf: LazyFrame, args: &mut MungeArgs) -> Result<LazyFrame> {
+    if !args.daner && !args.daner_n {
+        return Ok(lf);
+    }
+
+    let header = lf.clone().limit(0).collect()?;
+    let cols: Vec<String> = header
+        .get_column_names()
+        .iter()
+        .map(|c| c.to_string())
+        .collect();
+
+    let find_prefix = |prefix: &str| cols.iter().find(|c| c.starts_with(prefix)).cloned();
+
+    let frq_u = find_prefix("FRQ_U_")
+        .with_context(|| "Could not find FRQ_U_* column expected for daner format")?;
+
+    let mut lf = lf;
+
+    // Drop any existing FRQ synonyms so the daner FRQ_U_* column wins.
+    let drop_frq: Vec<String> = cols
+        .iter()
+        .filter(|name| cname_lookup(&name.to_uppercase()) == Some("FRQ") && name.as_str() != frq_u)
+        .cloned()
+        .collect();
+    lf = drop_columns(lf, &drop_frq)?;
+
+    if frq_u != "FRQ" {
+        lf = lf.rename([frq_u.clone()], vec!["FRQ".to_string()], false);
+    }
+
+    if args.daner {
+        let frq_a = find_prefix("FRQ_A_")
+            .with_context(|| "Could not find FRQ_A_* column expected for daner format")?;
+        let n_con: f64 = frq_u
+            .strip_prefix("FRQ_U_")
+            .context("FRQ_U_* column missing numeric suffix")?
+            .parse()
+            .context("Parsing N_con from FRQ_U_* suffix")?;
+        let n_cas: f64 = frq_a
+            .strip_prefix("FRQ_A_")
+            .context("FRQ_A_* column missing numeric suffix")?
+            .parse()
+            .context("Parsing N_cas from FRQ_A_* suffix")?;
+        println!(
+            "  --daner: inferred N_cas = {} and N_con = {} from FRQ_[A/U] headers",
+            n_cas, n_con
+        );
+        args.n_cas = Some(n_cas);
+        args.n_con = Some(n_con);
+    }
+
+    if args.daner_n {
+        let nca = cols
+            .iter()
+            .find(|c| c.as_str() == "Nca")
+            .cloned()
+            .context("Could not find Nca column expected for daner-n format")?;
+        let nco = cols
+            .iter()
+            .find(|c| c.as_str() == "Nco")
+            .cloned()
+            .context("Could not find Nco column expected for daner-n format")?;
+        if nca != "N_CAS" {
+            lf = lf.rename([nca], vec!["N_CAS".to_string()], false);
+        }
+        if nco != "N_CON" {
+            lf = lf.rename([nco], vec!["N_CON".to_string()], false);
+        }
+    }
+
+    Ok(lf)
 }
 
 // ---------------------------------------------------------------------------
@@ -786,6 +886,8 @@ mod tests {
             sumstats: sumstats.to_string(),
             out: out.to_string(),
             merge_alleles: None,
+            daner: false,
+            daner_n: false,
             n_min: 0.0,
             maf: 0.01,
             info_min: 0.9,
@@ -888,5 +990,57 @@ mod tests {
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2, "expected header + 1 row");
         assert!(lines[1].starts_with("rs5\t"));
+    }
+
+    #[test]
+    fn test_daner_infers_n_from_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let sumstats = dir.path().join("sumstats.txt");
+        let out = dir.path().join("out");
+        std::fs::write(
+            &sumstats,
+            "SNP A1 A2 FRQ_U_123 FRQ_A_456 Z\nrs1 A G 0.1 0.2 1.0\nrs2 C T 0.2 0.3 2.0\n",
+        )
+        .unwrap();
+
+        let mut args = base_args(sumstats.to_str().unwrap(), out.to_str().unwrap());
+        args.daner = true;
+        args.keep_maf = true;
+        run(args).unwrap();
+
+        let content = read_gz(&format!("{}.sumstats.gz", out.to_str().unwrap()));
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines[0], "SNP\tA1\tA2\tZ\tN\tFRQ");
+        let fields: Vec<&str> = lines[1].split('\t').collect();
+        let n: f64 = fields[4].parse().unwrap();
+        let frq: f64 = fields[5].parse().unwrap();
+        assert!((n - 579.0).abs() < 1e-9);
+        assert!((frq - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_daner_n_uses_nca_nco_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let sumstats = dir.path().join("sumstats.txt");
+        let out = dir.path().join("out");
+        std::fs::write(
+            &sumstats,
+            "SNP A1 A2 FRQ_U_100 Nca Nco Z\nrs1 A G 0.12 10 20 1.0\nrs2 C T 0.25 10 20 2.0\n",
+        )
+        .unwrap();
+
+        let mut args = base_args(sumstats.to_str().unwrap(), out.to_str().unwrap());
+        args.daner_n = true;
+        args.keep_maf = true;
+        run(args).unwrap();
+
+        let content = read_gz(&format!("{}.sumstats.gz", out.to_str().unwrap()));
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines[0], "SNP\tA1\tA2\tZ\tN\tFRQ");
+        let fields: Vec<&str> = lines[1].split('\t').collect();
+        let n: f64 = fields[4].parse().unwrap();
+        let frq: f64 = fields[5].parse().unwrap();
+        assert!((n - 30.0).abs() < 1e-9);
+        assert!((frq - 0.12).abs() < 1e-9);
     }
 }

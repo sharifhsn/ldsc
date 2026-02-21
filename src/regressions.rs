@@ -379,6 +379,14 @@ fn align_rg_alleles(merged: &DataFrame, z2: &Array1<f64>) -> Result<(Vec<bool>, 
 // ---------------------------------------------------------------------------
 
 pub fn run_h2(args: H2Args) -> Result<()> {
+    if args.return_silly_things {
+        println!(
+            "WARNING: --return-silly-things is accepted for CLI parity but has no effect in Rust."
+        );
+    }
+    if args.invert_anyway {
+        println!("WARNING: --invert-anyway is accepted for CLI parity but has no effect in Rust.");
+    }
     if args.h2_cts.is_some() {
         return run_h2_cts(&args);
     }
@@ -1341,6 +1349,26 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
         args.rg.len() >= 2,
         "--rg requires at least 2 sumstats files"
     );
+    if args.return_silly_things {
+        println!(
+            "WARNING: --return-silly-things is accepted for CLI parity but has no effect in Rust."
+        );
+    }
+    if args.invert_anyway {
+        println!("WARNING: --invert-anyway is accepted for CLI parity but has no effect in Rust.");
+    }
+
+    let n_traits = args.rg.len();
+    anyhow::ensure!(
+        args.intercept_h2.is_empty() || args.intercept_h2.len() == n_traits,
+        "--intercept-h2 expects one value per trait ({} values for this run)",
+        n_traits
+    );
+    let intercept_h2 = if args.intercept_h2.is_empty() {
+        None
+    } else {
+        Some(args.intercept_h2.as_slice())
+    };
 
     let ref_ld = load_ld(args.ref_ld.as_deref(), args.ref_ld_chr.as_deref(), "ref_l2")?
         .collect()
@@ -1594,8 +1622,12 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
 
         let chi2_1 = extract_f64(&merged, "Z1")?.mapv(|z| (z * z).max(0.0));
         let chi2_2 = extract_f64(&merged, "Z2")?.mapv(|z| (z * z).max(0.0));
-        // When --no-intercept is set, fix the univariate h2 intercepts at 1 (matching Python).
-        let h2_fixed_int = if args.no_intercept { Some(1.0) } else { None };
+        let h2_int1 = intercept_h2
+            .map(|vals| vals[pair_idx])
+            .or(if args.no_intercept { Some(1.0) } else { None });
+        let h2_int2 = intercept_h2
+            .map(|vals| vals[pair_idx + 1])
+            .or(if args.no_intercept { Some(1.0) } else { None });
         let h2_1 = run_h2_scalar(
             &chi2_1,
             &ref_l2_raw2(&merged)?,
@@ -1603,7 +1635,7 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
             &n1_raw2(&merged)?,
             m_snps,
             args.n_blocks,
-            h2_fixed_int,
+            h2_int1,
         )?;
         let h2_2 = run_h2_scalar(
             &chi2_2,
@@ -1612,7 +1644,7 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
             &n2_raw2(&merged)?,
             m_snps,
             args.n_blocks,
-            h2_fixed_int,
+            h2_int2,
         )?;
 
         let rg = if h2_1 > 0.0 && h2_2 > 0.0 {
