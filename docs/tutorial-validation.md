@@ -94,3 +94,74 @@ version or HM3 list. The direction, sign, and order of magnitude are all correct
 
 All flag renames work as expected (`--a1-col`, `--a2-col`, auto-detection of `BETA,0`).
 The `--merge-alleles` SNP count matches upstream Python to within 0.015%.
+
+## Wiki-Based Validation Checklist (Python LDSC → Rust)
+
+This section maps the upstream `ldsc.wiki` expectations to the Rust CLI and notes
+parity status for functional equivalence.
+
+### Supported / Parity-Checked
+
+| Wiki expectation | Rust mapping | Notes |
+|---|---|---|
+| `.sumstats` requires `SNP`, `A1`, `A2`, `N`, and signed stats (`Z` or P + signed column) | `ldsc munge-sumstats` writes `SNP A1 A2 Z N` (plus `FRQ` with `--keep-maf`) | Z is signed w.r.t. `A1`; `--a1-inc` covers “A1 always increasing” inputs |
+| INFO/MAF filters and strand-ambiguous removal | `--info-min` default 0.9, `--maf` default 0.01, strand ambiguous A/T and C/G removed | Matches wiki defaults for INFO/MAF and ambiguity filtering |
+| Constant sample size or per-SNP `N` | `--n`, `--n-cas`, `--n-con`, or per-row `N` | Matches wiki guidance for fixed/variable sample sizes |
+| LD score estimation from PLINK (`--l2`) | `ldsc ldscore --bfile … --ld-wind-cm/--ld-wind-kb/--ld-wind-snp …` | Emits `.l2.ldscore.gz`, `.l2.M`, `.l2.M_5_50` per chromosome |
+| `--ref-ld-chr` / `--w-ld-chr` with `@` placeholder | `ldsc h2` / `ldsc rg` support `@` replacement | Verified by code inspection |
+| Liability-scale conversion | `--samp-prev` + `--pop-prev` for `h2` and `rg` | Matches wiki/FAQ behavior |
+| Per-allele LD scores | `ldsc ldscore --per-allele` | Non-integer `.M` values expected (per FAQ) |
+
+### Gaps / Divergences to Resolve
+
+| Wiki expectation | Rust status | Impact / follow-up |
+|---|---|---|
+| `--merge-alleles` checks allele consistency (and RG allele checks across traits) | Rust currently intersects by SNP; no allele matching/flip logic and `--no-check-alleles` is a no-op | Require pre-aligned alleles or implement allele checking/flipping for parity |
+| `.l2.ldscore` format includes `CM`/`MAF` columns | Rust outputs `CHR SNP BP` + L2 columns only | Rust pipeline reads its own output; external LDSC tools may expect full format |
+| Partitioned h² with overlapping annotations (`--overlap-annot` + `--frqfile-chr`) | Not implemented | Results for overlapping categories are not equivalent to Python LDSC |
+| Cell-type-specific analyses (`--h2-cts`, `--ref-ld-chr-cts`) | Not implemented | Missing wiki tutorial feature |
+| Filtering non-SNP/indels and out-of-range P values in `munge_sumstats.py` | Not explicitly implemented | Add explicit indel and P-range filters or document expectations |
+| Whole-chromosome LD window guard (`--yes-really`) | Not implemented | No safety check for accidental whole-chr windows |
+
+## Wiki Tutorial Replication (SCZ/BIP) — Attempted (2026-02-21)
+
+This mirrors the wiki tutorial “Heritability and Genetic Correlation,” using Rust CLI.
+
+```bash
+# Download data (from the wiki)
+wget www.med.unc.edu/pgc/files/resultfiles/pgc.cross.bip.zip
+wget www.med.unc.edu/pgc/files/resultfiles/pgc.cross.scz.zip
+wget https://data.broadinstitute.org/alkesgroup/LDSCORE/eur_w_ld_chr.tar.bz2
+wget https://data.broadinstitute.org/alkesgroup/LDSCORE/w_hm3.snplist.bz2
+tar -jxvf eur_w_ld_chr.tar.bz2
+unzip -o pgc.cross.bip.zip
+unzip -o pgc.cross.scz.zip
+bunzip2 w_hm3.snplist.bz2
+
+# Munge (sample sizes from wiki: SCZ N=17115, BIP N=11810)
+ldsc munge-sumstats --sumstats pgc.cross.SCZ17.2013-05.txt \
+  --n 17115 --merge-alleles w_hm3.snplist --out scz
+ldsc munge-sumstats --sumstats pgc.cross.BIP11.2013-05.txt \
+  --n 11810 --merge-alleles w_hm3.snplist --out bip
+
+# h2
+ldsc h2 --h2 scz.sumstats.gz --ref-ld-chr eur_w_ld_chr/ --w-ld-chr eur_w_ld_chr/ --out scz_h2
+
+# rg
+ldsc rg --rg scz.sumstats.gz,bip.sumstats.gz \
+  --ref-ld-chr eur_w_ld_chr/ --w-ld-chr eur_w_ld_chr/ --out scz_bip
+```
+
+Status:
+1. `eur_w_ld_chr.tar.bz2` and `w_hm3.snplist.bz2` return HTTP 404 from `data.broadinstitute.org`
+   as of 2026-02-21.
+2. `pgc.cross.bip.zip` and `pgc.cross.scz.zip` URLs currently return an HTML page (not a ZIP),
+   so `unzip` fails.
+
+Until alternate download locations or credentials are provided, the SCZ/BIP tutorial cannot be
+executed end-to-end.
+
+Expected validation targets (once data is accessible):
+1. Munging log shows INFO/MAF filtering and HM3 merge counts similar to the wiki.
+2. h² and intercept roughly match the Python tutorial outputs within SE.
+3. rg is close to the wiki value (direction and magnitude).

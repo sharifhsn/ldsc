@@ -160,7 +160,7 @@ heavily battle-tested**. Use them only when needed:
 ### munge-sumstats
 
 Pre-processes GWAS summary statistics into the `.sumstats.gz` format consumed by `h2` and `rg`.
-Input summary statistics may be plain, `.gz`, or `.bz2`.
+Input summary statistics may be plain, `.gz`, or `.bz2`, and can be tab- or whitespace-delimited.
 
 ```bash
 ldsc munge-sumstats \
@@ -176,6 +176,7 @@ ldsc munge-sumstats \
 Key flags: `--signed-sumstats COLNAME,null_value` tells the tool which column carries effect direction and what the
 null value is (e.g. `BETA,0`, `OR,1`, `Z,0`). Without this flag the tool auto-detects from BETA/LOG_ODDS/OR/Z columns.
 `--a1-inc` skips the signed column and treats all Z-scores as positive (A1 is always the risk allele).
+`--merge-alleles` enforces allele concordance (mismatches are removed), matching Python behavior.
 
 ### ldscore
 
@@ -195,10 +196,13 @@ ldsc ldscore \
   --ld-wind-cm 1.0 \
   [--annot annotations/BaselineLD.] \
   [--extract snplist.txt] \
+  [--maf 0.01 --maf-pre] \
   [--keep keep_individuals.txt] \
   [--per-allele] \
   [--blas-threads 4]
 ```
+
+`ldsc ldscore` warns if the LD window spans an entire chromosome; use `--yes-really` to silence.
 
 Window flags are mutually exclusive: `--ld-wind-cm` (genetic distance, default 1.0), `--ld-wind-kb`
 (physical distance), or `--ld-wind-snp` (fixed flanking SNP count).
@@ -224,6 +228,8 @@ ldsc h2 \
 If the chromosome number falls in the middle of the filename, use `@` as a placeholder:
 `--ref-ld-chr ld/chr@_scores` → `ld/chr1_scores.l2.ldscore.gz`, etc.
 The same convention applies to `--w-ld-chr`.
+You may pass a comma-separated list to `--ref-ld` / `--ref-ld-chr` (Python behavior);
+`--w-ld` / `--w-ld-chr` must point to a single fileset.
 
 Common options: `--no-intercept`, `--intercept-h2 VALUE`, `--two-step 30`, `--chisq-max 80`,
 `--samp-prev 0.1 --pop-prev 0.01` (liability-scale conversion),
@@ -319,11 +325,11 @@ Python's `--l2` flag (LD score estimation mode) becomes the `ldscore` subcommand
 
 ### Behavioural differences
 
-- **`--maf` in ldscore**: applied as a post-filter on output (Python applies it pre-computation).
-  For typical thresholds (≥ 0.01) this makes no numerical difference.
-- **`--n-min` default**: Python defaults to 90th-percentile / 2; Rust defaults to 0 (disabled).
-- **`--yes-really`**: Python refuses `--ld-wind-cm` spanning an entire chromosome without this flag;
-  Rust has no such guard.
+- **`--maf` in ldscore**: default is a post-filter on output (faster). Use `--maf-pre`
+  to match Python’s pre-computation filtering.
+- **`--n-min` default**: when `--n-min` is 0, Rust now matches Python (90th percentile / 1.5).
+- **`--yes-really`**: Rust warns when the LD window spans a whole chromosome and
+  `--yes-really` is not set (Python errors).
 - **`--chunksize`**: Python requires explicit chunking for large files; Rust uses Polars LazyFrame
   streaming and ignores chunk size for munge.
 - **`--return-silly-things` / `--invert-anyway`**: accepted flags for CLI parity; Rust never clips
