@@ -60,9 +60,9 @@ pub struct MungeArgs {
     #[arg(long)]
     pub merge_alleles: Option<String>,
 
-    /// Minimum sample size to retain a SNP
-    #[arg(long, default_value_t = 0)]
-    pub n_min: u64,
+    /// Minimum sample size to retain a SNP (0 → Python default: 90th percentile / 1.5)
+    #[arg(long, default_value_t = 0.0)]
+    pub n_min: f64,
 
     /// Minimum MAF to retain a SNP (0 to disable)
     #[arg(long, default_value_t = 0.01)]
@@ -213,8 +213,14 @@ pub struct LdscoreArgs {
 
     /// Exclude SNPs with minor allele frequency below FLOAT from LD computation.
     /// Applied after --extract; MAF is computed from the genotype data.
+    /// Default behavior applies the filter to output only (see --maf-pre).
     #[arg(long)]
     pub maf: Option<f64>,
+
+    /// Apply --maf before LD computation (Python behavior). Slower but identical to Python.
+    /// Default: post-filter output only (faster).
+    #[arg(long, default_value_t = false)]
+    pub maf_pre: bool,
 
     /// File containing SNP IDs (one per line) to print LD scores for.
     /// Unlike --extract, all SNPs are still used in LD windows; only output is filtered.
@@ -235,6 +241,10 @@ pub struct LdscoreArgs {
     /// Larger values change the window approximation slightly.
     #[arg(long, default_value_t = 50)]
     pub chunk_size: usize,
+
+    /// Allow whole-chromosome LD windows without warning.
+    #[arg(long, default_value_t = false)]
+    pub yes_really: bool,
 
 }
 
@@ -413,7 +423,7 @@ pub struct RgArgs {
     pub intercept_gencov: Vec<f64>,
 
     /// Skip allele consistency checking between summary statistic files.
-    /// Currently a no-op (allele checking not yet implemented); included for API parity.
+    /// When set, skips allele alignment and mismatch filtering.
     #[arg(long, default_value_t = false)]
     pub no_check_alleles: bool,
 

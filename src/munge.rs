@@ -86,6 +86,9 @@ fn cname_lookup(upper: &str) -> Option<&'static str> {
 // ---------------------------------------------------------------------------
 
 pub fn run(args: MungeArgs) -> Result<()> {
+    if args.no_alleles && args.merge_alleles.is_some() {
+        anyhow::bail!("--no-alleles and --merge-alleles are not compatible");
+    }
     let lf = parse::scan_sumstats(&args.sumstats)?;
     let lf = apply_ignore(lf, args.ignore.as_deref())?;
     // Apply user overrides before synonym map so non-standard names are canonicalised.
@@ -98,16 +101,13 @@ pub fn run(args: MungeArgs) -> Result<()> {
     let lf = apply_nstudy_filter(lf, args.nstudy.as_deref(), args.nstudy_min)?;
 
     let lf = if let Some(ref allele_path) = args.merge_alleles {
-        let alleles = parse::scan_sumstats(allele_path)?;
-        lf.join(
-            alleles,
-            [col("SNP")],
-            [col("SNP")],
-            JoinArgs::new(JoinType::Inner),
-        )
+        apply_merge_alleles(lf, allele_path)?
     } else {
         lf
     };
+
+    // Drop rows with missing required values (aligns with Python's dropna).
+    let lf = drop_missing_required(lf, args.no_alleles)?;
 
     // Select output columns: --no-alleles omits A1/A2; --keep-maf includes FRQ.
     let lf = {
@@ -442,7 +442,7 @@ fn p_and_sign_to_z(df: &DataFrame, sign_col: &str, null_val: f64) -> Result<Seri
 fn filter_snps(
     lf: LazyFrame,
     maf: f64,
-    n_min: u64,
+    n_min: f64,
     info_min: f64,
     no_alleles: bool,
 ) -> Result<LazyFrame> {
@@ -452,9 +452,16 @@ fn filter_snps(
 
     let mut lf = lf;
 
+    // Python default: if N exists and --n-min is unset, use 90th percentile / 1.5.
+    let n_min = if n_min == 0.0 && has("N") {
+        compute_default_n_min(&lf)?.unwrap_or(0.0)
+    } else {
+        n_min
+    };
+
     // Filter by minimum sample size.
-    if n_min > 0 && has("N") {
-        lf = lf.filter(col("N").cast(DataType::Float64).gt_eq(lit(n_min as f64)));
+    if n_min > 0.0 && has("N") {
+        lf = lf.filter(col("N").cast(DataType::Float64).gt_eq(lit(n_min)));
     }
 
     // Filter by MAF: keep FRQ in [maf, 1−maf].
@@ -472,18 +479,127 @@ fn filter_snps(
         lf = lf.filter(col("INFO").cast(DataType::Float64).gt_eq(lit(info_min)));
     }
 
-    // Remove strand-ambiguous SNPs (A/T and C/G pairs), unless --no-alleles.
+    // Remove invalid or strand-ambiguous SNPs unless --no-alleles.
     if !no_alleles && has("A1") && has("A2") {
-        let ambig = col("A1")
+        lf = lf.with_columns([
+            col("A1").str().to_uppercase().alias("A1"),
+            col("A2").str().to_uppercase().alias("A2"),
+        ]);
+
+        let valid_base = |c: &str| {
+            col(c)
+                .eq(lit("A"))
+                .or(col(c).eq(lit("C")))
+                .or(col(c).eq(lit("G")))
+                .or(col(c).eq(lit("T")))
+        };
+        let not_same = col("A1").neq(col("A2"));
+        let not_ambig = col("A1")
             .eq(lit("A"))
             .and(col("A2").eq(lit("T")))
             .or(col("A1").eq(lit("T")).and(col("A2").eq(lit("A"))))
             .or(col("A1").eq(lit("C")).and(col("A2").eq(lit("G"))))
-            .or(col("A1").eq(lit("G")).and(col("A2").eq(lit("C"))));
-        lf = lf.filter(ambig.not());
+            .or(col("A1").eq(lit("G")).and(col("A2").eq(lit("C"))))
+            .not();
+
+        let valid = valid_base("A1")
+            .and(valid_base("A2"))
+            .and(not_same)
+            .and(not_ambig);
+        lf = lf.filter(valid);
     }
 
     Ok(lf)
+}
+
+fn compute_default_n_min(lf: &LazyFrame) -> Result<Option<f64>> {
+    let n_df = lf
+        .clone()
+        .select([col("N").cast(DataType::Float64)])
+        .collect()?;
+    let n_series = n_df.column("N")?.f64()?;
+    let mut vals: Vec<f64> = n_series.into_iter().flatten().collect();
+    if vals.is_empty() {
+        return Ok(None);
+    }
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pos = (vals.len() as f64 - 1.0) * 0.9;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    let p90 = if lo == hi {
+        vals[lo]
+    } else {
+        let frac = pos - lo as f64;
+        vals[lo] + frac * (vals[hi] - vals[lo])
+    };
+    Ok(Some(p90 / 1.5))
+}
+
+fn drop_missing_required(lf: LazyFrame, no_alleles: bool) -> Result<LazyFrame> {
+    let mut predicate = col("SNP")
+        .is_not_null()
+        .and(col("Z").is_not_null())
+        .and(col("N").is_not_null());
+    if !no_alleles {
+        predicate = predicate
+            .and(col("A1").is_not_null())
+            .and(col("A2").is_not_null());
+    }
+    Ok(lf.filter(predicate))
+}
+
+fn complement_expr(col_name: &str) -> Expr {
+    when(col(col_name).eq(lit("A")))
+        .then(lit("T"))
+        .when(col(col_name).eq(lit("T")))
+        .then(lit("A"))
+        .when(col(col_name).eq(lit("C")))
+        .then(lit("G"))
+        .when(col(col_name).eq(lit("G")))
+        .then(lit("C"))
+        .otherwise(lit(""))
+}
+
+fn apply_merge_alleles(lf: LazyFrame, allele_path: &str) -> Result<LazyFrame> {
+    let alleles = parse::scan_sumstats(allele_path)?;
+    let alleles = normalize_columns(alleles)?;
+    let alleles = alleles.select([
+        col("SNP"),
+        col("A1").str().to_uppercase().alias("A1_M"),
+        col("A2").str().to_uppercase().alias("A2_M"),
+    ]);
+
+    let merged = lf.join(
+        alleles,
+        [col("SNP")],
+        [col("SNP")],
+        JoinArgs::new(JoinType::Inner),
+    );
+
+    let a1 = col("A1");
+    let a2 = col("A2");
+    let m1 = col("A1_M");
+    let m2 = col("A2_M");
+    let m1c = complement_expr("A1_M");
+    let m2c = complement_expr("A2_M");
+
+    let matches = a1
+        .clone()
+        .eq(m1.clone())
+        .and(a2.clone().eq(m2.clone()))
+        .or(a1.clone().eq(m1c.clone()).and(a2.clone().eq(m2c.clone())))
+        .or(a1.clone().eq(m2.clone()).and(a2.clone().eq(m1.clone())))
+        .or(a1.eq(m2c).and(a2.eq(m1c)));
+
+    let merged = merged.filter(matches);
+    let header = merged.clone().limit(0).collect()?;
+    let keep: Vec<Expr> = header
+        .get_column_names()
+        .iter()
+        .filter(|c| c.as_str() != "A1_M" && c.as_str() != "A2_M")
+        .map(|c| col(c.as_str()))
+        .collect();
+    Ok(merged.select(keep))
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +723,7 @@ fn write_sumstats_gz(path: &str, df: &mut DataFrame) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     /// cname_lookup maps known synonyms to their canonical names.
     #[test]
@@ -653,5 +770,123 @@ mod tests {
         assert_eq!(cname_lookup("SNP"), Some("SNP"));
         assert_eq!(cname_lookup("Zscore"), None);
         assert_eq!(cname_lookup("ZSCORE"), Some("Z"));
+    }
+
+    fn read_gz(path: &str) -> String {
+        use flate2::read::GzDecoder;
+        let file = std::fs::File::open(path).expect("open gz");
+        let mut decoder = GzDecoder::new(file);
+        let mut s = String::new();
+        decoder.read_to_string(&mut s).expect("read gz");
+        s
+    }
+
+    fn base_args(sumstats: &str, out: &str) -> MungeArgs {
+        MungeArgs {
+            sumstats: sumstats.to_string(),
+            out: out.to_string(),
+            merge_alleles: None,
+            n_min: 0.0,
+            maf: 0.01,
+            info_min: 0.9,
+            keep_mhc: true,
+            n: None,
+            n_cas: None,
+            n_con: None,
+            snp_col: None,
+            n_col: None,
+            n_cas_col: None,
+            n_con_col: None,
+            a1_col: None,
+            a2_col: None,
+            p_col: None,
+            frq_col: None,
+            info_col: None,
+            signed_sumstats: None,
+            ignore: None,
+            keep_maf: false,
+            a1_inc: false,
+            no_alleles: false,
+            info_list: None,
+            nstudy: None,
+            nstudy_min: None,
+        }
+    }
+
+    #[test]
+    fn test_merge_alleles_filters_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let sumstats = dir.path().join("sumstats.txt");
+        let merge = dir.path().join("merge.txt");
+        let out = dir.path().join("out");
+
+        std::fs::write(
+            &sumstats,
+            "SNP A1 A2 Z N\nrs1 A G 1.0 100\nrs2 C T 2.0 100\n",
+        )
+        .unwrap();
+        std::fs::write(&merge, "SNP A1 A2\nrs1 A G\nrs2 G C\n").unwrap();
+
+        let mut args = base_args(sumstats.to_str().unwrap(), out.to_str().unwrap());
+        args.merge_alleles = Some(merge.to_str().unwrap().to_string());
+        run(args).unwrap();
+
+        let content = read_gz(&format!("{}.sumstats.gz", out.to_str().unwrap()));
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "expected header + 1 row");
+        assert!(lines[1].starts_with("rs1\t"));
+    }
+
+    #[test]
+    fn test_invalid_alleles_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sumstats = dir.path().join("sumstats.txt");
+        let out = dir.path().join("out");
+        std::fs::write(
+            &sumstats,
+            "SNP A1 A2 Z N\nrs1 A G 1.0 100\nrs2 I D 2.0 100\n",
+        )
+        .unwrap();
+        let args = base_args(sumstats.to_str().unwrap(), out.to_str().unwrap());
+        run(args).unwrap();
+
+        let content = read_gz(&format!("{}.sumstats.gz", out.to_str().unwrap()));
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "expected header + 1 row");
+        assert!(lines[1].starts_with("rs1\t"));
+    }
+
+    #[test]
+    fn test_drop_missing_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let sumstats = dir.path().join("sumstats.txt");
+        let out = dir.path().join("out");
+        std::fs::write(&sumstats, "SNP A1 A2 Z N\nrs1 A G 1.0 100\nrs2 C T . 100\n").unwrap();
+        let args = base_args(sumstats.to_str().unwrap(), out.to_str().unwrap());
+        run(args).unwrap();
+
+        let content = read_gz(&format!("{}.sumstats.gz", out.to_str().unwrap()));
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "expected header + 1 row");
+        assert!(lines[1].starts_with("rs1\t"));
+    }
+
+    #[test]
+    fn test_default_n_min_filters_low_n() {
+        let dir = tempfile::tempdir().unwrap();
+        let sumstats = dir.path().join("sumstats.txt");
+        let out = dir.path().join("out");
+        std::fs::write(
+            &sumstats,
+            "SNP A1 A2 Z N\nrs1 A G 1.0 10\nrs2 A G 1.0 20\nrs3 A G 1.0 30\nrs4 A G 1.0 40\nrs5 A G 1.0 100\n",
+        )
+        .unwrap();
+        let args = base_args(sumstats.to_str().unwrap(), out.to_str().unwrap());
+        run(args).unwrap();
+
+        let content = read_gz(&format!("{}.sumstats.gz", out.to_str().unwrap()));
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "expected header + 1 row");
+        assert!(lines[1].starts_with("rs5\t"));
     }
 }

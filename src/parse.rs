@@ -7,9 +7,11 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use bzip2_rs::DecoderReader;
+use flate2::read::GzDecoder;
 use tempfile::Builder as TempBuilder;
 
 static BZ2_TEMPFILES: OnceLock<Mutex<Vec<tempfile::TempPath>>> = OnceLock::new();
+static WS_TEMPFILES: OnceLock<Mutex<Vec<tempfile::TempPath>>> = OnceLock::new();
 
 fn maybe_decompress_bz2(path: &str) -> Result<PathBuf> {
     if !path.ends_with(".bz2") {
@@ -37,28 +39,113 @@ fn maybe_decompress_bz2(path: &str) -> Result<PathBuf> {
     Ok(temp_buf)
 }
 
+fn store_temp_path(path: tempfile::TempPath) {
+    WS_TEMPFILES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("whitespace tempfiles mutex poisoned")
+        .push(path);
+}
+
+fn first_line_contains_tab(path: &str, gz: bool) -> Result<bool> {
+    use std::io::{BufRead, BufReader};
+    let file = File::open(path).with_context(|| format!("opening '{}'", path))?;
+    let reader: Box<dyn BufRead> = if gz {
+        Box::new(BufReader::new(GzDecoder::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    };
+    for line in reader.lines() {
+        let line = line?;
+        if !line.is_empty() {
+            return Ok(line.contains('\t'));
+        }
+    }
+    Ok(false)
+}
+
+fn normalize_whitespace_to_tsv(path: &str, gz: bool) -> Result<PathBuf> {
+    use std::io::{BufRead, BufReader, BufWriter, Write};
+    if first_line_contains_tab(path, gz)? {
+        return Ok(PathBuf::from(path));
+    }
+
+    let file = File::open(path).with_context(|| format!("opening '{}'", path))?;
+    let reader: Box<dyn BufRead> = if gz {
+        Box::new(BufReader::new(GzDecoder::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    };
+
+    let mut tmp = TempBuilder::new()
+        .prefix("ldsc_ws_")
+        .suffix(".tmp")
+        .tempfile()
+        .context("creating temp file for whitespace normalization")?;
+    {
+        let mut w = BufWriter::new(&mut tmp);
+        for line in reader.lines() {
+            let line = line?;
+            if line.is_empty() {
+                writeln!(w)?;
+                continue;
+            }
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.is_empty() {
+                writeln!(w)?;
+            } else {
+                writeln!(w, "{}", cols.join("\t"))?;
+            }
+        }
+    }
+
+    let temp_path = tmp.into_temp_path();
+    let temp_buf = temp_path.to_path_buf();
+    store_temp_path(temp_path);
+    Ok(temp_buf)
+}
+
+fn resolve_text_path(path: &str) -> Result<PathBuf> {
+    if path.ends_with(".bz2") {
+        let tmp = maybe_decompress_bz2(path)?;
+        return normalize_whitespace_to_tsv(tmp.to_string_lossy().as_ref(), false);
+    }
+    if path.ends_with(".gz") {
+        return normalize_whitespace_to_tsv(path, true);
+    }
+    normalize_whitespace_to_tsv(path, false)
+}
+
 // ---------------------------------------------------------------------------
 // Readers
 // ---------------------------------------------------------------------------
 
 /// Scan a `.sumstats[.gz|.bz2]` file as a Polars LazyFrame.
 pub fn scan_sumstats(path: &str) -> Result<LazyFrame> {
-    let resolved = maybe_decompress_bz2(path)?;
+    let resolved = resolve_text_path(path)?;
     let resolved_str = resolved.to_string_lossy();
     let lf = LazyCsvReader::new(resolved_str.as_ref().into())
         .with_separator(b'\t')
         .with_has_header(true)
+        .with_null_values(Some(NullValues::AllColumns(vec![
+            "NA".into(),
+            ".".into(),
+        ])))
         .finish()?;
     Ok(lf)
 }
 
 /// Scan a `.ldscore[.gz|.bz2]` file as a Polars LazyFrame.
 pub fn scan_ldscore(path: &str) -> Result<LazyFrame> {
-    let resolved = maybe_decompress_bz2(path)?;
+    let resolved = resolve_text_path(path)?;
     let resolved_str = resolved.to_string_lossy();
     let lf = LazyCsvReader::new(resolved_str.as_ref().into())
         .with_separator(b'\t')
         .with_has_header(true)
+        .with_null_values(Some(NullValues::AllColumns(vec![
+            "NA".into(),
+            ".".into(),
+        ])))
         .finish()?;
     Ok(lf)
 }
@@ -153,6 +240,26 @@ pub fn read_m_vec(prefix: &str, suffix: &str) -> Result<Vec<f64>> {
     Ok(totals)
 }
 
+/// Read per-annotation M values from multiple prefixes (comma-separated in Python).
+/// Concatenates the per-prefix M vectors in order.
+pub fn read_m_vec_list(prefixes: &[String], suffix: &str) -> Result<Vec<f64>> {
+    let mut out: Vec<f64> = Vec::new();
+    for prefix in prefixes {
+        let mut v = read_m_vec(prefix, suffix)?;
+        out.append(&mut v);
+    }
+    Ok(out)
+}
+
+/// Sum total M across multiple prefixes.
+pub fn read_m_total_list(prefixes: &[String], suffix: &str) -> Result<f64> {
+    let mut total = 0.0f64;
+    for prefix in prefixes {
+        total += read_m_total(prefix, suffix)?;
+    }
+    Ok(total)
+}
+
 /// Concatenate per-chromosome LazyFrames, accepting .gz, .bz2, or plain files.
 pub fn concat_chrs_any(prefix: &str, suffixes: &[&str]) -> Result<LazyFrame> {
     for suffix in suffixes {
@@ -165,11 +272,15 @@ pub fn concat_chrs_any(prefix: &str, suffixes: &[&str]) -> Result<LazyFrame> {
             .iter()
             .map(|chr| {
                 let path = make_chr_path(prefix, *chr, suffix);
-                let resolved = maybe_decompress_bz2(&path)?;
+                let resolved = resolve_text_path(&path)?;
                 let resolved_str = resolved.to_string_lossy();
                 LazyCsvReader::new(resolved_str.as_ref().into())
                     .with_separator(b'\t')
                     .with_has_header(true)
+                    .with_null_values(Some(NullValues::AllColumns(vec![
+                        "NA".into(),
+                        ".".into(),
+                    ])))
                     .finish()
                     .map_err(anyhow::Error::from)
             })
@@ -206,11 +317,15 @@ pub fn read_annot(prefix: &str, thin: bool) -> Result<(Array2<f64>, Vec<String>)
         }
     };
 
-    let resolved = maybe_decompress_bz2(&path)?;
+    let resolved = resolve_text_path(&path)?;
     let resolved_str = resolved.to_string_lossy();
     let df = LazyCsvReader::new(resolved_str.as_ref().into())
         .with_separator(b'\t')
         .with_has_header(true)
+        .with_null_values(Some(NullValues::AllColumns(vec![
+            "NA".into(),
+            ".".into(),
+        ])))
         .finish()
         .with_context(|| format!("scanning annot file '{}'", path))?
         .collect()
@@ -335,5 +450,41 @@ mod tests {
         assert!(cols.contains(&"AL2"), "missing AL2 column");
         assert!(cols.contains(&"BL2"), "missing BL2 column");
         assert_eq!(df.height(), 22, "expected 22 SNPs, got {}", df.height());
+    }
+
+    #[test]
+    fn test_scan_sumstats_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sumstats.txt");
+        let content = "\
+SNP A1 A2 Z N
+rs1 A G 1.0 100
+rs2 C T 2.5 200
+";
+        std::fs::write(&path, content).unwrap();
+        let lf = scan_sumstats(path.to_str().unwrap()).unwrap();
+        let df = lf.collect().unwrap();
+        assert_eq!(df.height(), 2);
+        let cols: Vec<String> = df.get_column_names().iter().map(|s| s.to_string()).collect();
+        assert!(cols.contains(&"SNP".to_string()));
+        assert!(cols.contains(&"Z".to_string()));
+    }
+
+    #[test]
+    fn test_scan_ldscore_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ldscore.txt");
+        let content = "\
+CHR SNP BP L2
+1 rs1 100 1.0
+1 rs2 200 2.0
+";
+        std::fs::write(&path, content).unwrap();
+        let lf = scan_ldscore(path.to_str().unwrap()).unwrap();
+        let df = lf.collect().unwrap();
+        assert_eq!(df.height(), 2);
+        let cols: Vec<String> = df.get_column_names().iter().map(|s| s.to_string()).collect();
+        assert!(cols.contains(&"SNP".to_string()));
+        assert!(cols.contains(&"L2".to_string()));
     }
 }

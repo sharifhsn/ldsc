@@ -17,8 +17,13 @@ use crate::parse;
 // ---------------------------------------------------------------------------
 
 /// Load a scalar (single L2 column) LD score file, aliasing the L2 column.
-/// Used for weight LD scores (always scalar).
+/// Used for weight LD scores (always scalar). Comma-separated lists are not allowed.
 fn load_ld(single: Option<&str>, chr_prefix: Option<&str>, alias: &str) -> Result<LazyFrame> {
+    if single.map(|s| s.contains(',')).unwrap_or(false)
+        || chr_prefix.map(|s| s.contains(',')).unwrap_or(false)
+    {
+        anyhow::bail!("--w-ld/--w-ld-chr must point to a single fileset (no commas allowed)");
+    }
     match (single, chr_prefix) {
         (Some(path), _) => {
             Ok(parse::scan_ldscore(path)?.select([col("SNP"), col("L2").alias(alias)]))
@@ -41,16 +46,28 @@ fn load_ld(single: Option<&str>, chr_prefix: Option<&str>, alias: &str) -> Resul
 /// columns: SNP, ANNOT1L2, ANNOT2L2, … (one per annotation).
 ///
 /// Metadata columns (CHR, BP, CM) are dropped.
-fn load_ld_ref(single: Option<&str>, chr_prefix: Option<&str>) -> Result<LazyFrame> {
-    let lf = match (single, chr_prefix) {
-        (Some(path), _) => parse::scan_ldscore(path)?,
-        (None, Some(prefix)) => parse::concat_chrs_any(
-            prefix,
-            &[".l2.ldscore.gz", ".l2.ldscore.bz2", ".l2.ldscore"],
-        )?,
-        (None, None) => anyhow::bail!("Must specify exactly one of --ref-ld / --ref-ld-chr"),
-    };
-    // Drop metadata columns, keeping SNP and all L2 annotation columns.
+fn split_paths(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn load_ld_ref_single_path(path: &str) -> Result<LazyFrame> {
+    let lf = parse::scan_ldscore(path)?;
+    drop_ld_meta(lf)
+}
+
+fn load_ld_ref_single_chr(prefix: &str) -> Result<LazyFrame> {
+    let lf = parse::concat_chrs_any(
+        prefix,
+        &[".l2.ldscore.gz", ".l2.ldscore.bz2", ".l2.ldscore"],
+    )?;
+    drop_ld_meta(lf)
+}
+
+fn drop_ld_meta(lf: LazyFrame) -> Result<LazyFrame> {
     let peek = lf
         .clone()
         .limit(0)
@@ -64,6 +81,85 @@ fn load_ld_ref(single: Option<&str>, chr_prefix: Option<&str>) -> Result<LazyFra
         .map(|n| col(n.as_str()))
         .collect();
     Ok(lf.select(keep))
+}
+
+fn load_ld_ref(single: Option<&str>, chr_prefix: Option<&str>) -> Result<LazyFrame> {
+    match (single, chr_prefix) {
+        (Some(path), None) => {
+            let paths = split_paths(path);
+            if paths.len() == 1 {
+                load_ld_ref_single_path(&paths[0])
+            } else {
+                load_ld_ref_multi_paths(&paths, false)
+            }
+        }
+        (None, Some(prefix)) => {
+            let prefixes = split_paths(prefix);
+            if prefixes.len() == 1 {
+                load_ld_ref_single_chr(&prefixes[0])
+            } else {
+                load_ld_ref_multi_paths(&prefixes, true)
+            }
+        }
+        (None, None) => anyhow::bail!("Must specify exactly one of --ref-ld / --ref-ld-chr"),
+        _ => anyhow::bail!("Cannot set both --ref-ld and --ref-ld-chr"),
+    }
+}
+
+fn load_ld_ref_multi_paths(paths: &[String], chr_split: bool) -> Result<LazyFrame> {
+    anyhow::ensure!(!paths.is_empty(), "Empty LD score list");
+    let mut dfs: Vec<DataFrame> = Vec::new();
+    for p in paths {
+        let lf = if chr_split {
+            load_ld_ref_single_chr(p)?
+        } else {
+            load_ld_ref_single_path(p)?
+        };
+        dfs.push(lf.collect().with_context(|| format!("loading LD scores '{}'", p))?);
+    }
+    let mut base = dfs.remove(0);
+    // Match Python: suffix columns from the first file with _0.
+    let base_cols: Vec<String> = base
+        .get_column_names()
+        .iter()
+        .filter(|c| c.as_str() != "SNP")
+        .map(|c| c.to_string())
+        .collect();
+    for c in base_cols {
+        let new_name = format!("{}{}", c, "_0");
+        base.rename(c.as_str(), new_name.into())?;
+    }
+    let base_snps: Vec<Option<String>> = base
+        .column("SNP")?
+        .as_materialized_series()
+        .str()?
+        .into_iter()
+        .map(|opt| opt.map(|s| s.to_string()))
+        .collect();
+    for (idx, df) in dfs.into_iter().enumerate() {
+        let snps: Vec<Option<String>> = df
+            .column("SNP")?
+            .as_materialized_series()
+            .str()?
+            .into_iter()
+            .map(|opt| opt.map(|s| s.to_string()))
+            .collect();
+        anyhow::ensure!(
+            snps == base_snps,
+            "LD Scores for concatenation must have identical SNP columns"
+        );
+        let mut df = df.clone();
+        df.drop_in_place("SNP")?;
+        // Match Python: add _i suffix to each column from the i-th file.
+        let suffix = format!("_{}", idx + 1);
+        let cols: Vec<String> = df.get_column_names().iter().map(|c| c.to_string()).collect();
+        for c in cols {
+            let new_name = format!("{}{}", c, suffix);
+            df.rename(c.as_str(), new_name.into())?;
+        }
+        base.hstack_mut(df.columns())?;
+    }
+    Ok(base.lazy())
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +219,13 @@ fn resolve_m_vec(
 ) -> Vec<f64> {
     if let Some(prefix) = ref_ld_chr {
         let suffix = if not_m_5_50 { ".l2.M" } else { ".l2.M_5_50" };
-        match parse::read_m_vec(prefix, suffix) {
+        let prefixes = split_paths(prefix);
+        let m_vec_res = if prefixes.len() == 1 {
+            parse::read_m_vec(prefixes[0].as_str(), suffix)
+        } else {
+            parse::read_m_vec_list(&prefixes, suffix)
+        };
+        match m_vec_res {
             Ok(m_vec) if m_vec.len() == k => {
                 let total: f64 = m_vec.iter().sum();
                 println!(
@@ -165,6 +267,112 @@ fn filter_by_mask(v: &Array1<f64>, mask: &[bool]) -> Array1<f64> {
             .filter_map(|(&val, &keep)| if keep { Some(val) } else { None })
             .collect(),
     )
+}
+
+fn ensure_sumstats_have_alleles(path: &str) -> Result<()> {
+    let lf = parse::scan_sumstats(path)?;
+    let header = lf
+        .limit(0)
+        .collect()
+        .with_context(|| format!("peeking sumstats header '{}'", path))?;
+    let cols = header.get_column_names();
+    let has = |n: &str| cols.iter().any(|c| *c == n);
+    anyhow::ensure!(
+        has("A1") && has("A2"),
+        "Sumstats file '{}' is missing A1/A2 columns (required unless --no-check-alleles)",
+        path
+    );
+    Ok(())
+}
+
+fn is_valid_snp(a1: &str, a2: &str) -> bool {
+    if a1.len() != 1 || a2.len() != 1 {
+        return false;
+    }
+    let a1 = a1.chars().next().unwrap();
+    let a2 = a2.chars().next().unwrap();
+    let valid = |c| matches!(c, 'A' | 'C' | 'G' | 'T');
+    if !valid(a1) || !valid(a2) || a1 == a2 {
+        return false;
+    }
+    // strand-ambiguous
+    !matches!((a1, a2), ('A', 'T') | ('T', 'A') | ('C', 'G') | ('G', 'C'))
+}
+
+fn complement_base(c: char) -> char {
+    match c {
+        'A' => 'T',
+        'T' => 'A',
+        'C' => 'G',
+        'G' => 'C',
+        _ => c,
+    }
+}
+
+fn match_and_flip(a1: char, a2: char, b1: char, b2: char) -> Option<bool> {
+    let b1c = complement_base(b1);
+    let b2c = complement_base(b2);
+    if (a1 == b1 && a2 == b2) || (a1 == b1c && a2 == b2c) {
+        return Some(false);
+    }
+    if (a1 == b2 && a2 == b1) || (a1 == b2c && a2 == b1c) {
+        return Some(true);
+    }
+    None
+}
+
+fn align_rg_alleles(merged: &DataFrame, z2: &Array1<f64>) -> Result<(Vec<bool>, Vec<f64>, usize)> {
+    let a1_1 = merged
+        .column("A1_1")?
+        .as_materialized_series()
+        .str()?;
+    let a2_1 = merged
+        .column("A2_1")?
+        .as_materialized_series()
+        .str()?;
+    let a1_2 = merged
+        .column("A1_2")?
+        .as_materialized_series()
+        .str()?;
+    let a2_2 = merged
+        .column("A2_2")?
+        .as_materialized_series()
+        .str()?;
+
+    let mut mask: Vec<bool> = Vec::with_capacity(merged.height());
+    let mut z2_aligned: Vec<f64> = Vec::new();
+    let mut removed = 0usize;
+
+    for i in 0..merged.height() {
+        let a1 = a1_1.get(i).unwrap_or("").to_ascii_uppercase();
+        let a2 = a2_1.get(i).unwrap_or("").to_ascii_uppercase();
+        let b1 = a1_2.get(i).unwrap_or("").to_ascii_uppercase();
+        let b2 = a2_2.get(i).unwrap_or("").to_ascii_uppercase();
+
+        if !is_valid_snp(&a1, &a2) || !is_valid_snp(&b1, &b2) {
+            mask.push(false);
+            removed += 1;
+            continue;
+        }
+        let a1c = a1.chars().next().unwrap();
+        let a2c = a2.chars().next().unwrap();
+        let b1c = b1.chars().next().unwrap();
+        let b2c = b2.chars().next().unwrap();
+
+        match match_and_flip(a1c, a2c, b1c, b2c) {
+            Some(flip) => {
+                mask.push(true);
+                let z = z2[i];
+                z2_aligned.push(if flip { -z } else { z });
+            }
+            None => {
+                mask.push(false);
+                removed += 1;
+            }
+        }
+    }
+
+    Ok((mask, z2_aligned, removed))
 }
 
 // ---------------------------------------------------------------------------
@@ -529,7 +737,13 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
         } else {
             ".l2.M_5_50"
         };
-        match parse::read_m_total(prefix, suffix) {
+        let prefixes = split_paths(prefix);
+        let m_res = if prefixes.len() == 1 {
+            parse::read_m_total(prefixes[0].as_str(), suffix)
+        } else {
+            parse::read_m_total_list(&prefixes, suffix)
+        };
+        match m_res {
             Ok(m) => {
                 println!("Read M = {:.0} from {} files", m, suffix);
                 Some(m)
@@ -545,33 +759,52 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
         let file2 = &pair[1];
         println!("Computing rg: {} vs {}", file1, file2);
 
+        if !args.no_check_alleles {
+            ensure_sumstats_have_alleles(file1)?;
+            ensure_sumstats_have_alleles(file2)?;
+        }
+
         // Load both sumstats and suffix their Z/N columns to avoid conflicts.
-        let ss1 = parse::scan_sumstats(file1)?
-            .select([
+        let ss1 = if args.no_check_alleles {
+            parse::scan_sumstats(file1)?
+                .select([col("SNP"), col("Z").alias("Z1"), col("N").alias("N1")])
+        } else {
+            parse::scan_sumstats(file1)?.select([
                 col("SNP"),
                 col("A1").alias("A1_1"),
                 col("A2").alias("A2_1"),
                 col("Z").alias("Z1"),
                 col("N").alias("N1"),
             ])
-            .join(
-                ref_ld.clone().lazy(),
-                [col("SNP")],
-                [col("SNP")],
-                JoinArgs::new(JoinType::Inner),
-            )
-            .join(
-                w_ld.clone().lazy(),
-                [col("SNP")],
-                [col("SNP")],
-                JoinArgs::new(JoinType::Inner),
-            );
+        }
+        .join(
+            ref_ld.clone().lazy(),
+            [col("SNP")],
+            [col("SNP")],
+            JoinArgs::new(JoinType::Inner),
+        )
+        .join(
+            w_ld.clone().lazy(),
+            [col("SNP")],
+            [col("SNP")],
+            JoinArgs::new(JoinType::Inner),
+        );
 
-        let ss2 = parse::scan_sumstats(file2)?.select([
-            col("SNP"),
-            col("Z").alias("Z2"),
-            col("N").alias("N2"),
-        ]);
+        let ss2 = if args.no_check_alleles {
+            parse::scan_sumstats(file2)?.select([
+                col("SNP"),
+                col("Z").alias("Z2"),
+                col("N").alias("N2"),
+            ])
+        } else {
+            parse::scan_sumstats(file2)?.select([
+                col("SNP"),
+                col("A1").alias("A1_2"),
+                col("A2").alias("A2_2"),
+                col("Z").alias("Z2"),
+                col("N").alias("N2"),
+            ])
+        };
 
         let merged = ss1
             .join(
@@ -591,11 +824,31 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
 
         let z1_raw = extract_f64(&merged, "Z1")?;
         let z2_raw = extract_f64(&merged, "Z2")?;
-        let prod_raw = &z1_raw * &z2_raw;
         let ref_l2_raw = extract_f64(&merged, "ref_l2")?.mapv(|l| l.max(0.0));
         let w_l2_raw = extract_f64(&merged, "w_l2")?.mapv(|l| l.max(0.0));
         let n1_raw = extract_f64(&merged, "N1")?;
         let n2_raw = extract_f64(&merged, "N2")?;
+
+        let (z1_raw, z2_raw, ref_l2_raw, w_l2_raw, n1_raw, n2_raw) =
+            if args.no_check_alleles {
+                (z1_raw, z2_raw, ref_l2_raw, w_l2_raw, n1_raw, n2_raw)
+            } else {
+                let (mask, z2_aligned, n_removed) =
+                    align_rg_alleles(&merged, &z2_raw).context("aligning alleles")?;
+                if n_removed > 0 {
+                    println!("  Removed {} SNPs with incompatible alleles", n_removed);
+                }
+                (
+                    filter_by_mask(&z1_raw, &mask),
+                    Array1::from_vec(z2_aligned),
+                    filter_by_mask(&ref_l2_raw, &mask),
+                    filter_by_mask(&w_l2_raw, &mask),
+                    filter_by_mask(&n1_raw, &mask),
+                    filter_by_mask(&n2_raw, &mask),
+                )
+            };
+
+        let prod_raw = &z1_raw * &z2_raw;
 
         let (prod, ref_l2, w_l2, n1, n2) = if let Some(chisq_max) = args.chisq_max {
             let mask: Vec<bool> = prod_raw.iter().map(|&p| p.abs() <= chisq_max).collect();
@@ -924,6 +1177,7 @@ fn liability_conversion_factor(samp_prev: f64, pop_prev: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polars::prelude::df;
 
     /// p_z_norm: est=3, se=1 → z=3, p ≈ 0.00270 (2-sided normal tail).
     #[test]
@@ -1019,5 +1273,42 @@ mod tests {
             p_pos,
             p_neg
         );
+    }
+
+    #[test]
+    fn test_load_ld_ref_multi_paths_suffixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("ld1.l2.ldscore");
+        let f2 = dir.path().join("ld2.l2.ldscore");
+        std::fs::write(&f1, "SNP\tL2\nrs1\t1.0\nrs2\t2.0\n").unwrap();
+        std::fs::write(&f2, "SNP\tL2\nrs1\t3.0\nrs2\t4.0\n").unwrap();
+
+        let ref_ld = load_ld_ref(
+            Some(&format!("{},{}", f1.to_str().unwrap(), f2.to_str().unwrap())),
+            None,
+        )
+        .unwrap();
+        let df = ref_ld.collect().unwrap();
+        let cols: Vec<String> = df.get_column_names().iter().map(|s| s.to_string()).collect();
+        assert!(cols.contains(&"SNP".to_string()));
+        assert!(cols.contains(&"L2_0".to_string()));
+        assert!(cols.contains(&"L2_1".to_string()));
+        assert_eq!(df.height(), 2);
+    }
+
+    #[test]
+    fn test_align_rg_alleles_flip() {
+        let df = df![
+            "A1_1" => &["A", "A"],
+            "A2_1" => &["G", "G"],
+            "A1_2" => &["A", "G"],
+            "A2_2" => &["G", "A"],
+        ]
+        .unwrap();
+        let z2 = Array1::from_vec(vec![1.0, 2.0]);
+        let (mask, z2_aligned, removed) = align_rg_alleles(&df, &z2).unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(mask, vec![true, true]);
+        assert_eq!(z2_aligned, vec![1.0, -2.0]);
     }
 }

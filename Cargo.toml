@@ -20,7 +20,7 @@ bed-reader = { version = "1", default-features = false }
 
 # Data munging — replaces pandas in munge_sumstats.py.
 # decompress feature required for transparent .gz decompression in LazyCsvReader.
-polars = { version = "0.53", features = ["lazy", "csv", "parquet", "decompress"] }
+polars = { version = "0.53", features = ["lazy", "csv", "parquet", "decompress", "strings"] }
 
 # Dense matrix algebra — replaces numpy arrays in irwls.py / jackknife.py.
 # Pin to 0.16: bed-reader 1.0.6 requires ndarray ^0.16.1 and

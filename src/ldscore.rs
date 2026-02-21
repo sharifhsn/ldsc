@@ -222,6 +222,7 @@ fn compute_ldscore_global(
     annot: Option<&Array2<f64>>,
     iid_indices: Option<&Array1<isize>>,
     per_allele: bool,
+    yes_really: bool,
 ) -> Result<(Array2<f64>, Vec<f64>)> {
     let m = all_snps.len();
     if m == 0 {
@@ -241,6 +242,12 @@ fn compute_ldscore_global(
             get_block_lefts_f64(&coords, max_kb)
         }
     };
+    if !yes_really && !block_left.is_empty() && block_left[m - 1] == 0 {
+        println!(
+            "WARNING: LD window spans the entire chromosome. \
+             Use --yes-really to silence this warning."
+        );
+    }
 
     let n = n_indiv as f64;
     let mut maf_per_snp = vec![0.0f64; m];
@@ -493,6 +500,51 @@ fn compute_ldscore_global(
     Ok((l2, maf_per_snp))
 }
 
+fn compute_maf_only(
+    all_snps: &[BimRecord],
+    bed: &mut Bed,
+    n_indiv: usize,
+    chunk_c: usize,
+    iid_indices: Option<&Array1<isize>>,
+) -> Result<Vec<f64>> {
+    let m = all_snps.len();
+    if m == 0 {
+        return Ok(vec![]);
+    }
+
+    let mut maf_per_snp = vec![0.0f64; m];
+    let mut col_buf = Array1::<f32>::zeros(n_indiv);
+
+    for chunk_start in (0..m).step_by(chunk_c) {
+        let chunk_end = (chunk_start + chunk_c).min(m);
+        let c = chunk_end - chunk_start;
+
+        let bed_indices: Array1<isize> = Array1::from_iter(
+            all_snps[chunk_start..chunk_end]
+                .iter()
+                .map(|s| s.bed_idx as isize),
+        );
+        let raw: Array2<f32> = {
+            let mut ro = ReadOptions::builder();
+            let builder = ro.sid_index(&bed_indices).f32();
+            let result = if let Some(iids) = iid_indices {
+                builder.iid_index(iids).read(bed)
+            } else {
+                builder.read(bed)
+            };
+            result.with_context(|| format!("reading BED chunk [{},{})", chunk_start, chunk_end))?
+        };
+
+        for j in 0..c {
+            col_buf.assign(&raw.column(j));
+            let snp_maf = normalize_col(&mut col_buf, n_indiv);
+            maf_per_snp[chunk_start + j] = snp_maf;
+        }
+    }
+
+    Ok(maf_per_snp)
+}
+
 /// Unbiased r² estimator: r² − (1−r²)/(n−2) [Bulik-Sullivan 2015].
 #[inline]
 fn r2_unbiased(r: f64, n: usize) -> f64 {
@@ -610,7 +662,14 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
         None
     };
 
-    let annot_result: Option<(Array2<f64>, Vec<String>)> = if let Some(ref prefix) = args.annot {
+    if args.annot.is_some() && args.extract.is_some() {
+        println!(
+            "WARNING: --annot with --extract is not supported in Python LDSC. \
+             Ensure your annot files match the extracted SNP set."
+        );
+    }
+
+    let mut annot_result: Option<(Array2<f64>, Vec<String>)> = if let Some(ref prefix) = args.annot {
         // Collect unique chromosomes in BIM order.
         let mut chrs_seen: HashSet<u8> = HashSet::new();
         let mut chrs: Vec<u8> = Vec::new();
@@ -656,8 +715,6 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
         None
     };
 
-    let annot_ref: Option<&Array2<f64>> = annot_result.as_ref().map(|(m, _)| m);
-
     // --keep: subset individuals for LD computation.
     let iid_indices: Option<Array1<isize>> = if let Some(ref keep_path) = args.keep {
         let fam_ids =
@@ -671,6 +728,61 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
     };
     let n_indiv_actual = iid_indices.as_ref().map(|idx| idx.len()).unwrap_or(n_indiv);
 
+    let mut all_snps = all_snps;
+
+    // Optional pre-filter on MAF (Python behavior).
+    if args.maf_pre {
+        if let Some(thr) = args.maf {
+            let mut bed = Bed::new(bed_path.as_str()).context("opening BED file for MAF prefilter")?;
+            let maf_all = compute_maf_only(
+                &all_snps,
+                &mut bed,
+                n_indiv_actual,
+                args.chunk_size,
+                iid_indices.as_ref(),
+            )
+            .context("computing MAF prefilter")?;
+
+            let mut kept_snps: Vec<BimRecord> = Vec::new();
+            let mut keep_mask: Vec<bool> = Vec::with_capacity(all_snps.len());
+            for (snp, maf) in all_snps.iter().zip(maf_all.iter()) {
+                let keep = *maf >= thr;
+                keep_mask.push(keep);
+                if keep {
+                    kept_snps.push(snp.clone());
+                }
+            }
+            if kept_snps.is_empty() {
+                anyhow::bail!("--maf-pre removed all SNPs (threshold {})", thr);
+            }
+            all_snps = kept_snps;
+
+            if let Some((annot, names)) = annot_result.take() {
+                let rows: Vec<usize> = keep_mask
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &k)| if k { Some(i) } else { None })
+                    .collect();
+                let mut filtered = Array2::<f64>::zeros((rows.len(), annot.ncols()));
+                for (ri, &src) in rows.iter().enumerate() {
+                    filtered.row_mut(ri).assign(&annot.row(src));
+                }
+                annot_result = Some((filtered, names));
+            }
+
+            println!(
+                "--maf-pre: kept {} / {} SNPs (MAF >= {})",
+                all_snps.len(),
+                keep_mask.len(),
+                thr
+            );
+        } else {
+            println!("WARNING: --maf-pre has no effect without --maf");
+        }
+    }
+
+    let annot_ref: Option<&Array2<f64>> = annot_result.as_ref().map(|(m, _)| m);
+
     let chunk_c = args.chunk_size;
 
     let mut bed = Bed::new(bed_path.as_str()).context("opening BED file")?;
@@ -683,6 +795,7 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
         annot_ref,
         iid_indices.as_ref(),
         args.per_allele,
+        args.yes_really,
     )
     .context("computing LD scores")?;
 
@@ -957,5 +1070,81 @@ mod tests {
         let coords = vec![1.0, 4.0, 6.0, 7.0, 7.0, 8.0];
         let bl = get_block_lefts_f64(&coords, 2.0);
         assert_eq!(bl, vec![0, 1, 1, 2, 2, 2]);
+    }
+
+    fn write_plink_small(dir: &std::path::Path) -> String {
+        use std::io::Write;
+        let prefix = dir.join("toy");
+        let bim = prefix.with_extension("bim");
+        let fam = prefix.with_extension("fam");
+        let bed = prefix.with_extension("bed");
+
+        // .fam: 4 individuals
+        let mut f = std::fs::File::create(&fam).unwrap();
+        for i in 1..=4 {
+            writeln!(f, "F{} I{} 0 0 0 -9", i, i).unwrap();
+        }
+
+        // .bim: 2 SNPs
+        let mut b = std::fs::File::create(&bim).unwrap();
+        writeln!(b, "1\trs1\t0\t100\tA\tG").unwrap();
+        writeln!(b, "1\trs2\t0\t200\tA\tG").unwrap();
+
+        // .bed: SNP-major
+        let mut bed_f = std::fs::File::create(&bed).unwrap();
+        bed_f.write_all(&[0x6C, 0x1B, 0x01]).unwrap();
+
+        // SNP1: all hom-major (MAF=0)
+        let snp1 = [0u8, 0u8, 0u8, 0u8];
+        bed_f.write_all(&[pack_genotypes(&snp1)]).unwrap();
+
+        // SNP2: genotypes [0,1,1,2] => MAF=0.5
+        let snp2 = [0u8, 1u8, 1u8, 2u8];
+        bed_f.write_all(&[pack_genotypes(&snp2)]).unwrap();
+
+        prefix.to_string_lossy().to_string()
+    }
+
+    fn pack_genotypes(gt: &[u8; 4]) -> u8 {
+        // PLINK .bed encoding (2-bit, little-endian per individual):
+        // 00 = hom major, 01 = missing, 10 = het, 11 = hom minor
+        let code = |g: u8| match g {
+            0 => 0b00,
+            1 => 0b10,
+            2 => 0b11,
+            _ => 0b01,
+        };
+        code(gt[0]) | (code(gt[1]) << 2) | (code(gt[2]) << 4) | (code(gt[3]) << 6)
+    }
+
+    #[test]
+    fn test_maf_pre_changes_m_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = write_plink_small(dir.path());
+        let out_dir = tempfile::tempdir().unwrap();
+        let out = out_dir.path().join("out").to_string_lossy().to_string();
+
+        let args = LdscoreArgs {
+            bfile: prefix,
+            out: out.clone(),
+            ld_wind_cm: 1.0,
+            ld_wind_kb: None,
+            ld_wind_snp: Some(1),
+            annot: None,
+            thin_annot: false,
+            extract: None,
+            maf: Some(0.1),
+            maf_pre: true,
+            print_snps: None,
+            keep: None,
+            per_allele: false,
+            chunk_size: 50,
+            yes_really: true,
+        };
+        run(args).unwrap();
+
+        let m_path = format!("{}1.l2.M", out);
+        let m = std::fs::read_to_string(m_path).unwrap();
+        assert_eq!(m.trim(), "1", "pre-filter should keep 1 SNP");
     }
 }
