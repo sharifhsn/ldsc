@@ -26,11 +26,12 @@ polars = { version = "0.53", features = ["lazy", "csv", "parquet", "decompress"]
 # Pin to 0.16: bed-reader 1.0.6 requires ndarray ^0.16.1 and
 # ndarray-linalg 0.17 requires ndarray ^0.16.0 — both satisfied by "0.16".
 ndarray = { version = "0.16", features = ["rayon", "blas"] }
-ndarray-linalg = { version = "0.17", features = ["openblas-static"] }
+ndarray-linalg = { version = "0.17", default-features = false }
 
-# BLAS backend for ndarray::dot() matrix multiply — reuses the same OpenBLAS
-# that ndarray-linalg already links statically.
-blas-src = { version = "0.10", default-features = false, features = ["openblas"] }
+# BLAS backend selection for ndarray/ndarray-linalg. We keep this optional and
+# drive linkage through the feature flags below so CI can opt into system BLAS.
+blas-src = { version = "0.10", default-features = false, features = ["openblas"], optional = true }
+openblas-src = { version = "0.10", default-features = false, features = ["cblas", "lapacke"], optional = true }
 
 # Data-parallelism — parallelises block jackknife (replaces sequential for-loop + GIL)
 rayon = "1"
@@ -52,6 +53,28 @@ flate2 = "1"
 opt-level     = 3
 lto           = "thin"
 codegen-units = 1
+
+[features]
+# Default: build OpenBLAS from source and link statically (current behavior).
+default = ["blas-openblas-static"]
+
+# Static OpenBLAS (build from source via openblas-src).
+blas-openblas-static = [
+  "blas-src",
+  "openblas-src",
+  "openblas-src/static",
+  "ndarray-linalg/blas",
+  "ndarray-linalg/openblas-static",
+]
+
+# System OpenBLAS (use pkg-config, no source build). Intended for CI or HPC.
+blas-openblas-system = [
+  "blas-src",
+  "openblas-src",
+  "openblas-src/system",
+  "ndarray-linalg/blas",
+  "ndarray-linalg/openblas-system",
+]
 
 [dev-dependencies]
 tempfile = "3"

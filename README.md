@@ -63,8 +63,11 @@ ldsc rg \
 cargo install ldsc
 ```
 
-Requires Rust ≥ 1.85 and a C toolchain with Fortran support to build the statically-linked OpenBLAS.
-On Debian/Ubuntu:
+Requires Rust ≥ 1.85 and a C toolchain with Fortran support to build the default
+statically-linked OpenBLAS. If you opt into the system BLAS feature, you only
+need the system OpenBLAS development package.
+
+On Debian/Ubuntu (default static build):
 
 ```bash
 sudo apt-get install cmake gfortran libgfortran-dev
@@ -123,6 +126,21 @@ cargo build --release
 ```
 
 The release profile sets `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`.
+
+### BLAS configuration
+
+By default this crate builds **OpenBLAS from source** and links it statically
+(`blas-openblas-static`). For CI or HPC environments that prefer a system BLAS,
+use the system feature instead:
+
+```bash
+# Debian/Ubuntu system OpenBLAS
+sudo apt-get install libopenblas-dev pkg-config
+cargo build --release --no-default-features --features blas-openblas-system
+```
+
+The system feature skips the OpenBLAS source build and links via `pkg-config`.
+Keep the default static build if you want a self-contained binary.
 
 ---
 
