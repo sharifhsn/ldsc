@@ -9,10 +9,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: "0"
-  # Build OpenBLAS with runtime CPU dispatch so the binary works on any GHA
-  # runner generation and the cmake artifacts can be safely cached across jobs
-  # that may land on different physical machines (prevents SIGILL on cache hit).
-  OPENBLAS_DYNAMIC_ARCH: "1"
+  # Pin OpenBLAS to a conservative x86_64 target so cached artifacts are safe
+  # across different GitHub runner CPU generations (avoids SIGILL on cache hit).
+  OPENBLAS_TARGET: "SSE_GENERIC"
 
 jobs:
   test:
@@ -32,7 +31,7 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          env-vars: OPENBLAS_DYNAMIC_ARCH
+          env-vars: OPENBLAS_TARGET
           cache-on-failure: true
 
       - name: Install BLAS build dependencies
