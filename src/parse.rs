@@ -1,8 +1,9 @@
 /// File parsing utilities: Polars LazyFrame readers for `.sumstats` and `.ldscore` files.
 use anyhow::{Context, Result};
-use ndarray::Array2;
+use ndarray::{Array2, s};
 use polars::prelude::*;
 use std::fs::File;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -105,7 +106,7 @@ fn normalize_whitespace_to_tsv(path: &str, gz: bool) -> Result<PathBuf> {
     Ok(temp_buf)
 }
 
-fn resolve_text_path(path: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_text_path(path: &str) -> Result<PathBuf> {
     if path.ends_with(".bz2") {
         let tmp = maybe_decompress_bz2(path)?;
         return normalize_whitespace_to_tsv(tmp.to_string_lossy().as_ref(), false);
@@ -127,10 +128,7 @@ pub fn scan_sumstats(path: &str) -> Result<LazyFrame> {
     let lf = LazyCsvReader::new(resolved_str.as_ref().into())
         .with_separator(b'\t')
         .with_has_header(true)
-        .with_null_values(Some(NullValues::AllColumns(vec![
-            "NA".into(),
-            ".".into(),
-        ])))
+        .with_null_values(Some(NullValues::AllColumns(vec!["NA".into(), ".".into()])))
         .finish()?;
     Ok(lf)
 }
@@ -142,10 +140,7 @@ pub fn scan_ldscore(path: &str) -> Result<LazyFrame> {
     let lf = LazyCsvReader::new(resolved_str.as_ref().into())
         .with_separator(b'\t')
         .with_has_header(true)
-        .with_null_values(Some(NullValues::AllColumns(vec![
-            "NA".into(),
-            ".".into(),
-        ])))
+        .with_null_values(Some(NullValues::AllColumns(vec!["NA".into(), ".".into()])))
         .finish()?;
     Ok(lf)
 }
@@ -277,10 +272,7 @@ pub fn concat_chrs_any(prefix: &str, suffixes: &[&str]) -> Result<LazyFrame> {
                 LazyCsvReader::new(resolved_str.as_ref().into())
                     .with_separator(b'\t')
                     .with_has_header(true)
-                    .with_null_values(Some(NullValues::AllColumns(vec![
-                        "NA".into(),
-                        ".".into(),
-                    ])))
+                    .with_null_values(Some(NullValues::AllColumns(vec!["NA".into(), ".".into()])))
                     .finish()
                     .map_err(anyhow::Error::from)
             })
@@ -289,7 +281,11 @@ pub fn concat_chrs_any(prefix: &str, suffixes: &[&str]) -> Result<LazyFrame> {
         return Ok(concat(frames, UnionArgs::default())?);
     }
 
-    anyhow::bail!("No chromosome files found for prefix '{}' (tried {:?})", prefix, suffixes);
+    anyhow::bail!(
+        "No chromosome files found for prefix '{}' (tried {:?})",
+        prefix,
+        suffixes
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -322,10 +318,7 @@ pub fn read_annot(prefix: &str, thin: bool) -> Result<(Array2<f64>, Vec<String>)
     let df = LazyCsvReader::new(resolved_str.as_ref().into())
         .with_separator(b'\t')
         .with_has_header(true)
-        .with_null_values(Some(NullValues::AllColumns(vec![
-            "NA".into(),
-            ".".into(),
-        ])))
+        .with_null_values(Some(NullValues::AllColumns(vec!["NA".into(), ".".into()])))
         .finish()
         .with_context(|| format!("scanning annot file '{}'", path))?
         .collect()
@@ -368,6 +361,249 @@ pub fn read_annot(prefix: &str, thin: bool) -> Result<(Array2<f64>, Vec<String>)
     }
 
     Ok((matrix, col_names))
+}
+
+// ---------------------------------------------------------------------------
+// Overlap-annot helpers
+// ---------------------------------------------------------------------------
+
+fn get_present_chrs_any(prefix: &str, suffixes: &[&str]) -> Vec<u8> {
+    use std::collections::BTreeSet;
+    let mut set = BTreeSet::new();
+    for suffix in suffixes {
+        for chr in get_present_chrs(prefix, suffix) {
+            set.insert(chr);
+        }
+    }
+    set.into_iter().collect()
+}
+
+fn resolve_frq_path(prefix: &str, chr: Option<u8>) -> Result<String> {
+    let base = match chr {
+        Some(c) => make_chr_path(prefix, c, ""),
+        None => prefix.to_string(),
+    };
+    let candidates = [".frq.gz", ".frq.bz2", ".frq"];
+    for suffix in candidates {
+        let path = format!("{}{}", base, suffix);
+        if Path::new(&path).exists() {
+            return Ok(path);
+        }
+    }
+    anyhow::bail!("Frequency file not found: '{}.frq[.gz|.bz2]'", base);
+}
+
+/// Read a .frq file and return a MAF filter mask: keep 0.05 < FRQ < 0.95.
+/// Accepts either FRQ or MAF column names (MAF is renamed to FRQ in Python).
+pub fn read_frq_mask(path: &str) -> Result<Vec<bool>> {
+    let resolved = resolve_text_path(path)?;
+    let resolved_str = resolved.to_string_lossy();
+    let df = LazyCsvReader::new(resolved_str.as_ref().into())
+        .with_separator(b'\t')
+        .with_has_header(true)
+        .with_null_values(Some(NullValues::AllColumns(vec!["NA".into(), ".".into()])))
+        .finish()
+        .with_context(|| format!("scanning frq file '{}'", path))?
+        .collect()
+        .with_context(|| format!("reading frq file '{}'", path))?;
+
+    let col_name = if df.get_column_names().iter().any(|c| c.as_str() == "FRQ") {
+        "FRQ"
+    } else if df.get_column_names().iter().any(|c| c.as_str() == "MAF") {
+        "MAF"
+    } else {
+        anyhow::bail!("Frequency file '{}' has no FRQ or MAF column", path);
+    };
+
+    let s = df
+        .column(col_name)
+        .with_context(|| format!("column '{}' in frq file '{}'", col_name, path))?
+        .cast(&DataType::Float64)
+        .with_context(|| format!("casting '{}' to f64 in frq file '{}'", col_name, path))?;
+    let ca = s
+        .f64()
+        .with_context(|| format!("frq column '{}' as f64", col_name))?;
+    let mask = ca
+        .into_iter()
+        .map(|opt| opt.map(|v| v > 0.05 && v < 0.95).unwrap_or(false))
+        .collect();
+    Ok(mask)
+}
+
+/// Compute annotation overlap matrix XᵀX and total SNP count (M_tot).
+///
+/// When `chr_split` is true, reads per-chromosome `{prefix}{chr}.annot[.gz|.bz2]`.
+/// When false, reads single `{prefix}.annot[.gz|.bz2]`.
+///
+/// `frqfile` / `frqfile_chr` apply the Python MAF filter (0.05 < FRQ < 0.95)
+/// before computing XᵀX.
+pub fn read_overlap_matrix(
+    prefixes: &[String],
+    frqfile: Option<&str>,
+    frqfile_chr: Option<&str>,
+    chr_split: bool,
+) -> Result<(Array2<f64>, usize, Vec<String>)> {
+    anyhow::ensure!(!prefixes.is_empty(), "No annotation prefixes provided");
+
+    let mut raw_names_per_prefix: Vec<Vec<String>> = Vec::new();
+    let mut overlap: Option<Array2<f64>> = None;
+    let mut m_tot: usize = 0;
+
+    if chr_split {
+        let chrs = get_present_chrs_any(&prefixes[0], &[".annot.gz", ".annot.bz2", ".annot"]);
+        anyhow::ensure!(
+            !chrs.is_empty(),
+            "No .annot files found for prefix '{}'",
+            prefixes[0]
+        );
+
+        for chr in chrs {
+            let mut matrices: Vec<Array2<f64>> = Vec::new();
+            let mut n_rows: Option<usize> = None;
+            for (idx, prefix) in prefixes.iter().enumerate() {
+                let chr_prefix = make_chr_path(prefix, chr, "");
+                let (mat, names) = read_annot(&chr_prefix, false)?;
+                if raw_names_per_prefix.len() <= idx {
+                    raw_names_per_prefix.push(names.clone());
+                } else {
+                    anyhow::ensure!(
+                        raw_names_per_prefix[idx] == names,
+                        "Annotation columns for '{}' differ across chromosomes",
+                        prefix
+                    );
+                }
+                if let Some(nr) = n_rows {
+                    anyhow::ensure!(
+                        mat.nrows() == nr,
+                        "Annotation rows mismatch across prefixes for chr {}",
+                        chr
+                    );
+                } else {
+                    n_rows = Some(mat.nrows());
+                }
+                matrices.push(mat);
+            }
+
+            let n_rows = n_rows.unwrap_or(0);
+            let total_cols: usize = matrices.iter().map(|m| m.ncols()).sum();
+            let mut stacked = Array2::<f64>::zeros((n_rows, total_cols));
+            let mut col_offset = 0usize;
+            for mat in matrices {
+                let cols = mat.ncols();
+                stacked
+                    .slice_mut(s![.., col_offset..col_offset + cols])
+                    .assign(&mat);
+                col_offset += cols;
+            }
+
+            let (matrix, m_chr) = if let Some(frq_prefix) = frqfile_chr {
+                let frq_path = resolve_frq_path(frq_prefix, Some(chr))?;
+                let mask = read_frq_mask(&frq_path)?;
+                anyhow::ensure!(
+                    mask.len() == n_rows,
+                    "FRQ file '{}' has {} rows; expected {}",
+                    frq_path,
+                    mask.len(),
+                    n_rows
+                );
+                let keep = mask.iter().filter(|&&b| b).count();
+                let mut filtered = Array2::<f64>::zeros((keep, total_cols));
+                let mut row = 0usize;
+                for (i, keep_row) in mask.iter().enumerate() {
+                    if *keep_row {
+                        filtered.row_mut(row).assign(&stacked.row(i));
+                        row += 1;
+                    }
+                }
+                (filtered.t().dot(&filtered), keep)
+            } else {
+                (stacked.t().dot(&stacked), n_rows)
+            };
+
+            m_tot += m_chr;
+            if let Some(ref mut acc) = overlap {
+                *acc += &matrix;
+            } else {
+                overlap = Some(matrix);
+            }
+        }
+    } else {
+        let mut matrices: Vec<Array2<f64>> = Vec::new();
+        let mut n_rows: Option<usize> = None;
+        for (idx, prefix) in prefixes.iter().enumerate() {
+            let (mat, names) = read_annot(prefix, false)?;
+            if raw_names_per_prefix.len() <= idx {
+                raw_names_per_prefix.push(names.clone());
+            } else {
+                anyhow::ensure!(
+                    raw_names_per_prefix[idx] == names,
+                    "Annotation columns for '{}' differ across files",
+                    prefix
+                );
+            }
+            if let Some(nr) = n_rows {
+                anyhow::ensure!(
+                    mat.nrows() == nr,
+                    "Annotation rows mismatch across prefixes"
+                );
+            } else {
+                n_rows = Some(mat.nrows());
+            }
+            matrices.push(mat);
+        }
+
+        let n_rows = n_rows.unwrap_or(0);
+        let total_cols: usize = matrices.iter().map(|m| m.ncols()).sum();
+        let mut stacked = Array2::<f64>::zeros((n_rows, total_cols));
+        let mut col_offset = 0usize;
+        for mat in matrices {
+            let cols = mat.ncols();
+            stacked
+                .slice_mut(s![.., col_offset..col_offset + cols])
+                .assign(&mat);
+            col_offset += cols;
+        }
+
+        let (matrix, m_single) = if let Some(frq_prefix) = frqfile {
+            let frq_path = resolve_frq_path(frq_prefix, None)?;
+            let mask = read_frq_mask(&frq_path)?;
+            anyhow::ensure!(
+                mask.len() == n_rows,
+                "FRQ file '{}' has {} rows; expected {}",
+                frq_path,
+                mask.len(),
+                n_rows
+            );
+            let keep = mask.iter().filter(|&&b| b).count();
+            let mut filtered = Array2::<f64>::zeros((keep, total_cols));
+            let mut row = 0usize;
+            for (i, keep_row) in mask.iter().enumerate() {
+                if *keep_row {
+                    filtered.row_mut(row).assign(&stacked.row(i));
+                    row += 1;
+                }
+            }
+            (filtered.t().dot(&filtered), keep)
+        } else {
+            (stacked.t().dot(&stacked), n_rows)
+        };
+
+        m_tot += m_single;
+        overlap = Some(matrix);
+    }
+
+    let overlap = overlap.context("overlap matrix not computed")?;
+    let col_names: Vec<String> = if prefixes.len() > 1 {
+        raw_names_per_prefix
+            .iter()
+            .enumerate()
+            .flat_map(|(i, names)| names.iter().map(move |n| format!("{}_{}", n, i)))
+            .collect()
+    } else {
+        raw_names_per_prefix.get(0).cloned().unwrap_or_default()
+    };
+
+    Ok((overlap, m_tot, col_names))
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +651,76 @@ mod tests {
         let v = read_m_vec(&prefix, ".l2.M").unwrap();
         assert_eq!(v.len(), 1);
         assert!((v[0] - 3000.0).abs() < 0.01, "v[0]={}", v[0]);
+    }
+
+    #[test]
+    fn test_overlap_matrix_no_frq() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("test");
+        let annot_path = format!("{}.annot", prefix.to_string_lossy());
+        std::fs::write(
+            &annot_path,
+            "CHR\tBP\tSNP\tCM\tC1\tC2\tC3\n\
+1\t1\trs_0\t0\t1\t0\t0\n\
+1\t2\trs_1\t0\t0\t1\t1\n\
+1\t3\trs_2\t0\t0\t1\t1\n",
+        )
+        .unwrap();
+
+        let (overlap, m_tot, names) =
+            read_overlap_matrix(&[prefix.to_string_lossy().to_string()], None, None, false)
+                .unwrap();
+
+        assert_eq!(m_tot, 3);
+        assert_eq!(
+            names,
+            vec!["C1".to_string(), "C2".to_string(), "C3".to_string()]
+        );
+        assert!((overlap[[0, 0]] - 1.0).abs() < 1e-6);
+        assert!((overlap[[1, 1]] - 2.0).abs() < 1e-6);
+        assert!((overlap[[2, 2]] - 2.0).abs() < 1e-6);
+        assert!((overlap[[1, 2]] - 2.0).abs() < 1e-6);
+        assert!((overlap[[2, 1]] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_overlap_matrix_with_frq() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("test");
+        let annot_path = format!("{}.annot", prefix.to_string_lossy());
+        let frq_path = format!("{}.frq", prefix.to_string_lossy());
+
+        std::fs::write(
+            &annot_path,
+            "CHR\tBP\tSNP\tCM\tC1\tC2\tC3\n\
+1\t1\trs_0\t0\t1\t0\t0\n\
+1\t2\trs_1\t0\t0\t1\t1\n\
+1\t3\trs_2\t0\t0\t1\t1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &frq_path,
+            "CHR\tSNP\tCM\tBP\tA1\tFRQ\n\
+1\trs_0\t0\t1\tA\t0.7\n\
+1\trs_1\t0\t2\tA\t0.1\n\
+1\trs_2\t0\t3\tA\t0.01\n",
+        )
+        .unwrap();
+
+        let (overlap, m_tot, _) = read_overlap_matrix(
+            &[prefix.to_string_lossy().to_string()],
+            Some(prefix.to_string_lossy().as_ref()),
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(m_tot, 2);
+        assert!((overlap[[0, 0]] - 1.0).abs() < 1e-6);
+        assert!((overlap[[1, 1]] - 1.0).abs() < 1e-6);
+        assert!((overlap[[2, 2]] - 1.0).abs() < 1e-6);
+        assert!((overlap[[1, 2]] - 1.0).abs() < 1e-6);
+        assert!((overlap[[2, 1]] - 1.0).abs() < 1e-6);
     }
 
     /// read_m_vec on two-column (partitioned) M files returns Vec of length 2
@@ -465,7 +771,11 @@ rs2 C T 2.5 200
         let lf = scan_sumstats(path.to_str().unwrap()).unwrap();
         let df = lf.collect().unwrap();
         assert_eq!(df.height(), 2);
-        let cols: Vec<String> = df.get_column_names().iter().map(|s| s.to_string()).collect();
+        let cols: Vec<String> = df
+            .get_column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert!(cols.contains(&"SNP".to_string()));
         assert!(cols.contains(&"Z".to_string()));
     }
@@ -483,7 +793,11 @@ CHR SNP BP L2
         let lf = scan_ldscore(path.to_str().unwrap()).unwrap();
         let df = lf.collect().unwrap();
         assert_eq!(df.height(), 2);
-        let cols: Vec<String> = df.get_column_names().iter().map(|s| s.to_string()).collect();
+        let cols: Vec<String> = df
+            .get_column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert!(cols.contains(&"SNP".to_string()));
         assert!(cols.contains(&"L2".to_string()));
     }

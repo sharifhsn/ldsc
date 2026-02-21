@@ -105,6 +105,93 @@ fn irwls_known_solution() {
 }
 
 // ---------------------------------------------------------------------------
+// h2-cts smoke test (tiny synthetic inputs)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn h2_cts_smoke() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let base = dir.path().join("base.");
+    let cts = dir.path().join("cts.");
+    let w = dir.path().join("w.");
+    let out = dir.path().join("out");
+
+    let sumstats = dir.path().join("trait.sumstats");
+    fs::write(
+        &sumstats,
+        "SNP\tA1\tA2\tZ\tN\n\
+rs1\tA\tG\t1.0\t1000\n\
+rs2\tA\tG\t2.0\t1000\n\
+rs3\tA\tG\t1.5\t1000\n",
+    )
+    .expect("write sumstats");
+
+    fs::write(
+        format!("{}1.l2.ldscore", base.to_string_lossy()),
+        "CHR\tSNP\tBP\tBASEL2\n\
+1\trs1\t1\t10.0\n\
+1\trs2\t2\t12.0\n\
+1\trs3\t3\t11.0\n",
+    )
+    .expect("write base ldscore");
+    fs::write(format!("{}1.l2.M_5_50", base.to_string_lossy()), "3\n").expect("write base M");
+
+    fs::write(
+        format!("{}1.l2.ldscore", cts.to_string_lossy()),
+        "CHR\tSNP\tBP\tCTSL2\n\
+1\trs1\t1\t2.0\n\
+1\trs2\t2\t3.0\n\
+1\trs3\t3\t2.5\n",
+    )
+    .expect("write cts ldscore");
+    fs::write(format!("{}1.l2.M_5_50", cts.to_string_lossy()), "3\n").expect("write cts M");
+
+    fs::write(
+        format!("{}1.l2.ldscore", w.to_string_lossy()),
+        "CHR\tSNP\tBP\tL2\n\
+1\trs1\t1\t9.0\n\
+1\trs2\t2\t9.5\n\
+1\trs3\t3\t9.2\n",
+    )
+    .expect("write weight ldscore");
+
+    let ldcts = dir.path().join("cts.ldcts");
+    fs::write(
+        &ldcts,
+        format!("CTS\t{}\n", cts.to_string_lossy()),
+    )
+    .expect("write ldcts");
+
+    let status = Command::new(binary())
+        .args([
+            "h2",
+            "--h2-cts",
+            sumstats.to_str().unwrap(),
+            "--ref-ld-chr",
+            base.to_str().unwrap(),
+            "--w-ld-chr",
+            w.to_str().unwrap(),
+            "--ref-ld-chr-cts",
+            ldcts.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--n-blocks",
+            "2",
+        ])
+        .status()
+        .expect("failed to launch ldsc h2 --h2-cts");
+    assert!(status.success(), "ldsc h2-cts exited with {}", status);
+
+    let results = out.with_extension("cell_type_results.txt");
+    assert!(results.exists(), "missing CTS results file");
+    let content = fs::read_to_string(results).expect("read CTS results");
+    assert!(
+        content.lines().count() >= 2,
+        "expected header + at least one row"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

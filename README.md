@@ -6,7 +6,7 @@
 [![MSRV: 1.85](https://img.shields.io/badge/rustc-1.85%2B-orange.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
 
 A compiled, statically-typed rewrite of [Bulik-Sullivan et al.'s LDSC](https://github.com/bulik/ldsc) in Rust.
-Implements the same five subcommands — `munge-sumstats`, `ldscore`, `h2`, `rg`, `make-annot` — with
+Implements five subcommands — `munge-sumstats`, `ldscore`, `h2`, `rg`, `make-annot` — with
 identical numerical output and a 7× speedup on LD score computation.
 
 ---
@@ -235,9 +235,13 @@ Common options: `--no-intercept`, `--intercept-h2 VALUE`, `--two-step 30`, `--ch
 `--samp-prev 0.1 --pop-prev 0.01` (liability-scale conversion),
 `--print-coefficients` (partitioned h2: per-annotation τ and enrichment).
 
-> **Partitioned h2 note:** The standard baseline model workflow from the upstream wiki requires
-> `--overlap-annot` (for overlapping annotation categories) and `--frqfile-chr` (for per-category
-> M_5_50 computation). These flags are not yet implemented; see [Unimplemented Features](#unimplemented-features).
+**Overlapping annotations:** use `--overlap-annot` with `--frqfile-chr prefix` (or `--frqfile` for
+single filesets) to match Python’s overlap-adjusted results. When enabled, LDSC writes
+`<out>.results` with overlap-aware proportion/enrichment columns.
+
+**Cell-type-specific h2:** use `--h2-cts` and `--ref-ld-chr-cts` (see the LDSC wiki for `.ldcts`
+format). Output is written to `<out>.cell_type_results.txt`. Add `--print-all-cts` to report
+coefficients for all CTS LD score prefixes in each line.
 
 ### rg
 
@@ -345,10 +349,7 @@ The following Python flags have no Rust equivalent and are not planned:
 |------------|------|--------|
 | `munge-sumstats` | `--daner` / `--daner-n` | Ripke daner format; niche use case |
 | `ldscore` | `--pq-exp` | Generalised per-allele weighting; rare |
-| `ldscore` | `--cts-bin` / `--cts-breaks` / `--cts-names` | Continuous variable partitioning |
 | `ldscore` | `--no-print-annot` | Print-suppression flag; trivial |
-| `h2` | `--h2-cts` / `--ref-ld-chr-cts` / `--print-all-cts` | Cell-type-specific h2 |
-| `h2` / `rg` | `--overlap-annot` / `--frqfile-chr` | Overlapping annotation categories |
 | `rg` | `--intercept-h2` | Fix per-trait h2 intercepts in rg |
 
 ---

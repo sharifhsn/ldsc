@@ -4,11 +4,15 @@
 ///   parse → merge (sumstats ⨝ ld_scores ⨝ weights) → build ndarray
 ///   matrices → jackknife(IRWLS, n_blocks) → h2 / rg estimates.
 use anyhow::{Context, Result};
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Axis, s};
 use polars::prelude::*;
+use statrs::distribution::StudentsT;
 use statrs::distribution::{ChiSquared, Continuous, ContinuousCDF, Normal};
+use std::fs::File;
+use std::io::{BufWriter, Write};
 
 use crate::cli::{H2Args, RgArgs};
+use crate::irwls::IrwlsResult;
 use crate::jackknife;
 use crate::parse;
 
@@ -32,7 +36,7 @@ fn load_ld(single: Option<&str>, chr_prefix: Option<&str>, alias: &str) -> Resul
             prefix,
             &[".l2.ldscore.gz", ".l2.ldscore.bz2", ".l2.ldscore"],
         )?
-            .select([col("SNP"), col("L2").alias(alias)])),
+        .select([col("SNP"), col("L2").alias(alias)])),
         (None, None) => anyhow::bail!(
             "Must specify exactly one of --ref-ld / --ref-ld-chr (or --w-ld / --w-ld-chr)"
         ),
@@ -115,7 +119,10 @@ fn load_ld_ref_multi_paths(paths: &[String], chr_split: bool) -> Result<LazyFram
         } else {
             load_ld_ref_single_path(p)?
         };
-        dfs.push(lf.collect().with_context(|| format!("loading LD scores '{}'", p))?);
+        dfs.push(
+            lf.collect()
+                .with_context(|| format!("loading LD scores '{}'", p))?,
+        );
     }
     let mut base = dfs.remove(0);
     // Match Python: suffix columns from the first file with _0.
@@ -152,7 +159,11 @@ fn load_ld_ref_multi_paths(paths: &[String], chr_split: bool) -> Result<LazyFram
         df.drop_in_place("SNP")?;
         // Match Python: add _i suffix to each column from the i-th file.
         let suffix = format!("_{}", idx + 1);
-        let cols: Vec<String> = df.get_column_names().iter().map(|c| c.to_string()).collect();
+        let cols: Vec<String> = df
+            .get_column_names()
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
         for c in cols {
             let new_name = format!("{}{}", c, suffix);
             df.rename(c.as_str(), new_name.into())?;
@@ -322,22 +333,10 @@ fn match_and_flip(a1: char, a2: char, b1: char, b2: char) -> Option<bool> {
 }
 
 fn align_rg_alleles(merged: &DataFrame, z2: &Array1<f64>) -> Result<(Vec<bool>, Vec<f64>, usize)> {
-    let a1_1 = merged
-        .column("A1_1")?
-        .as_materialized_series()
-        .str()?;
-    let a2_1 = merged
-        .column("A2_1")?
-        .as_materialized_series()
-        .str()?;
-    let a1_2 = merged
-        .column("A1_2")?
-        .as_materialized_series()
-        .str()?;
-    let a2_2 = merged
-        .column("A2_2")?
-        .as_materialized_series()
-        .str()?;
+    let a1_1 = merged.column("A1_1")?.as_materialized_series().str()?;
+    let a2_1 = merged.column("A2_1")?.as_materialized_series().str()?;
+    let a1_2 = merged.column("A1_2")?.as_materialized_series().str()?;
+    let a2_2 = merged.column("A2_2")?.as_materialized_series().str()?;
 
     let mut mask: Vec<bool> = Vec::with_capacity(merged.height());
     let mut z2_aligned: Vec<f64> = Vec::new();
@@ -380,7 +379,32 @@ fn align_rg_alleles(merged: &DataFrame, z2: &Array1<f64>) -> Result<(Vec<bool>, 
 // ---------------------------------------------------------------------------
 
 pub fn run_h2(args: H2Args) -> Result<()> {
-    let sumstats_lf = parse::scan_sumstats(&args.h2)?;
+    if args.h2_cts.is_some() {
+        return run_h2_cts(&args);
+    }
+
+    if args.overlap_annot {
+        if args.not_m_5_50 {
+            if args.frqfile.is_some() || args.frqfile_chr.is_some() {
+                println!("  WARNING: --frqfile is ignored when --not-m-5-50 is set");
+            }
+        } else {
+            let ok = (args.frqfile.is_some() && args.ref_ld.is_some())
+                || (args.frqfile_chr.is_some() && args.ref_ld_chr.is_some());
+            anyhow::ensure!(
+                ok,
+                "Must set either --frqfile and --ref-ld or --frqfile-chr and --ref-ld-chr"
+            );
+        }
+    } else if args.frqfile.is_some() || args.frqfile_chr.is_some() {
+        println!("  WARNING: --frqfile is ignored without --overlap-annot");
+    }
+
+    let h2_path = args
+        .h2
+        .as_ref()
+        .context("--h2 is required unless --h2-cts is set")?;
+    let sumstats_lf = parse::scan_sumstats(h2_path)?;
     // Reference LD keeps all annotation columns (scalar or partitioned).
     let ref_ld = load_ld_ref(args.ref_ld.as_deref(), args.ref_ld_chr.as_deref())?;
     let w_ld = load_ld(args.w_ld.as_deref(), args.w_ld_chr.as_deref(), "w_l2")?;
@@ -409,7 +433,7 @@ pub fn run_h2(args: H2Args) -> Result<()> {
 
     println!(
         "Loaded {} SNPs from '{}' after merging with LD scores",
-        n_total, args.h2
+        n_total, h2_path
     );
 
     // Detect L2 annotation columns: everything that isn't a sumstats or weight column.
@@ -460,9 +484,47 @@ pub fn run_h2(args: H2Args) -> Result<()> {
     let n_mean = n_vec.mean().unwrap_or(1.0);
 
     if k > 1 {
-        return run_h2_partitioned(
+        let fit = run_h2_partitioned(
             &chi2, &ref_l2_k, &w_l2, &n_vec, &l2_cols, n_obs, n_mean, &args,
-        );
+        )?;
+
+        if args.overlap_annot {
+            let chr_split = args.ref_ld_chr.is_some();
+            let prefixes = if let Some(prefix) = args.ref_ld_chr.as_deref() {
+                split_paths(prefix)
+            } else {
+                split_paths(args.ref_ld.as_deref().unwrap_or_default())
+            };
+            let (overlap, m_tot, overlap_names) = parse::read_overlap_matrix(
+                &prefixes,
+                if args.not_m_5_50 {
+                    None
+                } else {
+                    args.frqfile.as_deref()
+                },
+                if args.not_m_5_50 {
+                    None
+                } else {
+                    args.frqfile_chr.as_deref()
+                },
+                chr_split,
+            )?;
+            anyhow::ensure!(
+                overlap_names.len() == l2_cols.len(),
+                "Overlap annotations (K={}) do not match LD score columns (K={})",
+                overlap_names.len(),
+                l2_cols.len()
+            );
+            write_overlap_results(
+                &fit,
+                &l2_cols,
+                &overlap,
+                m_tot,
+                args.print_coefficients,
+                &args.out,
+            )?;
+        }
+        return Ok(());
     }
 
     // Scalar h2 (K == 1).
@@ -583,42 +645,376 @@ pub fn run_h2(args: H2Args) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Partitioned h2 regression (K annotation columns)
-// ---------------------------------------------------------------------------
+fn read_ldcts(path: &str) -> Result<Vec<(String, String)>> {
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading ldcts '{}'", path))?;
+    let mut out = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        anyhow::ensure!(
+            parts.len() == 2,
+            "ldcts line {} must have 2 columns (name + prefixes)",
+            i + 1
+        );
+        out.push((parts[0].to_string(), parts[1].to_string()));
+    }
+    Ok(out)
+}
 
-/// Partitioned stratified LD score regression (Finucane et al. 2015).
-///
-/// Fits:  E[χ²ᵢ] ≈ Nᵢ × Σₖ τₖ × ℓᵢₖ / Mₖ + Na + 1
-///
-/// Which in matrix form is:  y = X β + ε
-///   y[i]     = χ²[i]
-///   X[i, k]  = ℓᵢₖ  (L2 score for annotation k at SNP i)
-///   X[i, K]  = 1.0  (intercept column, unless fixed)
-///   β[k]     ≈ N × h2ₖ / Mₖ  →  h2ₖ = β[k] × Mₖ / N_mean
-///
-/// Weights are based on the weight-LD-score file (w_l2) and total M,
-/// matching the scalar LDSC regression formula.
-#[allow(clippy::too_many_arguments)]
-fn run_h2_partitioned(
-    chi2: &Array1<f64>,
-    ref_l2_k: &[Array1<f64>],
-    w_l2: &Array1<f64>,
-    n_vec: &Array1<f64>,
-    l2_cols: &[String],
-    n_obs: usize,
-    n_mean: f64,
-    args: &H2Args,
-) -> Result<()> {
-    let k = l2_cols.len();
+fn run_h2_cts(args: &H2Args) -> Result<()> {
+    let sumstats_path = args
+        .h2_cts
+        .as_ref()
+        .context("--h2-cts requires a sumstats file")?;
+    let ldcts_path = args
+        .ref_ld_chr_cts
+        .as_ref()
+        .context("--h2-cts requires --ref-ld-chr-cts")?;
+    anyhow::ensure!(args.ref_ld_chr.is_some(), "--h2-cts requires --ref-ld-chr");
+    anyhow::ensure!(
+        args.ref_ld.is_none(),
+        "--h2-cts requires --ref-ld-chr (not --ref-ld)"
+    );
+    anyhow::ensure!(args.w_ld_chr.is_some(), "--h2-cts requires --w-ld-chr");
+    anyhow::ensure!(
+        args.w_ld.is_none(),
+        "--h2-cts requires --w-ld-chr (not --w-ld)"
+    );
 
-    let m_vec = resolve_m_vec(
+    let sumstats_lf = parse::scan_sumstats(sumstats_path)?;
+    let ref_ld = load_ld_ref(args.ref_ld.as_deref(), args.ref_ld_chr.as_deref())?;
+    let w_ld = load_ld(args.w_ld.as_deref(), args.w_ld_chr.as_deref(), "w_l2")?;
+
+    let merged = sumstats_lf
+        .join(
+            ref_ld,
+            [col("SNP")],
+            [col("SNP")],
+            JoinArgs::new(JoinType::Inner),
+        )
+        .join(
+            w_ld,
+            [col("SNP")],
+            [col("SNP")],
+            JoinArgs::new(JoinType::Inner),
+        )
+        .collect()
+        .context("merging sumstats with LD scores")?;
+
+    let n_total = merged.height();
+    anyhow::ensure!(
+        n_total > 0,
+        "No SNPs remaining after merging sumstats with LD scores"
+    );
+    println!(
+        "Loaded {} SNPs from '{}' after merging with LD scores",
+        n_total, sumstats_path
+    );
+
+    let non_l2_set: std::collections::HashSet<&str> = ["SNP", "A1", "A2", "Z", "N", "w_l2"]
+        .iter()
+        .copied()
+        .collect();
+    let l2_cols: Vec<String> = merged
+        .get_column_names()
+        .into_iter()
+        .filter(|n| !non_l2_set.contains(n.as_str()))
+        .map(|s| s.to_string())
+        .collect();
+    let k_base = l2_cols.len();
+    anyhow::ensure!(
+        k_base > 0,
+        "No L2 annotation columns found in merged dataset"
+    );
+
+    let chi2_raw = extract_f64(&merged, "Z")?.mapv(|z| (z * z).max(0.0));
+    let w_l2_raw = extract_f64(&merged, "w_l2")?.mapv(|l| l.max(0.0));
+    let n_vec_raw = extract_f64(&merged, "N")?;
+    let ref_l2_raw_k: Vec<Array1<f64>> = l2_cols
+        .iter()
+        .map(|name| extract_f64(&merged, name).map(|v| v.mapv(|l| l.max(0.0))))
+        .collect::<Result<Vec<_>>>()?;
+
+    let chisq_max = if let Some(c) = args.chisq_max {
+        Some(c)
+    } else {
+        let max_n = n_vec_raw.iter().cloned().fold(0.0f64, f64::max);
+        Some((0.001 * max_n).max(80.0))
+    };
+
+    let (chi2, w_l2, n_vec, ref_l2_k, keep_snps) = if let Some(cmax) = chisq_max {
+        let mask: Vec<bool> = chi2_raw.iter().map(|&c| c <= cmax).collect();
+        let n_removed = mask.iter().filter(|&&b| !b).count();
+        if n_removed > 0 {
+            println!("  Removed {} SNPs with chi2 > {:.1}", n_removed, cmax);
+        }
+        let keep_snps_all: Vec<String> = merged
+            .column("SNP")?
+            .as_materialized_series()
+            .str()?
+            .into_iter()
+            .map(|opt| opt.unwrap_or("").to_string())
+            .collect();
+        let keep_snps: Vec<String> = keep_snps_all
+            .into_iter()
+            .zip(mask.iter())
+            .filter_map(|(s, keep)| if *keep { Some(s) } else { None })
+            .collect();
+        (
+            filter_by_mask(&chi2_raw, &mask),
+            filter_by_mask(&w_l2_raw, &mask),
+            filter_by_mask(&n_vec_raw, &mask),
+            ref_l2_raw_k
+                .iter()
+                .map(|v| filter_by_mask(v, &mask))
+                .collect::<Vec<_>>(),
+            keep_snps,
+        )
+    } else {
+        let keep_snps: Vec<String> = merged
+            .column("SNP")?
+            .as_materialized_series()
+            .str()?
+            .into_iter()
+            .map(|opt| opt.unwrap_or("").to_string())
+            .collect();
+        (chi2_raw, w_l2_raw, n_vec_raw, ref_l2_raw_k, keep_snps)
+    };
+
+    let n_obs = chi2.len();
+    let n_mean = n_vec.mean().unwrap_or(1.0);
+
+    let m_base = resolve_m_vec(
         args.m_snps,
         args.ref_ld_chr.as_deref(),
         args.not_m_5_50,
         n_obs,
-        k,
+        k_base,
     );
+    anyhow::ensure!(
+        m_base.len() == ref_l2_k.len(),
+        "Baseline M length ({}) does not match LD score columns ({})",
+        m_base.len(),
+        ref_l2_k.len()
+    );
+
+    let ldcts = read_ldcts(ldcts_path)?;
+    let norm = Normal::new(0.0, 1.0)?;
+    let mut results: Vec<(String, f64, f64, f64)> = Vec::new();
+
+    for (name, ct_ld_chr) in ldcts {
+        let ct_prefixes = split_paths(&ct_ld_chr);
+        let suffix = if args.not_m_5_50 {
+            ".l2.M"
+        } else {
+            ".l2.M_5_50"
+        };
+        let m_cts = parse::read_m_vec_list(&ct_prefixes, suffix)
+            .with_context(|| format!("reading M files for '{}'", ct_ld_chr))?;
+
+        let cts_ld = load_ld_ref(None, Some(ct_ld_chr.as_str()))
+            .context("loading CTS LD scores")?
+            .collect()
+            .context("collecting CTS LD scores")?;
+        let cts_cols: Vec<String> = cts_ld
+            .get_column_names()
+            .iter()
+            .filter(|c| c.as_str() != "SNP")
+            .map(|c| c.to_string())
+            .collect();
+
+        let keep_df = DataFrame::new_infer_height(vec![
+            Series::new("SNP".into(), keep_snps.clone()).into(),
+            Series::new(
+                "idx".into(),
+                (0..keep_snps.len()).map(|i| i as u32).collect::<Vec<u32>>(),
+            )
+            .into(),
+        ])?;
+        let mut joined = keep_df.join(
+            &cts_ld,
+            ["SNP"],
+            ["SNP"],
+            JoinArgs::new(JoinType::Left),
+            None,
+        )?;
+        joined = joined.sort(["idx"], SortMultipleOptions::default())?;
+
+        let mut cts_arrays: Vec<Array1<f64>> = Vec::new();
+        for col in &cts_cols {
+            let s = joined
+                .column(col)
+                .with_context(|| format!("CTS column '{}'", col))?
+                .cast(&DataType::Float64)
+                .with_context(|| format!("casting CTS column '{}'", col))?;
+            let ca = s
+                .f64()
+                .with_context(|| format!("CTS column '{}' as f64", col))?;
+            let mut v = Vec::with_capacity(n_obs);
+            for val in ca.into_iter() {
+                let val = val.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Missing some LD scores from cts files. Are you sure all SNPs in ref-ld-chr are also in ref-ld-chr-cts?"
+                    )
+                })?;
+                v.push(val.max(0.0));
+            }
+            cts_arrays.push(Array1::from(v));
+        }
+
+        anyhow::ensure!(
+            m_cts.len() == cts_arrays.len(),
+            "M vector length ({}) does not match CTS LD columns ({}) for '{}'",
+            m_cts.len(),
+            cts_arrays.len(),
+            ct_ld_chr
+        );
+
+        let mut ref_l2_k_final = Vec::new();
+        ref_l2_k_final.extend(cts_arrays);
+        ref_l2_k_final.extend(ref_l2_k.clone());
+
+        let mut m_vec = Vec::new();
+        m_vec.extend(m_cts);
+        m_vec.extend(m_base.clone());
+
+        let fit = fit_h2_partitioned(
+            &chi2,
+            &ref_l2_k_final,
+            &w_l2,
+            &n_vec,
+            n_obs,
+            n_mean,
+            args,
+            Some(&m_vec),
+        )?;
+
+        let coef = fit.est[0] / n_mean;
+        let coef_var = fit.jknife_cov[[0, 0]] / (n_mean * n_mean);
+        let coef_se = coef_var.max(0.0).sqrt();
+        let z = if coef_se == 0.0 {
+            f64::NAN
+        } else {
+            coef / coef_se
+        };
+        let p = if z.is_nan() { f64::NAN } else { norm.sf(z) };
+        results.push((name.clone(), coef, coef_se, p));
+
+        if args.print_all_cts {
+            for i in 1..ct_prefixes.len() {
+                if i >= fit.est.len() {
+                    break;
+                }
+                let coef = fit.est[i] / n_mean;
+                let coef_var = fit.jknife_cov[[i, i]] / (n_mean * n_mean);
+                let coef_se = coef_var.max(0.0).sqrt();
+                let z = if coef_se == 0.0 {
+                    f64::NAN
+                } else {
+                    coef / coef_se
+                };
+                let p = if z.is_nan() { f64::NAN } else { norm.sf(z) };
+                results.push((format!("{}_{}", name, i), coef, coef_se, p));
+            }
+        }
+    }
+
+    results.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+
+    let out_path = format!("{}.cell_type_results.txt", args.out);
+    let mut w = BufWriter::new(
+        File::create(&out_path)
+            .with_context(|| format!("creating CTS results file '{}'", out_path))?,
+    );
+    writeln!(
+        w,
+        "Name\tCoefficient\tCoefficient_std_error\tCoefficient_P_value"
+    )?;
+    for (name, coef, se, p) in results {
+        writeln!(w, "{}\t{:.6e}\t{:.6e}\t{:.6e}", name, coef, se, p)?;
+    }
+    println!("Results printed to {}", out_path);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Partitioned h2 regression (K annotation columns)
+// ---------------------------------------------------------------------------
+
+struct PartitionedFit {
+    est: Array1<f64>,
+    jknife_cov: Array2<f64>,
+    delete_values: Array2<f64>,
+    m_vec: Vec<f64>,
+    n_mean: f64,
+    h2_per_annot: Vec<f64>,
+    h2_total: f64,
+    intercept: f64,
+    n_blocks: usize,
+}
+
+fn ratio_jackknife(
+    est: &Array1<f64>,
+    numer_delete: &Array2<f64>,
+    denom_delete: &Array2<f64>,
+) -> (Array2<f64>, Array1<f64>) {
+    let n_blocks = numer_delete.nrows();
+    let k = numer_delete.ncols();
+    let mut pseudo = Array2::<f64>::zeros((n_blocks, k));
+    for b in 0..n_blocks {
+        for j in 0..k {
+            let denom = denom_delete[[b, j]];
+            let numer = numer_delete[[b, j]];
+            pseudo[[b, j]] = if denom == 0.0 {
+                f64::NAN
+            } else {
+                n_blocks as f64 * est[j] - (n_blocks as f64 - 1.0) * (numer / denom)
+            };
+        }
+    }
+    let mean = pseudo.mean_axis(Axis(0)).unwrap();
+    let centered = Array2::from_shape_fn((n_blocks, k), |(b, j)| pseudo[[b, j]] - mean[j]);
+    let cov = centered.t().dot(&centered) / ((n_blocks as f64 - 1.0) * n_blocks as f64);
+    let mut se = Array1::<f64>::zeros(k);
+    for j in 0..k {
+        se[j] = cov[[j, j]].max(0.0).sqrt();
+    }
+    (cov, se)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fit_h2_partitioned(
+    chi2: &Array1<f64>,
+    ref_l2_k: &[Array1<f64>],
+    w_l2: &Array1<f64>,
+    n_vec: &Array1<f64>,
+    n_obs: usize,
+    n_mean: f64,
+    args: &H2Args,
+    m_override: Option<&[f64]>,
+) -> Result<PartitionedFit> {
+    let k = ref_l2_k.len();
+    let m_vec = if let Some(m) = m_override {
+        anyhow::ensure!(
+            m.len() == k,
+            "M vector length {} does not match K={}",
+            m.len(),
+            k
+        );
+        m.to_vec()
+    } else {
+        resolve_m_vec(
+            args.m_snps,
+            args.ref_ld_chr.as_deref(),
+            args.not_m_5_50,
+            n_obs,
+            k,
+        )
+    };
     let m_total: f64 = m_vec.iter().sum();
 
     let (y_reg, x_reg, fixed_intercept) = if let Some(fixed) = args.intercept_h2 {
@@ -658,18 +1054,41 @@ fn run_h2_partitioned(
         weights[i] = 1.0 / (2.0 * v * v);
     }
 
-    let result = jackknife::jackknife(&x_reg, &y_reg, &weights, args.n_blocks, 2)
+    let result: IrwlsResult = jackknife::jackknife(&x_reg, &y_reg, &weights, args.n_blocks, 2)
         .context("jackknife IRWLS for partitioned h2")?;
 
-    // h2_k = τ_k × M_k / N_mean
     let h2_per_annot: Vec<f64> = (0..k).map(|j| result.est[j] * m_vec[j] / n_mean).collect();
     let h2_total: f64 = h2_per_annot.iter().sum();
     let intercept = fixed_intercept.unwrap_or_else(|| result.est[k]);
 
-    println!("Total observed-scale h2: {:.4}", h2_total);
-    println!("Intercept: {:.4}", intercept);
+    let jknife_cov = result
+        .jknife_cov
+        .clone()
+        .context("missing jackknife covariance")?;
+    let delete_values = result
+        .delete_values
+        .clone()
+        .context("missing jackknife delete values")?;
 
-    if args.print_coefficients {
+    Ok(PartitionedFit {
+        est: result.est,
+        jknife_cov,
+        delete_values,
+        m_vec,
+        n_mean,
+        h2_per_annot,
+        h2_total,
+        intercept,
+        n_blocks: args.n_blocks,
+    })
+}
+
+fn print_partitioned_summary(fit: &PartitionedFit, l2_cols: &[String], args: &H2Args) {
+    println!("Total observed-scale h2: {:.4}", fit.h2_total);
+    println!("Intercept: {:.4}", fit.intercept);
+
+    if args.print_coefficients && !args.overlap_annot {
+        let m_total: f64 = fit.m_vec.iter().sum();
         println!();
         println!(
             "{:<35} {:>10} {:>10} {:>12} {:>14}",
@@ -677,20 +1096,18 @@ fn run_h2_partitioned(
         );
         println!("{}", "-".repeat(83));
         for (j, col_name) in l2_cols.iter().enumerate() {
-            let prop_h2 = if h2_total.abs() > 1e-12 {
-                h2_per_annot[j] / h2_total
+            let prop_h2 = if fit.h2_total.abs() > 1e-12 {
+                fit.h2_per_annot[j] / fit.h2_total
             } else {
                 f64::NAN
             };
-            let prop_m = m_vec[j] / m_total;
+            let prop_m = fit.m_vec[j] / m_total;
             let enrichment = if prop_m > 1e-12 {
                 prop_h2 / prop_m
             } else {
                 f64::NAN
             };
-            // Coefficient (τ*) = τ_k / (h2_total / M_k): the per-annotation coefficient
-            // normalized by mean h2 per SNP.
-            let coeff = result.est[j] / n_mean;
+            let coeff = fit.est[j] / fit.n_mean;
             println!(
                 "{:<35} {:>10.4} {:>10.4} {:>12.4} {:>14.4e}",
                 col_name, prop_h2, prop_m, enrichment, coeff
@@ -698,15 +1115,221 @@ fn run_h2_partitioned(
         }
         println!();
     }
+}
 
-    print_jackknife_diagnostics(&result, args.print_cov, args.print_delete_vals);
+fn write_overlap_results(
+    fit: &PartitionedFit,
+    category_names: &[String],
+    overlap: &Array2<f64>,
+    m_tot: usize,
+    print_coefficients: bool,
+    out_prefix: &str,
+) -> Result<()> {
+    let k = category_names.len();
+    anyhow::ensure!(
+        overlap.nrows() == k && overlap.ncols() == k,
+        "Overlap matrix shape {}x{} does not match K={}",
+        overlap.nrows(),
+        overlap.ncols(),
+        k
+    );
+
+    let m_vec = &fit.m_vec;
+    let m_tot_f = m_tot as f64;
+
+    let coef = fit.est.slice(s![..k]).to_owned() / fit.n_mean;
+    let coef_cov = fit.jknife_cov.slice(s![..k, ..k]).to_owned() / (fit.n_mean * fit.n_mean);
+    let mut coef_se = Array1::<f64>::zeros(k);
+    for j in 0..k {
+        coef_se[j] = coef_cov[[j, j]].max(0.0).sqrt();
+    }
+
+    let prop = Array1::from(
+        fit.h2_per_annot
+            .iter()
+            .map(|&h| {
+                if fit.h2_total.abs() > 1e-12 {
+                    h / fit.h2_total
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+    let (prop_cov, _prop_se) = {
+        let n_blocks = fit.delete_values.nrows();
+        let mut numer = Array2::<f64>::zeros((n_blocks, k));
+        for b in 0..n_blocks {
+            for j in 0..k {
+                numer[[b, j]] = m_vec[j] * fit.delete_values[[b, j]] / fit.n_mean;
+            }
+        }
+        let mut denom = Array2::<f64>::zeros((n_blocks, k));
+        for b in 0..n_blocks {
+            let sum = numer.row(b).sum();
+            for j in 0..k {
+                denom[[b, j]] = sum;
+            }
+        }
+        ratio_jackknife(&prop, &numer, &denom)
+    };
+
+    let mut overlap_prop = Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        for j in 0..k {
+            overlap_prop[[i, j]] = overlap[[i, j]] / m_vec[j];
+        }
+    }
+
+    let prop_h2_overlap = overlap_prop.dot(&prop);
+    let prop_h2_overlap_var = overlap_prop.dot(&prop_cov).dot(&overlap_prop.t());
+    let mut prop_h2_overlap_se = Array1::<f64>::zeros(k);
+    for j in 0..k {
+        prop_h2_overlap_se[j] = prop_h2_overlap_var[[j, j]].max(0.0).sqrt();
+    }
+
+    let prop_m_overlap = Array1::from(
+        m_vec
+            .iter()
+            .map(|&m| if m_tot_f > 0.0 { m / m_tot_f } else { f64::NAN })
+            .collect::<Vec<_>>(),
+    );
+    let enrichment = &prop_h2_overlap / &prop_m_overlap;
+    let enrichment_se = &prop_h2_overlap_se / &prop_m_overlap;
+
+    let mut overlap_diff = Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        if (m_tot_f - m_vec[i]).abs() < 1e-12 {
+            continue;
+        }
+        for j in 0..k {
+            let term1 = overlap[[i, j]] / m_vec[i];
+            let term2 = (m_vec[j] - overlap[[i, j]]) / (m_tot_f - m_vec[i]);
+            overlap_diff[[i, j]] = term1 - term2;
+        }
+    }
+
+    let diff_est = overlap_diff.dot(&coef);
+    let diff_cov: Array2<f64> = overlap_diff.dot(&coef_cov).dot(&overlap_diff.t());
+    let mut diff_se = Array1::<f64>::zeros(k);
+    for j in 0..k {
+        diff_se[j] = diff_cov[[j, j]].max(0.0).sqrt();
+    }
+    let tdist =
+        StudentsT::new(0.0, 1.0, fit.n_blocks as f64).context("constructing t distribution")?;
+    let diff_p: Vec<String> = (0..k)
+        .map(|i| {
+            if diff_se[i] == 0.0 {
+                "NA".to_string()
+            } else {
+                let t = (diff_est[i] / diff_se[i]).abs();
+                format!("{}", 2.0 * tdist.sf(t))
+            }
+        })
+        .collect();
+
+    let out_path = format!("{}.results", out_prefix);
+    let mut w = BufWriter::new(
+        File::create(&out_path)
+            .with_context(|| format!("creating overlap results file '{}'", out_path))?,
+    );
+
+    if print_coefficients {
+        writeln!(
+            w,
+            "Category\tProp._SNPs\tProp._h2\tProp._h2_std_error\tEnrichment\tEnrichment_std_error\tEnrichment_p\tCoefficient\tCoefficient_std_error\tCoefficient_z-score"
+        )?;
+    } else {
+        writeln!(
+            w,
+            "Category\tProp._SNPs\tProp._h2\tProp._h2_std_error\tEnrichment\tEnrichment_std_error\tEnrichment_p"
+        )?;
+    }
+
+    for i in 0..k {
+        if print_coefficients {
+            let z = if coef_se[i] == 0.0 {
+                f64::NAN
+            } else {
+                coef[i] / coef_se[i]
+            };
+            writeln!(
+                w,
+                "{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6e}\t{:.6e}\t{:.6}",
+                category_names[i],
+                prop_m_overlap[i],
+                prop_h2_overlap[i],
+                prop_h2_overlap_se[i],
+                enrichment[i],
+                enrichment_se[i],
+                diff_p[i],
+                coef[i],
+                coef_se[i],
+                z
+            )?;
+        } else {
+            writeln!(
+                w,
+                "{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}",
+                category_names[i],
+                prop_m_overlap[i],
+                prop_h2_overlap[i],
+                prop_h2_overlap_se[i],
+                enrichment[i],
+                enrichment_se[i],
+                diff_p[i]
+            )?;
+        }
+    }
+
+    println!("Results printed to {}", out_path);
+    Ok(())
+}
+
+/// Partitioned stratified LD score regression (Finucane et al. 2015).
+///
+/// Fits:  E[χ²ᵢ] ≈ Nᵢ × Σₖ τₖ × ℓᵢₖ / Mₖ + Na + 1
+///
+/// Which in matrix form is:  y = X β + ε
+///   y[i]     = χ²[i]
+///   X[i, k]  = ℓᵢₖ  (L2 score for annotation k at SNP i)
+///   X[i, K]  = 1.0  (intercept column, unless fixed)
+///   β[k]     ≈ N × h2ₖ / Mₖ  →  h2ₖ = β[k] × Mₖ / N_mean
+///
+/// Weights are based on the weight-LD-score file (w_l2) and total M,
+/// matching the scalar LDSC regression formula.
+#[allow(clippy::too_many_arguments)]
+fn run_h2_partitioned(
+    chi2: &Array1<f64>,
+    ref_l2_k: &[Array1<f64>],
+    w_l2: &Array1<f64>,
+    n_vec: &Array1<f64>,
+    l2_cols: &[String],
+    n_obs: usize,
+    n_mean: f64,
+    args: &H2Args,
+) -> Result<PartitionedFit> {
+    let fit = fit_h2_partitioned(chi2, ref_l2_k, w_l2, n_vec, n_obs, n_mean, args, None)?;
+
+    print_partitioned_summary(&fit, l2_cols, args);
+    print_jackknife_diagnostics(
+        &IrwlsResult {
+            est: fit.est.clone(),
+            jknife_se: None,
+            jknife_var: None,
+            jknife_cov: Some(fit.jknife_cov.clone()),
+            delete_values: Some(fit.delete_values.clone()),
+        },
+        args.print_cov,
+        args.print_delete_vals,
+    );
 
     if let (Some(samp_prev), Some(pop_prev)) = (args.samp_prev, args.pop_prev) {
         let c = liability_conversion_factor(samp_prev, pop_prev);
-        println!("Liability-scale h2: {:.4}", h2_total * c);
+        println!("Liability-scale h2: {:.4}", fit.h2_total * c);
     }
 
-    Ok(())
+    Ok(fit)
 }
 
 // ---------------------------------------------------------------------------
@@ -766,8 +1389,11 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
 
         // Load both sumstats and suffix their Z/N columns to avoid conflicts.
         let ss1 = if args.no_check_alleles {
-            parse::scan_sumstats(file1)?
-                .select([col("SNP"), col("Z").alias("Z1"), col("N").alias("N1")])
+            parse::scan_sumstats(file1)?.select([
+                col("SNP"),
+                col("Z").alias("Z1"),
+                col("N").alias("N1"),
+            ])
         } else {
             parse::scan_sumstats(file1)?.select([
                 col("SNP"),
@@ -829,24 +1455,23 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
         let n1_raw = extract_f64(&merged, "N1")?;
         let n2_raw = extract_f64(&merged, "N2")?;
 
-        let (z1_raw, z2_raw, ref_l2_raw, w_l2_raw, n1_raw, n2_raw) =
-            if args.no_check_alleles {
-                (z1_raw, z2_raw, ref_l2_raw, w_l2_raw, n1_raw, n2_raw)
-            } else {
-                let (mask, z2_aligned, n_removed) =
-                    align_rg_alleles(&merged, &z2_raw).context("aligning alleles")?;
-                if n_removed > 0 {
-                    println!("  Removed {} SNPs with incompatible alleles", n_removed);
-                }
-                (
-                    filter_by_mask(&z1_raw, &mask),
-                    Array1::from_vec(z2_aligned),
-                    filter_by_mask(&ref_l2_raw, &mask),
-                    filter_by_mask(&w_l2_raw, &mask),
-                    filter_by_mask(&n1_raw, &mask),
-                    filter_by_mask(&n2_raw, &mask),
-                )
-            };
+        let (z1_raw, z2_raw, ref_l2_raw, w_l2_raw, n1_raw, n2_raw) = if args.no_check_alleles {
+            (z1_raw, z2_raw, ref_l2_raw, w_l2_raw, n1_raw, n2_raw)
+        } else {
+            let (mask, z2_aligned, n_removed) =
+                align_rg_alleles(&merged, &z2_raw).context("aligning alleles")?;
+            if n_removed > 0 {
+                println!("  Removed {} SNPs with incompatible alleles", n_removed);
+            }
+            (
+                filter_by_mask(&z1_raw, &mask),
+                Array1::from_vec(z2_aligned),
+                filter_by_mask(&ref_l2_raw, &mask),
+                filter_by_mask(&w_l2_raw, &mask),
+                filter_by_mask(&n1_raw, &mask),
+                filter_by_mask(&n2_raw, &mask),
+            )
+        };
 
         let prod_raw = &z1_raw * &z2_raw;
 
@@ -1284,12 +1909,20 @@ mod tests {
         std::fs::write(&f2, "SNP\tL2\nrs1\t3.0\nrs2\t4.0\n").unwrap();
 
         let ref_ld = load_ld_ref(
-            Some(&format!("{},{}", f1.to_str().unwrap(), f2.to_str().unwrap())),
+            Some(&format!(
+                "{},{}",
+                f1.to_str().unwrap(),
+                f2.to_str().unwrap()
+            )),
             None,
         )
         .unwrap();
         let df = ref_ld.collect().unwrap();
-        let cols: Vec<String> = df.get_column_names().iter().map(|s| s.to_string()).collect();
+        let cols: Vec<String> = df
+            .get_column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert!(cols.contains(&"SNP".to_string()));
         assert!(cols.contains(&"L2_0".to_string()));
         assert!(cols.contains(&"L2_1".to_string()));

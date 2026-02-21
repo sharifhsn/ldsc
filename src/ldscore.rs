@@ -669,7 +669,8 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
         );
     }
 
-    let mut annot_result: Option<(Array2<f64>, Vec<String>)> = if let Some(ref prefix) = args.annot {
+    let mut annot_result: Option<(Array2<f64>, Vec<String>)> = if let Some(ref prefix) = args.annot
+    {
         // Collect unique chromosomes in BIM order.
         let mut chrs_seen: HashSet<u8> = HashSet::new();
         let mut chrs: Vec<u8> = Vec::new();
@@ -733,7 +734,8 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
     // Optional pre-filter on MAF (Python behavior).
     if args.maf_pre {
         if let Some(thr) = args.maf {
-            let mut bed = Bed::new(bed_path.as_str()).context("opening BED file for MAF prefilter")?;
+            let mut bed =
+                Bed::new(bed_path.as_str()).context("opening BED file for MAF prefilter")?;
             let maf_all = compute_maf_only(
                 &all_snps,
                 &mut bed,

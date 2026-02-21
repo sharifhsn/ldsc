@@ -1,5 +1,5 @@
-mod cli;
 mod blas;
+mod cli;
 mod irwls;
 mod jackknife;
 mod ldscore;

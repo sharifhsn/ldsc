@@ -245,7 +245,6 @@ pub struct LdscoreArgs {
     /// Allow whole-chromosome LD windows without warning.
     #[arg(long, default_value_t = false)]
     pub yes_really: bool,
-
 }
 
 // ---------------------------------------------------------------------------
@@ -255,8 +254,12 @@ pub struct LdscoreArgs {
 #[derive(Args)]
 pub struct H2Args {
     /// Munged summary statistics file (.sumstats[.gz|.bz2])
-    #[arg(long)]
-    pub h2: String,
+    #[arg(long, required_unless_present = "h2_cts", conflicts_with = "h2_cts")]
+    pub h2: Option<String>,
+
+    /// Cell-type specific analysis input (.sumstats[.gz|.bz2]) (Python --h2-cts).
+    #[arg(long, required_unless_present = "h2", conflicts_with = "h2")]
+    pub h2_cts: Option<String>,
 
     /// LD score file prefix, per-chromosome (e.g. eas_ldscores/chr).
     /// LDSC appends .l2.ldscore(.gz|.bz2) and the chromosome number.
@@ -273,6 +276,10 @@ pub struct H2Args {
     /// Provide exactly one of --w-ld-chr or --w-ld.
     #[arg(long)]
     pub w_ld_chr: Option<String>,
+
+    /// Cell-type-specific LD score list file (.ldcts): label + comma-separated prefixes.
+    #[arg(long)]
+    pub ref_ld_chr_cts: Option<String>,
 
     /// Single regression weight LD score file (non-chr-split alternative to --w-ld-chr).
     #[arg(long)]
@@ -329,6 +336,25 @@ pub struct H2Args {
     /// Only meaningful when --ref-ld-chr points to partitioned (multi-column) LD score files.
     #[arg(long, default_value_t = false)]
     pub print_coefficients: bool,
+
+    /// For --h2-cts: report coefficients for all LD score sets in each line.
+    #[arg(long, default_value_t = false)]
+    pub print_all_cts: bool,
+
+    /// Treat partitioned annotations as overlapping categories (Python LDSC --overlap-annot).
+    /// Requires --frqfile/--frqfile-chr unless --not-m-5-50 is set.
+    #[arg(long, default_value_t = false)]
+    pub overlap_annot: bool,
+
+    /// Allele frequency file for overlapping annotations (single fileset).
+    /// Only used when --overlap-annot is set and --not-m-5-50 is false.
+    #[arg(long)]
+    pub frqfile: Option<String>,
+
+    /// Allele frequency files split per chromosome (prefix).
+    /// Only used when --overlap-annot is set and --not-m-5-50 is false.
+    #[arg(long)]
+    pub frqfile_chr: Option<String>,
 
     /// Print jackknife covariance matrix of regression estimates.
     #[arg(long, default_value_t = false)]
