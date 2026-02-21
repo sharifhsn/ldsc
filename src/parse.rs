@@ -44,7 +44,8 @@ fn maybe_decompress_bz2(path: &str) -> Result<PathBuf> {
 /// Scan a `.sumstats[.gz|.bz2]` file as a Polars LazyFrame.
 pub fn scan_sumstats(path: &str) -> Result<LazyFrame> {
     let resolved = maybe_decompress_bz2(path)?;
-    let lf = LazyCsvReader::new(resolved.into())
+    let resolved_str = resolved.to_string_lossy();
+    let lf = LazyCsvReader::new(resolved_str.as_ref().into())
         .with_separator(b'\t')
         .with_has_header(true)
         .finish()?;
@@ -54,7 +55,8 @@ pub fn scan_sumstats(path: &str) -> Result<LazyFrame> {
 /// Scan a `.ldscore[.gz|.bz2]` file as a Polars LazyFrame.
 pub fn scan_ldscore(path: &str) -> Result<LazyFrame> {
     let resolved = maybe_decompress_bz2(path)?;
-    let lf = LazyCsvReader::new(resolved.into())
+    let resolved_str = resolved.to_string_lossy();
+    let lf = LazyCsvReader::new(resolved_str.as_ref().into())
         .with_separator(b'\t')
         .with_has_header(true)
         .finish()?;
@@ -151,31 +153,6 @@ pub fn read_m_vec(prefix: &str, suffix: &str) -> Result<Vec<f64>> {
     Ok(totals)
 }
 
-/// Concatenate per-chromosome LazyFrames into one.
-pub fn concat_chrs(prefix: &str, suffix: &str) -> Result<LazyFrame> {
-    let chrs = get_present_chrs(prefix, suffix);
-    anyhow::ensure!(
-        !chrs.is_empty(),
-        "No chromosome files found for prefix '{}'",
-        prefix
-    );
-
-    let frames: Vec<LazyFrame> = chrs
-        .iter()
-        .map(|chr| {
-            let path = make_chr_path(prefix, *chr, suffix);
-            let resolved = maybe_decompress_bz2(&path)?;
-            LazyCsvReader::new(resolved.into())
-                .with_separator(b'\t')
-                .with_has_header(true)
-                .finish()
-                .map_err(anyhow::Error::from)
-        })
-        .collect::<Result<_>>()?;
-
-    Ok(concat(frames, UnionArgs::default())?)
-}
-
 /// Concatenate per-chromosome LazyFrames, accepting .gz, .bz2, or plain files.
 pub fn concat_chrs_any(prefix: &str, suffixes: &[&str]) -> Result<LazyFrame> {
     for suffix in suffixes {
@@ -189,7 +166,8 @@ pub fn concat_chrs_any(prefix: &str, suffixes: &[&str]) -> Result<LazyFrame> {
             .map(|chr| {
                 let path = make_chr_path(prefix, *chr, suffix);
                 let resolved = maybe_decompress_bz2(&path)?;
-                LazyCsvReader::new(resolved.into())
+                let resolved_str = resolved.to_string_lossy();
+                LazyCsvReader::new(resolved_str.as_ref().into())
                     .with_separator(b'\t')
                     .with_has_header(true)
                     .finish()
@@ -229,7 +207,8 @@ pub fn read_annot(prefix: &str, thin: bool) -> Result<(Array2<f64>, Vec<String>)
     };
 
     let resolved = maybe_decompress_bz2(&path)?;
-    let df = LazyCsvReader::new(resolved.into())
+    let resolved_str = resolved.to_string_lossy();
+    let df = LazyCsvReader::new(resolved_str.as_ref().into())
         .with_separator(b'\t')
         .with_has_header(true)
         .finish()

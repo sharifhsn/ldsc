@@ -17,14 +17,18 @@ use cli::{Cli, Command};
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if let Some(n) = cli.rayon_threads {
-        if let Err(err) = ThreadPoolBuilder::new().num_threads(n).build_global() {
-            eprintln!("warning: failed to set Rayon thread pool size: {}", err);
-        }
+    if let Some(n) = cli.rayon_threads
+        && let Err(err) = ThreadPoolBuilder::new().num_threads(n).build_global()
+    {
+        eprintln!("warning: failed to set Rayon thread pool size: {}", err);
     }
 
     if let Some(n) = cli.polars_threads {
-        std::env::set_var("POLARS_MAX_THREADS", n.to_string());
+        // Setting environment variables is unsafe in Rust 2024 due to potential
+        // data races if other threads read env concurrently.
+        unsafe {
+            std::env::set_var("POLARS_MAX_THREADS", n.to_string());
+        }
     }
 
     blas::set_openblas_threads(cli.blas_threads);
