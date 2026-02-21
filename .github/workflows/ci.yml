@@ -40,6 +40,9 @@ jobs:
       - name: cargo check
         run: cargo check --release --no-default-features --features blas-openblas-system
 
+      - name: cargo fmt
+        run: cargo fmt --check
+
       - name: cargo clippy
         run: cargo clippy --release --no-default-features --features blas-openblas-system -- -D warnings
 
