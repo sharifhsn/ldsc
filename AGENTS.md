@@ -15,6 +15,11 @@
 - `docker build -t ldsc .` builds the container image (see `Dockerfile`).
 - Always run `cargo clippy --release` before committing changes and use it as the feedback loop.
 
+## Key Behavior & Interfaces (from README)
+- Subcommands: `munge-sumstats`, `ldscore`, `h2`, `rg`, `make-annot`.
+- Inputs accept plain, `.gz`, and `.bz2` for sumstats/ldscores/annots where noted in CLI help.
+- `--ref-ld-chr` / `--w-ld-chr` follow the `@` placeholder convention (e.g., `chr@` → `chr22`).
+
 ## Coding Style & Naming Conventions
 - Rust edition: 2024 (`Cargo.toml`). Use standard `rustfmt` output (4-space indentation).
 - Prefer idiomatic Rust naming: `snake_case` for functions/modules, `CamelCase` for types/traits, `SCREAMING_SNAKE_CASE` for constants.
@@ -35,5 +40,12 @@
   - For CLI behavior changes, include example invocations and expected output files.
 
 ## Configuration Notes
-- Building requires Rust >= 1.85 and a C/Fortran toolchain for OpenBLAS (see `README.md`).
+- Default BLAS: static OpenBLAS build (`blas-openblas-static`).
+- CI uses system OpenBLAS: `--no-default-features --features blas-openblas-system` (see `.github/workflows/ci.yml`).
+- Runtime tuning flags (lower priority; not heavily battle-tested): `--blas-threads`, `--rayon-threads`, `--polars-threads`.
+- `ldsc --version` prints the compiled BLAS backend.
+- Building requires Rust >= 1.85 and a C/Fortran toolchain for static OpenBLAS; system BLAS needs `libopenblas-dev` + `pkg-config`.
 - Large datasets are not stored in Git; keep local-only files under `data/`.
+
+## CI Notes
+- CI workflow: `.github/workflows/ci.yml`. On failure it dumps OpenBLAS build logs.
