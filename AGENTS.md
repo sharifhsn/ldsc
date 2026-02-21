@@ -13,6 +13,7 @@
 - `cargo test --test integration` runs only the end-to-end integration suite.
 - `bash test_rust.sh` runs a full CLI smoke test; add `--build` to build first. Requires `data/1000G_phase3_common_norel.{bed,bim,fam}`.
 - `docker build -t ldsc .` builds the container image (see `Dockerfile`).
+- Run `cargo fmt` before committing changes.
 - Always run `cargo clippy --release` before committing changes and use it as the feedback loop.
 
 ## Key Behavior & Interfaces (from README)

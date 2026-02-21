@@ -248,7 +248,7 @@ fn cartesian_indices(sizes: &[usize]) -> Vec<Vec<usize>> {
     combos
 }
 
-fn compare_combo(a: &Vec<usize>, b: &Vec<usize>, specs: &[BinSpec]) -> std::cmp::Ordering {
+fn compare_combo(a: &[usize], b: &[usize], specs: &[BinSpec]) -> std::cmp::Ordering {
     for (i, (ai, bi)) in a.iter().zip(b.iter()).enumerate() {
         let ka = specs[i].lower_bounds[*ai];
         let kb = specs[i].lower_bounds[*bi];

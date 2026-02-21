@@ -600,7 +600,7 @@ pub fn read_overlap_matrix(
             .flat_map(|(i, names)| names.iter().map(move |n| format!("{}_{}", n, i)))
             .collect()
     } else {
-        raw_names_per_prefix.get(0).cloned().unwrap_or_default()
+        raw_names_per_prefix.first().cloned().unwrap_or_default()
     };
 
     Ok((overlap, m_tot, col_names))
