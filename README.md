@@ -113,6 +113,8 @@ tag and a short-SHA tag (`:sha-XXXXXXX`).
 ## Prebuilt Binaries
 
 Releases include Linux and macOS tarballs that contain `ldsc`, `LICENSE`, and `README.md`.
+These binaries are built against **system OpenBLAS** (dynamic), so you may need to install
+OpenBLAS on the target machine (or use Docker for a self-contained run).
 
 ```bash
 # Linux (x86_64)

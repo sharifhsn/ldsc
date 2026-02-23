@@ -1,0 +1,35 @@
+name: Windows Build (Preview)
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (GNU toolchain)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Set up MSYS2 (OpenBLAS + gfortran)
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: >
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-gcc-fortran
+            mingw-w64-x86_64-openblas
+            mingw-w64-x86_64-pkg-config
+
+      - name: Build
+        shell: bash
+        env:
+          PKG_CONFIG_PATH: C:/msys64/mingw64/lib/pkgconfig
+          PATH: C:/msys64/mingw64/bin:${{ env.PATH }}
+        run: cargo build --release --locked --target x86_64-pc-windows-gnu --no-default-features --features blas-openblas-system
