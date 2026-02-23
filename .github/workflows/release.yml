@@ -41,14 +41,16 @@ jobs:
 
       - name: Install build dependencies (Linux)
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y cmake gfortran pkg-config
+        run: sudo apt-get update && sudo apt-get install -y cmake gfortran pkg-config libopenblas-dev
 
       - name: Install build dependencies (macOS)
         if: startsWith(matrix.os, 'macos')
-        run: brew install cmake gcc
+        run: brew install cmake gcc openblas pkg-config
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/opt/openblas/lib/pkgconfig:/usr/local/opt/openblas/lib/pkgconfig
+        run: cargo build --release --locked --target ${{ matrix.target }} --no-default-features --features blas-openblas-system
 
       - name: Package
         run: |
