@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  OPENBLAS_TARGET: "SSE_GENERIC"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: ldsc_linux-x86_64
+            sha_cmd: sha256sum
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: ldsc_macos-x86_64
+            sha_cmd: shasum -a 256
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: ldsc_macos-aarch64
+            sha_cmd: shasum -a 256
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install build dependencies (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y cmake gfortran pkg-config
+
+      - name: Install build dependencies (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: brew install cmake gcc
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/ldsc dist/
+          cp LICENSE README.md dist/
+          tar -czf ${{ matrix.artifact }}.tar.gz -C dist ldsc LICENSE README.md
+          ${{ matrix.sha_cmd }} ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
