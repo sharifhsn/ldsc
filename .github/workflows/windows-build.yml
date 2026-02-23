@@ -12,25 +12,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (GNU toolchain)
+      - name: Install Rust (MSVC toolchain)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-gnu
+          targets: x86_64-pc-windows-msvc
 
-      - name: Set up MSYS2 (OpenBLAS + gfortran)
-        uses: msys2/setup-msys2@v2
+      - name: Install OpenBLAS via vcpkg
+        uses: lukka/run-vcpkg@v11
         with:
-          update: true
-          install: >
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-gcc-fortran
-            mingw-w64-x86_64-openblas
-            mingw-w64-x86_64-pkg-config
+          vcpkgArguments: "openblas:x64-windows"
 
       - name: Build
-        shell: bash
         env:
-          PKG_CONFIG_PATH: C:/msys64/mingw64/lib/pkgconfig
-        run: |
-          export PATH="$CARGO_HOME/bin:/c/msys64/mingw64/bin:$PATH"
-          cargo build --release --locked --target x86_64-pc-windows-gnu --no-default-features --features blas-openblas-system
+          VCPKG_DEFAULT_TRIPLET: x64-windows
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc --no-default-features --features blas-openblas-system
