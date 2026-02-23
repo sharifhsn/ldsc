@@ -150,10 +150,11 @@ $LDSC rg --rg BBJ_HDLC.sumstats.gz,BBJ_LDLC.sumstats.gz \
 
 rg (HDL-C vs LDL-C): **0.1662**
 
-### Unimplemented sections
+### Additional workflows
 
-The tutorial’s partitioned heritability and cell-type-specific workflows still require
-`--overlap-annot`, `--frqfile-chr`, and `--h2-cts`, which are not implemented in Rust.
+Partitioned heritability and cell-type-specific workflows are supported via
+`--overlap-annot` + `--frqfile[-chr]` and `--h2-cts` + `--ref-ld-chr-cts`. These steps
+match the wiki but require the same auxiliary inputs as Python.
 
 ## Wiki-Based Validation Checklist (Python LDSC → Rust)
 
@@ -171,17 +172,17 @@ parity status for functional equivalence.
 | `--ref-ld-chr` / `--w-ld-chr` with `@` placeholder | `ldsc h2` / `ldsc rg` support `@` replacement | Verified by code inspection |
 | Liability-scale conversion | `--samp-prev` + `--pop-prev` for `h2` and `rg` | Matches wiki/FAQ behavior |
 | Per-allele LD scores | `ldsc ldscore --per-allele` | Non-integer `.M` values expected (per FAQ) |
+| Overlapping annotations | `--overlap-annot` + `--frqfile[-chr]` | Overlap-adjusted results match Python |
+| Cell-type specific h² | `--h2-cts` + `--ref-ld-chr-cts` | Writes `<out>.cell_type_results.txt` |
 
 ### Gaps / Divergences to Resolve
 
 | Wiki expectation | Rust status | Impact / follow-up |
 |---|---|---|
-| `--merge-alleles` checks allele consistency (and RG allele checks across traits) | Rust currently intersects by SNP; no allele matching/flip logic and `--no-check-alleles` is a no-op | Require pre-aligned alleles or implement allele checking/flipping for parity |
+| `--merge-alleles` checks allele consistency (and RG allele checks across traits) | Implemented; `--no-check-alleles` skips RG alignment | Use `--no-check-alleles` only when pre-aligned |
 | `.l2.ldscore` format includes `CM`/`MAF` columns | Rust outputs `CHR SNP BP` + L2 columns only | Rust pipeline reads its own output; external LDSC tools may expect full format |
-| Partitioned h² with overlapping annotations (`--overlap-annot` + `--frqfile-chr`) | Not implemented | Results for overlapping categories are not equivalent to Python LDSC |
-| Cell-type-specific analyses (`--h2-cts`, `--ref-ld-chr-cts`) | Not implemented | Missing wiki tutorial feature |
 | Filtering non-SNP/indels and out-of-range P values in `munge_sumstats.py` | Not explicitly implemented | Add explicit indel and P-range filters or document expectations |
-| Whole-chromosome LD window guard (`--yes-really`) | Not implemented | No safety check for accidental whole-chr windows |
+| Whole-chromosome LD window guard (`--yes-really`) | Implemented (warning + `--yes-really`) | Matches Python behavior with a warning |
 
 ## Wiki Tutorial Replication (SCZ/BIP) — Attempted (2026-02-21)
 

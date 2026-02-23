@@ -11,6 +11,23 @@ identical numerical output and a 7× speedup on LD score computation.
 
 ---
 
+## Get Started
+
+Fastest (no Rust required):
+
+```bash
+docker run --rm ghcr.io/sharifhsn/ldsc:latest --help
+```
+
+Standalone binaries are available in GitHub Releases (see “Prebuilt Binaries” below).
+
+Native install (requires Rust):
+
+```bash
+cargo install ldsc
+ldsc --help
+```
+
 ## Quick Start
 
 The typical LDSC workflow — preprocess summary statistics, then estimate heritability or genetic
@@ -57,15 +74,11 @@ ldsc rg \
 
 ---
 
-## Installation
+## Installation Details
 
-```bash
-cargo install ldsc
-```
-
-Requires Rust ≥ 1.85 and a C toolchain with Fortran support to build the default
-statically-linked OpenBLAS. If you opt into the system BLAS feature, you only
-need the system OpenBLAS development package.
+Native builds require Rust ≥ 1.85 and a C toolchain with Fortran support to build the default
+statically-linked OpenBLAS. If you opt into the system BLAS feature, you only need
+the system OpenBLAS development package.
 
 On Debian/Ubuntu (default static build):
 
@@ -77,15 +90,10 @@ sudo apt-get install cmake gfortran libgfortran-dev
 
 ## Docker
 
-Pre-built images are published to the [GitHub Container Registry](https://ghcr.io/sharifhsn/ldsc)
-on every push to `main` and for each version tag:
+Images are published to the GitHub Container Registry on every push to `main` and for each version tag.
 
 ```bash
-# Latest stable release
 docker pull ghcr.io/sharifhsn/ldsc:latest
-
-# Specific version
-docker pull ghcr.io/sharifhsn/ldsc:0.1.0
 
 # Run with local data mounted
 docker run --rm \
@@ -97,8 +105,46 @@ docker run --rm \
      --out        /data/results
 ```
 
-Version tags (`v1.2.3`) produce `:1.2.3`, `:1.2`, and `:latest` image tags.
-Pushes to `main` produce a `:main` tag and a short-SHA tag (`:sha-XXXXXXX`).
+Version tags (`v1.2.3`) produce `:1.2.3`, `:1.2`, and `:latest`. Pushes to `main` produce a `:main`
+tag and a short-SHA tag (`:sha-XXXXXXX`).
+
+---
+
+## Prebuilt Binaries
+
+Releases include Linux and macOS tarballs that contain `ldsc`, `LICENSE`, and `README.md`.
+
+```bash
+# Linux (x86_64)
+curl -L -o ldsc_linux-x86_64.tar.gz \
+  https://github.com/sharifhsn/ldsc/releases/latest/download/ldsc_linux-x86_64.tar.gz
+tar -xzf ldsc_linux-x86_64.tar.gz
+./ldsc --help
+
+# macOS (Apple Silicon)
+curl -L -o ldsc_macos-aarch64.tar.gz \
+  https://github.com/sharifhsn/ldsc/releases/latest/download/ldsc_macos-aarch64.tar.gz
+tar -xzf ldsc_macos-aarch64.tar.gz
+./ldsc --help
+
+# macOS (Intel)
+curl -L -o ldsc_macos-x86_64.tar.gz \
+  https://github.com/sharifhsn/ldsc/releases/latest/download/ldsc_macos-x86_64.tar.gz
+tar -xzf ldsc_macos-x86_64.tar.gz
+./ldsc --help
+```
+
+---
+
+## Release Process (Maintainers)
+
+Releases are cut with `cargo-release` and tagged as `vX.Y.Z`. Tag pushes trigger the release
+workflow, which builds and uploads platform tarballs to GitHub Releases.
+
+```bash
+cargo release patch
+cargo release patch --execute
+```
 
 ### Building the image locally
 
