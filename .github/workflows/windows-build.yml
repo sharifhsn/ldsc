@@ -20,7 +20,9 @@ jobs:
       - name: Install OpenBLAS via vcpkg
         uses: lukka/run-vcpkg@v11
         with:
-          vcpkgArguments: "openblas:x64-windows"
+          vcpkgGitCommitId: "d3f5b1876d2a7e87689d0b772fe2f7d3a9bdc5b0"
+          runVcpkgInstall: true
+          runVcpkgFormatString: "install openblas:x64-windows"
 
       - name: Build
         env:
