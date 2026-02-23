@@ -22,7 +22,7 @@ jobs:
         working-directory: ${{ github.workspace }}\\vcpkg
         env:
           VCPKG_DEFAULT_TRIPLET: x64-windows
-        run: .\\vcpkg.exe install openblas:x64-windows --disable-metrics
+        run: .\\vcpkg.exe install openblas:x64-windows --classic --disable-metrics
 
       - name: Install Rust (MSVC toolchain)
         uses: dtolnay/rust-toolchain@stable
