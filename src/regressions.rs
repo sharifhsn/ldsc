@@ -196,7 +196,7 @@ fn resolve_m(
             }
             Err(_) => {
                 println!(
-                    "  No {} files found alongside --ref-ld-chr; using M = {} (regression SNPs)",
+                    "  No {} files found alongside --ref-ld-chr; using M = {} (regression SNPs), may not be correct because M should be # of SNPs used for estimating LD score",
                     suffix, n_obs
                 );
             }
@@ -204,7 +204,7 @@ fn resolve_m(
     } else {
         println!(
             "  Single-file --ref-ld: no M files to read. \
-             Use --M to set M explicitly. Using M = {} (regression SNPs).",
+             Use --M to set M explicitly. Using M = {} (regression SNPs), may not be correct because M should be # of SNPs used for estimating LD score",
             n_obs
         );
     }
