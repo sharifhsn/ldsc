@@ -695,7 +695,7 @@ pub fn run(args: LdscoreArgs) -> Result<()> {
 
     if args.annot.is_some() && args.extract.is_some() {
         println!(
-            "WARNING: --annot with --extract is not supported in Python LDSC. \
+            "WARNING: --annot with --extract is not supported. \
              Ensure your annot files match the extracted SNP set."
         );
     }
