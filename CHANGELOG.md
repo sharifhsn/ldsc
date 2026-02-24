@@ -6,7 +6,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [1.0.3] — 2026-02-23
+## [0.1.3] — 2026-02-23
 
 ### Added
 - `cts-annot` continuous-annotation binning (Python `--cts-bin`) and `.annot` output.
@@ -36,6 +36,6 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Statically linked OpenBLAS (no runtime library needed)
 - 40 unit tests; integration smoke test for ldscore
 
-[Unreleased]: https://github.com/sharifhsn/ldsc/compare/v1.0.3...HEAD
-[1.0.3]: https://github.com/sharifhsn/ldsc/releases/tag/v1.0.3
+[Unreleased]: https://github.com/sharifhsn/ldsc/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/sharifhsn/ldsc/releases/tag/v0.1.3
 [0.1.0]: https://github.com/sharifhsn/ldsc/releases/tag/v0.1.0
