@@ -43,7 +43,7 @@ bunzip2 w_hm3.snplist.bz2
 ```bash
 ldsc munge-sumstats \
   --sumstats my_gwas.txt \
-  --n 50000 \
+  --N 50000 \
   --merge-alleles w_hm3.snplist \
   --out my_trait
 ```
@@ -83,9 +83,9 @@ ldsc munge-sumstats \
   --out output_prefix \
   [--merge-alleles w_hm3.snplist] \
   [--signed-sumstats BETA,0] \
-  [--n 50000] \
+  [--N 50000] \
   [--info-min 0.9] \
-  [--maf 0.01]
+  [--maf-min 0.01]
 ```
 
 Key flags: `--signed-sumstats COLNAME,null_value` tells the tool which column carries effect direction and what the
@@ -122,7 +122,7 @@ ldsc ldscore \
 `ldsc ldscore` warns if the LD window spans an entire chromosome; use `--yes-really` to silence.
 
 Window flags are mutually exclusive: `--ld-wind-cm` (genetic distance, default 1.0), `--ld-wind-kb`
-(physical distance), or `--ld-wind-snp` (fixed flanking SNP count).
+(physical distance), or `--ld-wind-snps` (fixed flanking SNP count).
 
 Partitioned LD scores with `--annot prefix`: expects `{prefix}{chr}.annot[.gz]` for each chromosome present in
 the BIM, outputs one L2 column per annotation and corresponding `.l2.M` / `.l2.M_5_50` files.
@@ -329,7 +329,7 @@ heavily battle-tested**. Use them only when needed:
 ## Performance
 
 Benchmarks against the original Python on a 16-core desktop (AMD Ryzen 9 5950X) using 1000 Genomes
-Phase 3 (n = 2,504 individuals, `--ld-wind-snp 100`).
+Phase 3 (n = 2,504 individuals, `--ld-wind-snps 100`).
 
 | Dataset | SNPs | Rust | Python | Speedup |
 |---------|------|------|--------|---------|
@@ -360,15 +360,10 @@ single `ldsc` binary:
 Python's `--l2` flag (LD score estimation mode) becomes the `ldscore` subcommand. The `--h2` and
 `--rg` flags (regression modes) become `h2` and `rg` subcommands.
 
-### Flag renames
+### Flag compatibility
 
-| Python | Rust | Note |
-|--------|------|------|
-| `--ld-wind-snps` | `--ld-wind-snp` | trailing `s` removed |
-| `--N` / `--N-col` | `--n` / `--n-col` | lowercase |
-| `--M` | `--m-snps` | renamed |
-| `--snp` / `--a1` / `--a2` / `--p` / `--frq` / `--info` | `--snp-col` / `--a1-col` / ... | `--*-col` suffix |
-| `--maf-min` | `--maf` | renamed |
+Python flag names are supported directly. For backwards compatibility with early Rust builds,
+the previous aliases (e.g., `--ld-wind-snp`, `--n`, `--m-snps`, `--a1-col`) still work.
 
 ### Behavioural differences
 

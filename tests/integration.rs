@@ -50,7 +50,7 @@ fn ldscore_smoke() {
             &test_data(),
             "--out",
             &out_prefix,
-            "--ld-wind-snp",
+            "--ld-wind-snps",
             "50", // small window → fast
         ])
         .status()

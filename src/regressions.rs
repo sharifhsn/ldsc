@@ -184,7 +184,7 @@ fn resolve_m(
     n_obs: usize,
 ) -> f64 {
     if let Some(m) = m_snps_override {
-        println!("  Using M = {:.0} from --m-snps", m);
+        println!("  Using M = {:.0} from --M", m);
         return m;
     }
     if let Some(prefix) = ref_ld_chr {
@@ -204,7 +204,7 @@ fn resolve_m(
     } else {
         println!(
             "  Single-file --ref-ld: no M files to read. \
-             Use --m-snps to set M explicitly. Using M = {} (regression SNPs).",
+             Use --M to set M explicitly. Using M = {} (regression SNPs).",
             n_obs
         );
     }
@@ -1380,7 +1380,7 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
 
     // Determine M before the per-pair loop; falls back to n_obs per pair if not found.
     let m_from_files: Option<f64> = if let Some(m) = args.m_snps {
-        println!("Using M = {:.0} from --m-snps", m);
+        println!("Using M = {:.0} from --M", m);
         Some(m)
     } else if let Some(prefix) = &args.ref_ld_chr {
         let suffix = if args.not_m_5_50 {

@@ -33,9 +33,9 @@ EAS=eas_ldscores/
 
 # Step 1 & 2: munge
 ldsc munge-sumstats --sumstats BBJ_HDLC.txt.gz --merge-alleles w_hm3.snplist \
-  --a1-col ALT --a2-col REF --out BBJ_HDLC
+  --a1 ALT --a2 REF --out BBJ_HDLC
 ldsc munge-sumstats --sumstats BBJ_LDLC.txt.gz --merge-alleles w_hm3.snplist \
-  --a1-col ALT --a2-col REF --out BBJ_LDLC
+  --a1 ALT --a2 REF --out BBJ_LDLC
 
 # Step 3a: h2 HDL-C
 ldsc h2 --h2 BBJ_HDLC.sumstats.gz --ref-ld-chr $EAS --w-ld-chr $EAS --out BBJ_HDLC_h2
@@ -92,7 +92,7 @@ for lipid traits in BBJ has wide confidence intervals (both estimates overlap wi
 and the tutorial results were from a 2022 run that may have used a different EAS LD score
 version or HM3 list. The direction, sign, and order of magnitude are all correct.
 
-All flag renames work as expected (`--a1-col`, `--a2-col`, auto-detection of `BETA,0`).
+Python flag names are accepted directly (`--a1`, `--a2`, auto-detection of `BETA,0`).
 The `--merge-alleles` SNP count matches upstream Python to within 0.015%.
 
 ## GWASTutorial 08_LDSC (2026-02-21)
@@ -128,9 +128,9 @@ EAS=/tmp/ldsc_tutorial_08/resource/eas_ldscores/
 HM3=/tmp/ldsc_tutorial_08/resource/w_hm3.snplist
 
 $LDSC munge-sumstats --sumstats BBJ_HDLC.txt.gz --merge-alleles $HM3 \
-  --a1-col ALT --a2-col REF --out BBJ_HDLC
+  --a1 ALT --a2 REF --out BBJ_HDLC
 $LDSC munge-sumstats --sumstats BBJ_LDLC.txt.gz --merge-alleles $HM3 \
-  --a1-col ALT --a2-col REF --out BBJ_LDLC
+  --a1 ALT --a2 REF --out BBJ_LDLC
 
 $LDSC h2 --h2 BBJ_HDLC.sumstats.gz --ref-ld-chr $EAS --w-ld-chr $EAS --out BBJ_HDLC_h2
 $LDSC h2 --h2 BBJ_LDLC.sumstats.gz --ref-ld-chr $EAS --w-ld-chr $EAS --out BBJ_LDLC_h2
@@ -166,9 +166,9 @@ parity status for functional equivalence.
 | Wiki expectation | Rust mapping | Notes |
 |---|---|---|
 | `.sumstats` requires `SNP`, `A1`, `A2`, `N`, and signed stats (`Z` or P + signed column) | `ldsc munge-sumstats` writes `SNP A1 A2 Z N` (plus `FRQ` with `--keep-maf`) | Z is signed w.r.t. `A1`; `--a1-inc` covers “A1 always increasing” inputs |
-| INFO/MAF filters and strand-ambiguous removal | `--info-min` default 0.9, `--maf` default 0.01, strand ambiguous A/T and C/G removed | Matches wiki defaults for INFO/MAF and ambiguity filtering |
-| Constant sample size or per-SNP `N` | `--n`, `--n-cas`, `--n-con`, or per-row `N` | Matches wiki guidance for fixed/variable sample sizes |
-| LD score estimation from PLINK (`--l2`) | `ldsc ldscore --bfile … --ld-wind-cm/--ld-wind-kb/--ld-wind-snp …` | Emits `.l2.ldscore.gz`, `.l2.M`, `.l2.M_5_50` per chromosome |
+| INFO/MAF filters and strand-ambiguous removal | `--info-min` default 0.9, `--maf-min` default 0.01, strand ambiguous A/T and C/G removed | Matches wiki defaults for INFO/MAF and ambiguity filtering |
+| Constant sample size or per-SNP `N` | `--N`, `--N-cas`, `--N-con`, or per-row `N` | Matches wiki guidance for fixed/variable sample sizes |
+| LD score estimation from PLINK (`--l2`) | `ldsc ldscore --bfile … --ld-wind-cm/--ld-wind-kb/--ld-wind-snps …` | Emits `.l2.ldscore.gz`, `.l2.M`, `.l2.M_5_50` per chromosome |
 | `--ref-ld-chr` / `--w-ld-chr` with `@` placeholder | `ldsc h2` / `ldsc rg` support `@` replacement | Verified by code inspection |
 | Liability-scale conversion | `--samp-prev` + `--pop-prev` for `h2` and `rg` | Matches wiki/FAQ behavior |
 | Per-allele LD scores | `ldsc ldscore --per-allele` | Non-integer `.M` values expected (per FAQ) |
@@ -201,9 +201,9 @@ bunzip2 w_hm3.snplist.bz2
 
 # Munge (sample sizes from wiki: SCZ N=17115, BIP N=11810)
 ldsc munge-sumstats --sumstats pgc.cross.SCZ17.2013-05.txt \
-  --n 17115 --merge-alleles w_hm3.snplist --out scz
+  --N 17115 --merge-alleles w_hm3.snplist --out scz
 ldsc munge-sumstats --sumstats pgc.cross.BIP11.2013-05.txt \
-  --n 11810 --merge-alleles w_hm3.snplist --out bip
+  --N 11810 --merge-alleles w_hm3.snplist --out bip
 
 # h2
 ldsc h2 --h2 scz.sumstats.gz --ref-ld-chr eur_w_ld_chr/ --w-ld-chr eur_w_ld_chr/ --out scz_h2
