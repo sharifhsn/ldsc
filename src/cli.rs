@@ -75,7 +75,7 @@ pub struct MungeArgs {
     pub n_min: f64,
 
     /// Minimum MAF to retain a SNP (0 to disable)
-    #[arg(long = "maf-min", alias = "maf", default_value_t = 0.01)]
+    #[arg(long = "maf-min", default_value_t = 0.01)]
     pub maf: f64,
 
     /// Minimum INFO score to retain a SNP (0 to disable)
@@ -88,53 +88,53 @@ pub struct MungeArgs {
 
     // --- Sample size overrides -----------------------------------------------
     /// Fix sample size for all SNPs (overrides any N column in the file)
-    #[arg(long = "N", alias = "n")]
+    #[arg(long = "N")]
     pub n: Option<f64>,
 
     /// Number of cases (N = N-cas + N-con; ignored if --n is set)
-    #[arg(long = "N-cas", alias = "n-cas")]
+    #[arg(long = "N-cas")]
     pub n_cas: Option<f64>,
 
     /// Number of controls (N = N-cas + N-con; ignored if --n is set)
-    #[arg(long = "N-con", alias = "n-con")]
+    #[arg(long = "N-con")]
     pub n_con: Option<f64>,
 
     // --- Column name overrides (case-insensitive) ----------------------------
     // Use when the file uses a non-standard name not in the built-in synonym map.
     /// Name of the SNP ID column in the input file
-    #[arg(long = "snp", alias = "snp-col")]
+    #[arg(long = "snp")]
     pub snp_col: Option<String>,
 
     /// Name of the sample size (N) column in the input file
-    #[arg(long = "N-col", alias = "n-col")]
+    #[arg(long = "N-col")]
     pub n_col: Option<String>,
 
     /// Name of the case sample size column (N = N-cas-col + N-con-col per row)
-    #[arg(long = "N-cas-col", alias = "n-cas-col")]
+    #[arg(long = "N-cas-col")]
     pub n_cas_col: Option<String>,
 
     /// Name of the control sample size column (N = N-cas-col + N-con-col per row)
-    #[arg(long = "N-con-col", alias = "n-con-col")]
+    #[arg(long = "N-con-col")]
     pub n_con_col: Option<String>,
 
     /// Name of the effect allele (A1) column in the input file
-    #[arg(long = "a1", alias = "a1-col")]
+    #[arg(long = "a1")]
     pub a1_col: Option<String>,
 
     /// Name of the other allele (A2) column in the input file
-    #[arg(long = "a2", alias = "a2-col")]
+    #[arg(long = "a2")]
     pub a2_col: Option<String>,
 
     /// Name of the p-value column in the input file
-    #[arg(long = "p", alias = "p-col")]
+    #[arg(long = "p")]
     pub p_col: Option<String>,
 
     /// Name of the allele frequency column in the input file
-    #[arg(long = "frq", alias = "frq-col")]
+    #[arg(long = "frq")]
     pub frq_col: Option<String>,
 
     /// Name of the imputation INFO column in the input file
-    #[arg(long = "info", alias = "info-col")]
+    #[arg(long = "info")]
     pub info_col: Option<String>,
 
     /// Signed summary statistic column and its null value: COLNAME,null
@@ -202,7 +202,7 @@ pub struct LdscoreArgs {
     pub ld_wind_kb: Option<f64>,
 
     /// LD window as number of flanking SNPs (overrides --ld-wind-cm when set)
-    #[arg(long = "ld-wind-snps", alias = "ld-wind-snp")]
+    #[arg(long = "ld-wind-snps")]
     pub ld_wind_snp: Option<usize>,
 
     /// Annotation file prefix for partitioned LD scores.
@@ -311,7 +311,7 @@ pub struct H2Args {
     /// Number of SNPs in the LD score reference panel (e.g. 1190321 for HapMap3 EUR).
     /// Used as M in h2 = slope × M / N.  If omitted, reads from .l2.M_5_50 files
     /// alongside --ref-ld-chr; falls back to the number of regression SNPs if not found.
-    #[arg(long = "M", alias = "m-snps")]
+    #[arg(long = "M")]
     pub m_snps: Option<f64>,
 
     /// Use .l2.M instead of .l2.M_5_50 as the M denominator.
@@ -427,7 +427,7 @@ pub struct RgArgs {
 
     /// Number of SNPs in the LD score reference panel.
     /// If omitted, reads from .l2.M_5_50 files alongside --ref-ld-chr.
-    #[arg(long = "M", alias = "m-snps")]
+    #[arg(long = "M")]
     pub m_snps: Option<f64>,
 
     /// Use .l2.M instead of .l2.M_5_50 as the M denominator.

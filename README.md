@@ -362,8 +362,7 @@ Python's `--l2` flag (LD score estimation mode) becomes the `ldscore` subcommand
 
 ### Flag compatibility
 
-Python flag names are supported directly. For backwards compatibility with early Rust builds,
-the previous aliases (e.g., `--ld-wind-snp`, `--n`, `--m-snps`, `--a1-col`) still work.
+Python flag names are supported directly.
 
 ### Behavioural differences
 
