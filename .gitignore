@@ -12,3 +12,6 @@ data/
 .claude/
 
 *.sh
+
+generated_docs/
+perf/
