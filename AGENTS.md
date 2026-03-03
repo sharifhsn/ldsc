@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `src/` holds the Rust implementation. Entry points and subcommands are in `main.rs` and `cli.rs`; core pipelines live in modules like `munge.rs`, `ldscore.rs`, `regressions.rs`, `jackknife.rs`, and `irwls.rs`.
+- `src/` holds the Rust implementation. Entry points and subcommands are in `main.rs` and `cli.rs`; core pipelines live in modules like `munge.rs`, `l2.rs`, `regressions.rs`, `jackknife.rs`, and `irwls.rs`.
 - `tests/` contains integration tests (`tests/integration.rs`) plus fixtures under `tests/fixtures/`.
 - `data/` is for local test data (e.g., 1000G reference files used by the smoke test).
 - `test_rust.sh` is a repo-level CLI smoke test script.
@@ -24,7 +24,7 @@
 ## Coding Style & Naming Conventions
 - Rust edition: 2024 (`Cargo.toml`). Use standard `rustfmt` output (4-space indentation).
 - Prefer idiomatic Rust naming: `snake_case` for functions/modules, `CamelCase` for types/traits, `SCREAMING_SNAKE_CASE` for constants.
-- If adding complex logic, include brief comments for non-obvious invariants (see `src/ldscore.rs` and `src/regressions.rs`).
+- If adding complex logic, include brief comments for non-obvious invariants (see `src/l2.rs` and `src/regressions.rs`).
 
 ## Testing Guidelines
 - Unit tests live alongside modules under `#[cfg(test)]` (e.g., `src/parse.rs`).

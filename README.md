@@ -6,7 +6,7 @@
 [![MSRV: 1.85](https://img.shields.io/badge/rustc-1.85%2B-orange.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
 
 A compiled, statically-typed rewrite of [Bulik-Sullivan et al.'s LDSC](https://github.com/bulik/ldsc) in Rust.
-Implements six subcommands — `munge-sumstats`, `ldscore`, `h2`, `rg`, `make-annot`, `cts-annot` — with
+Implements six subcommands — `munge-sumstats`, `l2`, `h2`, `rg`, `make-annot`, `cts-annot` — with
 identical numerical output and a 7× speedup on LD score computation.
 
 ---
@@ -29,7 +29,7 @@ Local install options:
 The typical LDSC workflow — preprocess summary statistics, then estimate heritability or genetic
 correlation — mirrors the [upstream wiki tutorial](https://github.com/bulik/ldsc/wiki/Heritability-and-Genetic-Correlation).
 
-**Step 1: Download pre-computed European LD scores** (skip `ldscore` for European GWAS)
+**Step 1: Download pre-computed European LD scores** (skip `l2` for European GWAS)
 
 ```bash
 wget https://data.broadinstitute.org/alkesgroup/LDSCORE/eur_w_ld_chr.tar.bz2
@@ -94,7 +94,7 @@ null value is (e.g. `BETA,0`, `OR,1`, `Z,0`). Without this flag the tool auto-de
 `--merge-alleles` enforces allele concordance (mismatches are removed), matching Python behavior.
 Use `--daner` or `--daner-n` for Ripke daner formats (infers N from FRQ_[A/U] headers or Nca/Nco columns).
 
-### ldscore
+### l2
 
 Computes LD scores from a PLINK binary file set (`.bed/.bim/.fam`).
 Annotation inputs (`.annot`) may be plain, `.gz`, or `.bz2`.
@@ -106,30 +106,31 @@ Annotation inputs (`.annot`) may be plain, `.gz`, or `.bz2`.
 > your own LD scores from an appropriate reference panel.
 
 ```bash
-ldsc ldscore \
+ldsc l2 \
   --bfile /path/to/1000G_EUR \
   --out out/eur \
   --ld-wind-cm 1.0 \
   [--annot annotations/BaselineLD.] \
   [--extract snplist.txt] \
-  [--maf 0.01 --maf-pre] \
+  [--maf 0.01] \
   [--keep keep_individuals.txt] \
   [--per-allele] \
   [--pq-exp 1.0] \
   [--blas-threads 4]
 ```
 
-`ldsc ldscore` warns if the LD window spans an entire chromosome; use `--yes-really` to silence.
+`ldsc l2` warns if the LD window spans an entire chromosome; use `--yes-really` to silence.
 
 Window flags are mutually exclusive: `--ld-wind-cm` (genetic distance, default 1.0), `--ld-wind-kb`
 (physical distance), or `--ld-wind-snps` (fixed flanking SNP count).
 
-Partitioned LD scores with `--annot prefix`: expects `{prefix}{chr}.annot[.gz]` for each chromosome present in
-the BIM, outputs one L2 column per annotation and corresponding `.l2.M` / `.l2.M_5_50` files.
+Partitioned LD scores with `--annot prefix`: accepts either a single `{prefix}.annot[.gz|.bz2]` file or
+per-chromosome `{prefix}{chr}.annot[.gz|.bz2]` files for each chromosome present in the BIM. Outputs one L2 column
+per annotation and corresponding `.l2.M` / `.l2.M_5_50` files.
 
 `--per-allele` is equivalent to `--pq-exp 1` (weights each r² by p·(1−p)). Use `--pq-exp S` to
 apply (p·(1−p))^S weighting; output columns and `.M` files receive a `_S{S}` suffix.
-`--no-print-annot` is accepted for Python CLI parity but is a no-op (warns when used).
+`--no-print-annot` suppresses the `.annot.gz` output produced by `--cts-bin`.
 
 ### h2
 
@@ -206,7 +207,7 @@ ldsc make-annot \
 ### cts-annot
 
 Bins one or more continuous annotations into categories and writes a `.annot` file
-compatible with `ldscore --annot` (Python `--cts-bin` preprocessing).
+compatible with `l2 --annot` (Python `--cts-bin` preprocessing).
 
 ```bash
 ldsc cts-annot \
@@ -221,14 +222,14 @@ ldsc cts-annot \
 
 ## Installation Details
 
-Native builds require Rust ≥ 1.85 and a C toolchain with Fortran support to build the default
-statically-linked OpenBLAS. If you opt into the system BLAS feature, you only need
-the system OpenBLAS development package.
+Native builds require Rust ≥ 1.85. By default the crate links against the **system OpenBLAS**
+via `pkg-config`, so you need the OpenBLAS development package installed. If you opt into the
+static OpenBLAS feature, you’ll need a C/Fortran toolchain to build from source.
 
-On Debian/Ubuntu (default static build):
+On Debian/Ubuntu (default system build):
 
 ```bash
-sudo apt-get install cmake gfortran libgfortran-dev
+sudo apt-get install libopenblas-dev pkg-config
 ```
 
 ### Prebuilt Binaries
@@ -279,8 +280,8 @@ tag and a short-SHA tag (`:sha-XXXXXXX`).
 
 ### Building from source
 
-Requires a Rust toolchain (≥ 1.85; edition 2024 features used). OpenBLAS is linked statically — no
-runtime library installation needed.
+Requires a Rust toolchain (≥ 1.85; edition 2024 features used). By default OpenBLAS is linked
+dynamically via the system package; install OpenBLAS before building (see above).
 
 ```bash
 cargo build --release
@@ -291,18 +292,17 @@ The release profile sets `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`.
 
 ### BLAS configuration
 
-By default this crate builds **OpenBLAS from source** and links it statically
-(`blas-openblas-static`). For CI or HPC environments that prefer a system BLAS,
-use the system feature instead:
+By default this crate uses the **system OpenBLAS** (`blas-openblas-system`) and links it
+dynamically via `pkg-config`. For a self-contained binary, enable the static feature instead:
 
 ```bash
-# Debian/Ubuntu system OpenBLAS
-sudo apt-get install libopenblas-dev pkg-config
-cargo build --release --no-default-features --features blas-openblas-system
+# Debian/Ubuntu static OpenBLAS
+sudo apt-get install cmake gfortran libgfortran-dev
+cargo build --release --no-default-features --features blas-openblas-static
 ```
 
-The system feature skips the OpenBLAS source build and links via `pkg-config`.
-Keep the default static build if you want a self-contained binary.
+The static feature builds OpenBLAS from source and links it into the binary.
+Keep the default system build if you prefer dynamic linking.
 
 Windows (MSVC) users can use vcpkg for the system build:
 
@@ -322,7 +322,7 @@ heavily battle-tested**. Use them only when needed:
 - `--rayon-threads N`: Rayon thread count for jackknife in `h2`/`rg`.
 - `--polars-threads N`: Polars thread count for CSV streaming in `munge-sumstats`.
 
-`ldsc --version` prints the compiled BLAS backend (e.g., `openblas-static`).
+`ldsc --version` prints the compiled BLAS backend (e.g., `openblas-system`).
 
 ---
 
@@ -339,6 +339,29 @@ Phase 3 (n = 2,504 individuals, `--ld-wind-snps 100`).
 Correctness: all 1,664,851 SNPs in the full 1000G genome verified to match Python within 0.001
 (max diff 0.000508, median 0.000250) after fixing the four algorithmic bugs described below.
 
+Additional UKBB I/O benchmarks on this machine (Apple M4, 10 CPU cores, 24 GB RAM, macOS 26.3
+build 25D125). These highlight I/O-heavy workflows and the impact of the Rust pipeline’s faster
+parsing and joins.
+
+Dataset: `/Users/sharif/Code/ldsc/data/biomarkers-30600-both_sexes-irnt.sample8m.tsv`
+(~497 MB) for `munge-sumstats`; and `/Users/sharif/Code/ldsc/data/UKBB.ALL.ldscore/UKBB.EUR.l2.ldscore.gz`
+for `h2`/`rg` (381,831 SNPs after merge).
+Quick local checks for `l2` default to a 50k SNP extract via `scripts/bench_l2_py3_vs_rust.sh`.
+
+| Workflow | Rust | Python | Speedup |
+|---------|------|--------|---------|
+| munge-sumstats | 3.74 s | 62.65 s | **16.75×** |
+| h2 | 0.90 s | 7.81 s | **8.68×** |
+| rg (two traits) | 2.93 s | 28.09 s | **9.59×** |
+
+Reference HPC hardware (Penn PMACS) for scaling tests:
+- 19 Dell C6420 quad node systems (76 compute nodes, 6,080 cores total, CentOS 7.8, 80 CPU cores per node with hyper-threading, 256 GB or 512 GB RAM per node, 56 GB/s EDR or 100 GB/s FDR InfiniBand to the filesystem, 10 Gb/s Ethernet).
+- 1 Dell R940 big memory system (1.5 TB RAM, 96 CPU cores, 10 Gb/s Ethernet, 100 GB/s FDR InfiniBand).
+- 2 GPU nodes (1× Nvidia Tesla P100, 512 GB RAM, 88 CPU cores, 10 Gb/s Ethernet, 100 GB/s FDR InfiniBand).
+- 4.2 PB IBM Spectrum Scale (GPFS) disk storage (2 tiers, no backup).
+- 1.3 PB mirrored archive tape storage.
+- LSF job scheduling system.
+
 ---
 
 ## Differences from Python
@@ -351,13 +374,13 @@ single `ldsc` binary:
 | Python | Rust |
 |--------|------|
 | `python munge_sumstats.py --sumstats … --out …` | `ldsc munge-sumstats --sumstats … --out …` |
-| `python ldsc.py --l2 --bfile … --out …` | `ldsc ldscore --bfile … --out …` |
+| `python ldsc.py --l2 --bfile … --out …` | `ldsc l2 --bfile … --out …` |
 | `python ldsc.py --h2 … --ref-ld-chr …` | `ldsc h2 --h2 … --ref-ld-chr …` |
 | `python ldsc.py --rg … --ref-ld-chr …` | `ldsc rg --rg … --ref-ld-chr …` |
 | `python make_annot.py --bimfile … --bed-file …` | `ldsc make-annot --bimfile … --bed-file …` |
 | `python ldsc.py --cts-bin …` | `ldsc cts-annot …` |
 
-Python's `--l2` flag (LD score estimation mode) becomes the `ldscore` subcommand. The `--h2` and
+Python's `--l2` flag (LD score estimation mode) becomes the `l2` subcommand. The `--h2` and
 `--rg` flags (regression modes) become `h2` and `rg` subcommands.
 
 ### Flag compatibility
@@ -366,8 +389,7 @@ Python flag names are supported directly.
 
 ### Behavioural differences
 
-- **`--maf` in ldscore**: default is a post-filter on output (faster). Use `--maf-pre`
-  to match Python’s pre-computation filtering.
+- **`--maf` in l2**: default now matches Python (MAF prefilter before LD computation).
 - **`--n-min` default**: when `--n-min` is 0, Rust now matches Python (90th percentile / 1.5).
 - **`--yes-really`**: Rust warns when the LD window spans a whole chromosome and
   `--yes-really` is not set (Python errors).
@@ -375,9 +397,9 @@ Python flag names are supported directly.
   streaming and ignores chunk size for munge.
 - **`--return-silly-things` / `--invert-anyway`**: accepted flags for CLI parity; Rust never clips
   results and always uses a least-squares solver (warnings emitted).
-- **`--no-print-annot`**: accepted for CLI parity but does not affect output (warning emitted).
-- **`--cts-bin` workflow**: implemented as a separate preprocessor (`ldsc cts-annot`), then
-  use `ldsc ldscore --annot`.
+- **`--no-print-annot`**: only affects `--cts-bin` output; suppresses the `.annot.gz` file.
+- **`--cts-bin` workflow**: supported directly by `ldsc l2` (also available as a separate
+  preprocessor via `ldsc cts-annot`).
 
 ---
 
@@ -385,7 +407,6 @@ Python flag names are supported directly.
 
 The following Python flags are accepted for CLI parity but do not change behavior in Rust:
 
-- `ldscore --no-print-annot` (cts-annot always writes output)
 - `h2/rg --return-silly-things`
 - `h2/rg --invert-anyway`
 
@@ -410,7 +431,7 @@ The original Python implementation is bottlenecked by three independent factors:
 
 ### What the Rust implementation does differently
 
-#### 1. Ring-buffer genotype store (`ldscore.rs`)
+#### 1. Ring-buffer genotype store (`l2.rs`)
 
 Python allocates a new `rfuncA` matrix every chunk. Rust pre-allocates a single F-order
 `Array2<f64>` of shape `(n_indiv, ring_size)` where `ring_size = max_window + chunk_c`. SNP columns
@@ -470,7 +491,7 @@ peak RAM is proportional to the output size, not the input size.
 src/
 ├── main.rs          Clap dispatch — parses CLI, calls into subcommand modules.
 │
-├── cli.rs           All argument structs (MungeArgs, LdscoreArgs, H2Args, RgArgs,
+├── cli.rs           All argument structs (MungeArgs, L2Args, H2Args, RgArgs,
 │                    MakeAnnotArgs). No logic — pure clap derive macros.
 │
 ├── parse.rs         File I/O helpers:
@@ -487,7 +508,7 @@ src/
 │                    · filter_snps, apply_nstudy_filter
 │                    · write_sumstats_gz (gzip TSV output)
 │
-├── ldscore.rs       LD score computation. Key types and functions:
+├── l2.rs            LD score computation. Key types and functions:
 │                    · BimRecord — CHR/SNP/CM/BP/bed_idx struct
 │                    · parse_bim, count_fam, parse_fam — PLINK file parsers
 │                    · load_individual_indices — --keep FID/IID file → isize indices
@@ -539,7 +560,7 @@ make_annot.rs        BED → 0/1 annotation generator.
 
 ### Key data-flow invariants
 
-- `ldscore --annot prefix` reads `{prefix}{chr}.annot[.gz]` for every chromosome found in
+- `l2 --annot prefix` reads `{prefix}{chr}.annot[.gz]` for every chromosome found in
   the BIM (not a single `prefix.annot.gz` file).
 - `--extract` filters the BIM *before* window computation; `--print-snps` filters only the output.
 - `bed_idx` (original BIM row index) differs from `pos` (index in the filtered `all_snps` slice)
@@ -558,7 +579,7 @@ make_annot.rs        BED → 0/1 annotation generator.
 | `bed-reader` | 1 | mmap-based PLINK .bed reading; only touched pages loaded |
 | `polars` | 0.53 | lazy CSV streaming (munge + LD score file loading) |
 | `ndarray` + `ndarray-linalg` | 0.16 + 0.17 | dense matrix algebra; SVD for IRWLS |
-| `blas-src` + OpenBLAS | 0.10 | statically-linked BLAS for DGEMM |
+| `blas-src` + OpenBLAS | 0.10 | OpenBLAS backend (system or static) for DGEMM |
 | `rayon` | 1 | data-parallel jackknife blocks |
 | `statrs` | 0.18 | Normal CDF/quantile for P→Z conversion |
 | `clap` | 4 | derive-macro CLI argument parsing |
@@ -589,5 +610,5 @@ docker build -t ldsc .
 
 The multi-stage `Dockerfile` uses [cargo-chef](https://github.com/LukeMathWalker/cargo-chef) to
 cache dependency compilation in a separate layer, so incremental rebuilds only recompile changed
-source files. The runtime image is `debian:bookworm-slim` plus `libgfortran5` for the
-statically-linked OpenBLAS.
+source files. The runtime image is `debian:bookworm-slim` plus `libgfortran5` for OpenBLAS
+runtime support when needed.

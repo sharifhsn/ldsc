@@ -24,7 +24,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - `munge-sumstats` — Polars LazyFrame streaming pipeline; full Python API parity
   (column-name overrides, `--signed-sumstats`, `--info-list`, `--nstudy`, `--a1-inc`, etc.)
-- `ldscore` — ring-buffer DGEMM loop; global sequential pass matching Python's
+- `l2` — ring-buffer DGEMM loop; global sequential pass matching Python's
   cross-chromosome LD window behaviour; 7× speedup over Python on 1000G data
   - `--annot` (partitioned LD scores, per-chromosome annot files)
   - `--extract`, `--print-snps`, `--maf`, `--keep`, `--per-allele`
@@ -34,7 +34,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--no-intercept`, `--samp-prev`/`--pop-prev`
 - `make-annot` — BED-file and gene-set annotation generators
 - Statically linked OpenBLAS (no runtime library needed)
-- 40 unit tests; integration smoke test for ldscore
+- 40 unit tests; integration smoke test for l2
 
 [Unreleased]: https://github.com/sharifhsn/ldsc/compare/v0.1.3...HEAD
 [0.1.3]: https://github.com/sharifhsn/ldsc/releases/tag/v0.1.3

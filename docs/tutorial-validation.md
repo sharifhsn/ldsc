@@ -168,10 +168,10 @@ parity status for functional equivalence.
 | `.sumstats` requires `SNP`, `A1`, `A2`, `N`, and signed stats (`Z` or P + signed column) | `ldsc munge-sumstats` writes `SNP A1 A2 Z N` (plus `FRQ` with `--keep-maf`) | Z is signed w.r.t. `A1`; `--a1-inc` covers “A1 always increasing” inputs |
 | INFO/MAF filters and strand-ambiguous removal | `--info-min` default 0.9, `--maf-min` default 0.01, strand ambiguous A/T and C/G removed | Matches wiki defaults for INFO/MAF and ambiguity filtering |
 | Constant sample size or per-SNP `N` | `--N`, `--N-cas`, `--N-con`, or per-row `N` | Matches wiki guidance for fixed/variable sample sizes |
-| LD score estimation from PLINK (`--l2`) | `ldsc ldscore --bfile … --ld-wind-cm/--ld-wind-kb/--ld-wind-snps …` | Emits `.l2.ldscore.gz`, `.l2.M`, `.l2.M_5_50` per chromosome |
+| LD score estimation from PLINK (`--l2`) | `ldsc l2 --bfile … --ld-wind-cm/--ld-wind-kb/--ld-wind-snps …` | Emits `.l2.ldscore.gz`, `.l2.M`, `.l2.M_5_50` per chromosome |
 | `--ref-ld-chr` / `--w-ld-chr` with `@` placeholder | `ldsc h2` / `ldsc rg` support `@` replacement | Verified by code inspection |
 | Liability-scale conversion | `--samp-prev` + `--pop-prev` for `h2` and `rg` | Matches wiki/FAQ behavior |
-| Per-allele LD scores | `ldsc ldscore --per-allele` | Non-integer `.M` values expected (per FAQ) |
+| Per-allele LD scores | `ldsc l2 --per-allele` | Non-integer `.M` values expected (per FAQ) |
 | Overlapping annotations | `--overlap-annot` + `--frqfile[-chr]` | Overlap-adjusted results match Python |
 | Cell-type specific h² | `--h2-cts` + `--ref-ld-chr-cts` | Writes `<out>.cell_type_results.txt` |
 

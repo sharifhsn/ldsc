@@ -7,7 +7,7 @@ This repository already achieves major speedups on CPU by combining:
 - A global sequential LD pass to preserve cross-chromosome boundary effects.
 - Parallel block jackknife for h2/rg variance estimation.
 
-These choices are documented in `README.md` and implemented primarily in `src/ldscore.rs`,
+These choices are documented in `README.md` and implemented primarily in `src/l2.rs`,
 `src/jackknife.rs`, and `src/irwls.rs`.
 
 ## Why GPU Is Deferred
