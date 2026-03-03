@@ -19,11 +19,10 @@
 # build image; the compiled binary is independent of the toolchain version.
 FROM rust:1 AS base
 
-# OpenBLAS is compiled from source (ndarray-linalg openblas-static feature)
-# and statically linked into the final binary.
+# Build against the system OpenBLAS (default feature).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        cmake \
-        gfortran \
+        libopenblas-dev \
+        pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # Compile sccache and cargo-chef once; cached as a Docker layer.
@@ -64,10 +63,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ── runtime: minimal final image ─────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
-# libgfortran5: Fortran runtime linked by the OpenBLAS build.
+# libopenblas0 + libgfortran5: runtime deps for OpenBLAS.
 # ca-certificates: needed for HTTPS downloads (LD score files, summary stats).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        libopenblas0 \
         libgfortran5 \
     && rm -rf /var/lib/apt/lists/*
 

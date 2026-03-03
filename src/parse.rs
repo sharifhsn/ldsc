@@ -246,15 +246,6 @@ pub fn read_m_vec_list(prefixes: &[String], suffix: &str) -> Result<Vec<f64>> {
     Ok(out)
 }
 
-/// Sum total M across multiple prefixes.
-pub fn read_m_total_list(prefixes: &[String], suffix: &str) -> Result<f64> {
-    let mut total = 0.0f64;
-    for prefix in prefixes {
-        total += read_m_total(prefix, suffix)?;
-    }
-    Ok(total)
-}
-
 /// Concatenate per-chromosome LazyFrames, accepting .gz, .bz2, or plain files.
 pub fn concat_chrs_any(prefix: &str, suffixes: &[&str]) -> Result<LazyFrame> {
     for suffix in suffixes {
@@ -298,22 +289,41 @@ pub fn concat_chrs_any(prefix: &str, suffixes: &[&str]) -> Result<LazyFrame> {
 /// Thin format (`thin=true`): all columns are annotations.
 /// Tries `{prefix}.annot.gz`, `{prefix}.annot.bz2`, then `{prefix}.annot`.
 pub fn read_annot(prefix: &str, thin: bool) -> Result<(Array2<f64>, Vec<String>)> {
-    let path = {
-        let gz = format!("{}.annot.gz", prefix);
-        let bz2 = format!("{}.annot.bz2", prefix);
-        let plain = format!("{}.annot", prefix);
-        if std::path::Path::new(&gz).exists() {
-            gz
-        } else if std::path::Path::new(&bz2).exists() {
-            bz2
-        } else if std::path::Path::new(&plain).exists() {
-            plain
-        } else {
-            anyhow::bail!("Annotation file not found: '{}.annot[.gz|.bz2]'", prefix);
-        }
-    };
+    let path = resolve_annot_path(prefix)?;
+    read_annot_path(&path, thin)
+}
 
-    let resolved = resolve_text_path(&path)?;
+/// Resolve a single annotation file path.
+/// Accepts `prefix` with or without `.annot[.gz|.bz2]` suffix.
+pub fn resolve_annot_path(prefix: &str) -> Result<String> {
+    if prefix.ends_with(".annot")
+        || prefix.ends_with(".annot.gz")
+        || prefix.ends_with(".annot.bz2")
+    {
+        if std::path::Path::new(prefix).exists() {
+            return Ok(prefix.to_string());
+        }
+        anyhow::bail!("Annotation file not found: '{}'", prefix);
+    }
+
+    let gz = format!("{}.annot.gz", prefix);
+    let bz2 = format!("{}.annot.bz2", prefix);
+    let plain = format!("{}.annot", prefix);
+    if std::path::Path::new(&gz).exists() {
+        Ok(gz)
+    } else if std::path::Path::new(&bz2).exists() {
+        Ok(bz2)
+    } else if std::path::Path::new(&plain).exists() {
+        Ok(plain)
+    } else {
+        anyhow::bail!("Annotation file not found: '{}.annot[.gz|.bz2]'", prefix);
+    }
+}
+
+/// Read a partitioned LD score annotation file into a dense `Array2<f64>`.
+/// `path` must include the extension (e.g., `.annot.gz`).
+pub fn read_annot_path(path: &str, thin: bool) -> Result<(Array2<f64>, Vec<String>)> {
+    let resolved = resolve_text_path(path)?;
     let resolved_str = resolved.to_string_lossy();
     let df = LazyCsvReader::new(resolved_str.as_ref().into())
         .with_separator(b'\t')
@@ -743,7 +753,7 @@ mod tests {
 
     /// scan_ldscore can read the existing test .ldscore.gz file and returns
     /// a LazyFrame with the expected columns.
-    /// Mirrors Python Test_ldscore::test_ldscore.
+    /// Mirrors Python Test_ldscore::test_ldscore (l2 mode).
     #[test]
     fn test_scan_ldscore_gz() {
         let manifest = env!("CARGO_MANIFEST_DIR");

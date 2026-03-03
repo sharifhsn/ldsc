@@ -11,6 +11,7 @@ pub struct IrwlsResult {
     /// Point estimates (one per predictor column)
     pub est: Array1<f64>,
     /// Jackknife SE (filled in by jackknife.rs after regression)
+    #[allow(dead_code)]
     pub jknife_se: Option<Array1<f64>>,
     /// Jackknife variance (SE² × n_blocks)
     #[allow(dead_code)]

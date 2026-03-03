@@ -6,7 +6,7 @@
 # Usage:
 #   bash test_rust.sh [--build]
 #
-# For ldscore/h2/rg tests, expects 1000G reference data at:
+# For l2/h2/rg tests, expects 1000G reference data at:
 #   data/1000G_phase3_common_norel.{bed,bim,fam}
 
 set -euo pipefail
@@ -49,7 +49,7 @@ echo "Testing: $("$BIN" --version 2>&1)"
 # ─── Help (all subcommands) ───────────────────────────────────────────────────
 section "Help"
 run_test "munge-sumstats --help"  "$BIN" munge-sumstats --help
-run_test "ldscore --help"         "$BIN" ldscore --help
+run_test "l2 --help"              "$BIN" l2 --help
 run_test "h2 --help"              "$BIN" h2 --help
 run_test "rg --help"              "$BIN" rg --help
 run_test "make-annot --help"      "$BIN" make-annot --help
@@ -229,10 +229,10 @@ run_test "--gene-set-file + --gene-coord-file" \
         --gene-coord-file "$TMP/genecoords.txt" \
         --annot-file "$TMP/geneset.annot.gz"
 
-# ─── ldscore / h2 / rg ───────────────────────────────────────────────────────
+# ─── l2 / h2 / rg ────────────────────────────────────────────────────────────
 if [[ ! -f "${BFILE}.bim" ]]; then
     echo
-    echo "  Skipping ldscore/h2/rg: data not found at ${BFILE}.{bed,bim,fam}"
+    echo "  Skipping l2/h2/rg: data not found at ${BFILE}.{bed,bim,fam}"
     echo "  Place 1000G_phase3_common_norel.{bed,bim,fam} in data/ to enable."
 else
     # Extract chr22 SNP list and BIM (no Python — pure awk)
@@ -245,11 +245,11 @@ else
     mkdir -p "$TMP/ld"
     LD="$TMP/ld"
 
-    section "ldscore"
+    section "l2"
 
     # --ld-wind-cm (default window; generates per-chr .l2.ldscore.gz/.M/.M_5_50)
     run_test "--ld-wind-cm 1" \
-        "$BIN" ldscore \
+        "$BIN" l2 \
             --bfile "$BFILE" --extract "$TMP/chr22_snps.txt" \
             --ld-wind-cm 1 --out "$LD/cm1"
     assert_file "chr22 .l2.ldscore.gz" "$LD/cm122.l2.ldscore.gz"
@@ -258,52 +258,52 @@ else
 
     # --ld-wind-kb (physical-distance window)
     run_test "--ld-wind-kb 1000" \
-        "$BIN" ldscore \
+        "$BIN" l2 \
             --bfile "$BFILE" --extract "$TMP/chr22_snps.txt" \
             --ld-wind-kb 1000 --out "$LD/kb1000"
 
     # --ld-wind-snp (fixed flanking-SNP window)
     run_test "--ld-wind-snp 200" \
-        "$BIN" ldscore \
+        "$BIN" l2 \
             --bfile "$BFILE" --extract "$TMP/chr22_snps.txt" \
             --ld-wind-snp 200 --out "$LD/snp200"
 
     # --maf (exclude low-frequency SNPs from output)
     run_test "--maf 0.05" \
-        "$BIN" ldscore \
+        "$BIN" l2 \
             --bfile "$BFILE" --extract "$TMP/chr22_snps.txt" \
             --ld-wind-cm 1 --maf 0.05 --out "$LD/maf05"
 
     # --print-snps (output subset; all SNPs still contribute to LD windows)
     head -5000 "$TMP/chr22_snps.txt" > "$TMP/chr22_print.txt"
     run_test "--print-snps" \
-        "$BIN" ldscore \
+        "$BIN" l2 \
             --bfile "$BFILE" --extract "$TMP/chr22_snps.txt" \
             --print-snps "$TMP/chr22_print.txt" \
             --ld-wind-cm 1 --out "$LD/printsnps"
 
     # --per-allele (weight r² by 2p(1-p) of target SNP)
     run_test "--per-allele" \
-        "$BIN" ldscore \
+        "$BIN" l2 \
             --bfile "$BFILE" --extract "$TMP/chr22_snps.txt" \
             --ld-wind-cm 1 --per-allele --out "$LD/perallele"
 
     # --chunk-size (BLAS tile size; larger values change window approximation)
     run_test "--chunk-size 100" \
-        "$BIN" ldscore \
+        "$BIN" l2 \
             --bfile "$BFILE" --extract "$TMP/chr22_snps.txt" \
             --ld-wind-cm 1 --chunk-size 100 --out "$LD/chunk100"
 
     # --blas-threads (OpenBLAS thread count)
     run_test "--blas-threads 2" \
-        "$BIN" ldscore \
+        "$BIN" l2 \
             --bfile "$BFILE" --extract "$TMP/chr22_snps.txt" \
             --ld-wind-cm 1 --blas-threads 2 --out "$LD/blas2"
 
     # --keep (restrict to a subset of individuals)
     awk 'NR<=100' "${BFILE}.fam" > "$TMP/keep100.txt"
     run_test "--keep 100 individuals" \
-        "$BIN" ldscore \
+        "$BIN" l2 \
             --bfile "$BFILE" --extract "$TMP/chr22_snps.txt" \
             --keep "$TMP/keep100.txt" \
             --ld-wind-cm 1 --out "$LD/keep100"
@@ -316,7 +316,7 @@ else
             --annot-file "$TMP/chr22annot.22.annot.gz" \
             >/dev/null 2>&1; then
         run_test "--annot (partitioned LD scores)" \
-            "$BIN" ldscore \
+            "$BIN" l2 \
                 --bfile "$BFILE" --extract "$TMP/chr22_snps.txt" \
                 --annot "$TMP/chr22annot." \
                 --ld-wind-cm 1 --out "$LD/annot"
@@ -325,7 +325,7 @@ else
         zcat "$TMP/chr22annot.22.annot.gz" | cut -f5- \
             > "$TMP/chr22thin.22.annot"
         run_test "--thin-annot" \
-            "$BIN" ldscore \
+            "$BIN" l2 \
                 --bfile "$BFILE" --extract "$TMP/chr22_snps.txt" \
                 --annot "$TMP/chr22thin." \
                 --thin-annot \

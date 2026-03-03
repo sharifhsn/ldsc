@@ -14,7 +14,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use crate::cli::MakeAnnotArgs;
-use crate::ldscore::{BimRecord, parse_bim};
+use crate::l2::{BimRecord, parse_bim};
 
 // ---------------------------------------------------------------------------
 // Public entry point

@@ -1,13 +1,15 @@
 /// Continuous-annotation binning into annot files (Python --cts-bin).
 use anyhow::{Context, Result};
+use ndarray::Array2;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use crate::cli::CtsAnnotArgs;
-use crate::ldscore::parse_bim;
+use crate::l2::parse_bim;
 use crate::parse::resolve_text_path;
 
+#[derive(Debug)]
 struct BinSpec {
     labels: Vec<String>,
     lower_bounds: Vec<f64>,
@@ -20,19 +22,50 @@ pub fn run(args: CtsAnnotArgs) -> Result<()> {
     println!("Read {} SNPs from '{}'", snps.len(), args.bimfile);
     let snp_ids: Vec<String> = snps.iter().map(|s| s.snp.clone()).collect();
 
-    let cts_files = split_paths(&args.cts_bin);
+    let (matrix, col_names) =
+        build_cts_matrix(&snp_ids, &args.cts_bin, &args.cts_breaks, args.cts_names.as_deref())?;
+
+    let writer = open_writer(&args.annot_file)?;
+    let mut w = BufWriter::new(writer);
+    writeln!(w, "CHR\tBP\tSNP\tCM\t{}", col_names.join("\t"))?;
+
+    for (row_idx, snp) in snps.iter().enumerate() {
+        write!(w, "{}\t{}\t{}\t{}", snp.chr, snp.bp, snp.snp, snp.cm)?;
+        let row = matrix.row(row_idx);
+        for v in row.iter() {
+            write!(w, "\t{}", *v as u8)?;
+        }
+        writeln!(w)?;
+    }
+
+    println!(
+        "Wrote CTS annot matrix ({} columns) to '{}'",
+        col_names.len(),
+        args.annot_file
+    );
+    Ok(())
+}
+
+/// Build a one-hot annotation matrix for --cts-bin, aligned to `snp_ids`.
+pub(crate) fn build_cts_matrix(
+    snp_ids: &[String],
+    cts_bin: &str,
+    cts_breaks: &str,
+    cts_names: Option<&str>,
+) -> Result<(Array2<f64>, Vec<String>)> {
+    let cts_files = split_paths(cts_bin);
     anyhow::ensure!(
         !cts_files.is_empty(),
         "--cts-bin must list at least one file"
     );
-    let breaks = parse_breaks(&args.cts_breaks, cts_files.len())?;
-    let cts_names = parse_cts_names(args.cts_names.as_deref(), cts_files.len())?;
+    let breaks = parse_breaks(cts_breaks, cts_files.len())?;
+    let cts_names = parse_cts_names(cts_names, cts_files.len())?;
 
     let mut bin_specs: Vec<BinSpec> = Vec::new();
     let mut bin_indices: Vec<Vec<usize>> = Vec::new();
 
     for (i, path) in cts_files.iter().enumerate() {
-        let values = read_cts_values(path, &snp_ids)?;
+        let values = read_cts_values(path, snp_ids)?;
         let spec = compute_bins(&values, &breaks[i])?;
         let indices = assign_bins(&values, &spec.cut_breaks)?;
         bin_specs.push(spec);
@@ -49,29 +82,21 @@ pub fn run(args: CtsAnnotArgs) -> Result<()> {
         combo_map.insert(combo.clone(), idx);
     }
 
-    let mut row_buf = vec![0u8; col_names.len()];
-    let writer = open_writer(&args.annot_file)?;
-    let mut w = BufWriter::new(writer);
-    writeln!(w, "CHR\tBP\tSNP\tCM\t{}", col_names.join("\t"))?;
-
-    for (row_idx, snp) in snps.iter().enumerate() {
-        row_buf.fill(0);
+    let mut matrix = Array2::<f64>::zeros((snp_ids.len(), col_names.len()));
+    for row_idx in 0..snp_ids.len() {
         let combo: Vec<usize> = bin_indices.iter().map(|v| v[row_idx]).collect();
         let col_idx = combo_map.get(&combo).context("missing bin combination")?;
-        row_buf[*col_idx] = 1;
-        write!(w, "{}\t{}\t{}\t{}", snp.chr, snp.bp, snp.snp, snp.cm)?;
-        for v in &row_buf {
-            write!(w, "\t{}", v)?;
-        }
-        writeln!(w)?;
+        matrix[[row_idx, *col_idx]] = 1.0;
     }
 
-    println!(
-        "Wrote CTS annot matrix ({} columns) to '{}'",
-        col_names.len(),
-        args.annot_file
-    );
-    Ok(())
+    if matrix
+        .axis_iter(ndarray::Axis(0))
+        .any(|row| row.iter().all(|v| *v == 0.0))
+    {
+        anyhow::bail!("Some SNPs have no annotation in --cts-bin. This is a bug!");
+    }
+
+    Ok((matrix, col_names))
 }
 
 fn split_paths(raw: &str) -> Vec<String> {

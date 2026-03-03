@@ -3,7 +3,7 @@
 /// Run with:
 ///   cargo test --test integration
 ///
-/// The `ldscore_smoke` test is marked `#[ignore]` by default because it
+/// The `l2_smoke` test is marked `#[ignore]` by default because it
 /// reads the 1000G BED file (~1 GB) and takes ~30–90 s on first run
 /// (OS page-fault warm-up).  Pass `--include-ignored` to run it:
 ///   cargo test --test integration -- --include-ignored
@@ -28,24 +28,24 @@ fn test_data() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// ldscore smoke test
+// l2 smoke test
 // ---------------------------------------------------------------------------
 
-/// Run `ldsc ldscore` on the full 1000G file with a tiny SNP window.
+/// Run `ldsc l2` on the full 1000G file with a tiny SNP window.
 /// Checks that:
 ///   1. The binary exits successfully.
 ///   2. Per-chromosome .ldscore.gz files are created.
 ///   3. Each file is a valid gzip-compressed TSV with a CHR/SNP/BP/L2 header.
 #[test]
 #[ignore = "reads ~1 GB BED file; run with --include-ignored"]
-fn ldscore_smoke() {
+fn l2_smoke() {
     let out_dir = tempfile::tempdir().expect("tempdir");
     let out_prefix = out_dir.path().join("test_ld").to_str().unwrap().to_string();
 
     let t0 = Instant::now();
     let status = Command::new(binary())
         .args([
-            "ldscore",
+            "l2",
             "--bfile",
             &test_data(),
             "--out",
@@ -56,8 +56,8 @@ fn ldscore_smoke() {
         .status()
         .expect("failed to launch ldsc binary");
 
-    eprintln!("ldscore completed in {:.1}s", t0.elapsed().as_secs_f64());
-    assert!(status.success(), "ldsc ldscore exited with {}", status);
+    eprintln!("l2 completed in {:.1}s", t0.elapsed().as_secs_f64());
+    assert!(status.success(), "ldsc l2 exited with {}", status);
 
     // Expect one output file per chromosome present in the BIM file.
     // The 1000G file covers chromosomes 1–22.

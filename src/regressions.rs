@@ -10,11 +10,18 @@ use statrs::distribution::StudentsT;
 use statrs::distribution::{ChiSquared, Continuous, ContinuousCDF, Normal};
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::time::Instant;
+use tracing::{debug, trace};
 
 use crate::cli::{H2Args, RgArgs};
+use crate::h2::{
+    JackknifeResult, aggregate, combine_twostep, irwls_ldsc, jackknife_fast, ldsc_weights,
+    run_h2_ldsc, update_separators, weight_xy,
+};
 use crate::irwls::IrwlsResult;
-use crate::jackknife;
 use crate::parse;
+
+const MIN_SNPS_WARN: usize = 200_000;
 
 // ---------------------------------------------------------------------------
 // Helper: load LD scores from either a single file or per-chr split files
@@ -56,6 +63,83 @@ fn split_paths(raw: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect()
+}
+
+fn warn_small_snp_count(n_snps: usize) {
+    if n_snps < MIN_SNPS_WARN {
+        println!("WARNING: number of SNPs less than 200k; this is almost always bad.");
+    }
+}
+
+fn smart_merge_on_snp(mut left: DataFrame, mut right: DataFrame) -> Result<DataFrame> {
+    let same_order = if left.height() == right.height() {
+        let left_snp = left.column("SNP")?;
+        let right_snp = right.column("SNP")?;
+        let left_snp = if matches!(left_snp.dtype(), DataType::String) {
+            left_snp.clone()
+        } else {
+            left_snp.cast(&DataType::String)?
+        };
+        let right_snp = if matches!(right_snp.dtype(), DataType::String) {
+            right_snp.clone()
+        } else {
+            right_snp.cast(&DataType::String)?
+        };
+        left_snp.equals_missing(&right_snp)
+    } else {
+        false
+    };
+
+    if same_order {
+        right.drop_in_place("SNP")?;
+        let right_cols = right.columns().to_vec();
+        left.hstack_mut(&right_cols)?;
+        Ok(left)
+    } else {
+        let mut args = JoinArgs::new(JoinType::Inner);
+        args.maintain_order = MaintainOrderJoin::Left;
+        Ok(left.join(&right, ["SNP"], ["SNP"], args, None)?)
+    }
+}
+
+fn trace_array_stats(label: &str, arr: &Array1<f64>) {
+    let mut count = 0usize;
+    let mut sum = 0.0f64;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for &v in arr.iter() {
+        if v.is_nan() {
+            continue;
+        }
+        count += 1;
+        sum += v;
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
+    if count == 0 {
+        trace!("{label}: empty or all-NaN");
+        return;
+    }
+    let mean = sum / count as f64;
+    trace!("{label}: n={count} mean={mean:.6} min={min:.6} max={max:.6}");
+}
+
+fn trace_ref_l2_stats(labels: &[String], cols: &[Array1<f64>]) {
+    if labels.is_empty() || cols.is_empty() {
+        return;
+    }
+    let k = labels.len().min(cols.len());
+    let max_log = 5usize;
+    for i in 0..k.min(max_log) {
+        trace_array_stats(&format!("ref_l2[{}]", labels[i]), &cols[i]);
+    }
+    if k > max_log {
+        trace!("ref_l2: {} columns total (showing first {})", k, max_log);
+    }
 }
 
 fn load_ld_ref_single_path(path: &str) -> Result<LazyFrame> {
@@ -227,6 +311,8 @@ fn resolve_m_vec(
     not_m_5_50: bool,
     n_obs: usize,
     k: usize,
+    keep_idx: Option<&[usize]>,
+    k_full: Option<usize>,
 ) -> Vec<f64> {
     if let Some(prefix) = ref_ld_chr {
         let suffix = if not_m_5_50 { ".l2.M" } else { ".l2.M_5_50" };
@@ -237,15 +323,33 @@ fn resolve_m_vec(
             parse::read_m_vec_list(&prefixes, suffix)
         };
         match m_vec_res {
-            Ok(m_vec) if m_vec.len() == k => {
-                let total: f64 = m_vec.iter().sum();
-                println!(
-                    "  Read per-annotation M (K={}) from {} files; total M = {:.0}",
-                    k, suffix, total
-                );
-                return m_vec;
-            }
             Ok(m_vec) => {
+                if m_vec.len() == k {
+                    let total: f64 = m_vec.iter().sum();
+                    println!(
+                        "  Read per-annotation M (K={}) from {} files; total M = {:.0}",
+                        k, suffix, total
+                    );
+                    return m_vec;
+                }
+                if let (Some(idx), Some(k_full)) = (keep_idx, k_full) && m_vec.len() == k_full {
+                    let total: f64 = m_vec.iter().sum();
+                    let mut kept = Vec::with_capacity(idx.len());
+                    for &i in idx {
+                        if i >= m_vec.len() {
+                            break;
+                        }
+                        kept.push(m_vec[i]);
+                    }
+                    println!(
+                        "  Read per-annotation M (K={} original, K={} kept) from {} files; total M = {:.0}",
+                        k_full,
+                        kept.len(),
+                        suffix,
+                        total
+                    );
+                    return kept;
+                }
                 println!(
                     "  WARNING: {} files have {} M values but K={} annotation columns; using fallback",
                     suffix,
@@ -268,6 +372,65 @@ fn resolve_m_vec(
 }
 
 // ---------------------------------------------------------------------------
+// Helper: drop zero-variance LD score columns (partitioned h2 parity).
+// ---------------------------------------------------------------------------
+
+fn column_is_zero_variance(values: &Array1<f64>) -> bool {
+    let mut count = 0usize;
+    let mut first: Option<f64> = None;
+    for &v in values.iter() {
+        if v.is_nan() {
+            continue;
+        }
+        count += 1;
+        if let Some(f) = first {
+            if v != f {
+                return false;
+            }
+        } else {
+            first = Some(v);
+        }
+    }
+    if count < 2 {
+        return false;
+    }
+    true
+}
+
+fn drop_zero_variance_ld(ref_ld: &DataFrame) -> Result<(DataFrame, Vec<usize>, usize)> {
+    let mut keep_cols: Vec<String> = Vec::new();
+    let mut keep_idx: Vec<usize> = Vec::new();
+    let mut any_zero = false;
+    let mut total = 0usize;
+
+    for name in ref_ld.get_column_names() {
+        if name == "SNP" {
+            keep_cols.push(name.to_string());
+            continue;
+        }
+        let values = extract_f64(ref_ld, name)?;
+        if column_is_zero_variance(&values) {
+            any_zero = true;
+        } else {
+            keep_cols.push(name.to_string());
+            keep_idx.push(total);
+        }
+        total += 1;
+    }
+
+    anyhow::ensure!(total > 0, "No L2 annotation columns found in reference LD scores");
+    if keep_cols.len() == 1 {
+        anyhow::bail!("All L2 annotation columns have zero variance.");
+    }
+    if any_zero {
+        println!("  Removing partitioned L2 columns with zero variance.");
+    }
+
+    let df = ref_ld.select(&keep_cols)?;
+    Ok((df, keep_idx, total))
+}
+
+// ---------------------------------------------------------------------------
 // Helper: filter multiple parallel arrays by a boolean mask
 // ---------------------------------------------------------------------------
 
@@ -278,6 +441,13 @@ fn filter_by_mask(v: &Array1<f64>, mask: &[bool]) -> Array1<f64> {
             .filter_map(|(&val, &keep)| if keep { Some(val) } else { None })
             .collect(),
     )
+}
+
+fn filter_strings_by_mask(v: &[String], mask: &[bool]) -> Vec<String> {
+    v.iter()
+        .zip(mask.iter())
+        .filter_map(|(val, keep)| if *keep { Some(val.clone()) } else { None })
+        .collect()
 }
 
 fn ensure_sumstats_have_alleles(path: &str) -> Result<()> {
@@ -412,26 +582,31 @@ pub fn run_h2(args: H2Args) -> Result<()> {
         .h2
         .as_ref()
         .context("--h2 is required unless --h2-cts is set")?;
-    let sumstats_lf = parse::scan_sumstats(h2_path)?;
+    let z = col("Z").cast(DataType::Float64);
+    let sumstats_lf = parse::scan_sumstats(h2_path)?
+        .with_columns([
+            col("N").cast(DataType::Float64).alias("N"),
+            (z.clone() * z).alias("CHI2"),
+        ])
+        .select([col("SNP"), col("N"), col("CHI2")]);
     // Reference LD keeps all annotation columns (scalar or partitioned).
-    let ref_ld = load_ld_ref(args.ref_ld.as_deref(), args.ref_ld_chr.as_deref())?;
-    let w_ld = load_ld(args.w_ld.as_deref(), args.w_ld_chr.as_deref(), "w_l2")?;
+    let ref_ld =
+        load_ld_ref(args.ref_ld.as_deref(), args.ref_ld_chr.as_deref())?.with_columns([all()
+            .exclude_cols(["SNP"])
+            .as_expr()
+            .cast(DataType::Float64)]);
+    let w_ld = load_ld(args.w_ld.as_deref(), args.w_ld_chr.as_deref(), "w_l2")?
+        .with_columns([col("w_l2").cast(DataType::Float64).alias("w_l2")]);
 
-    let merged = sumstats_lf
-        .join(
-            ref_ld,
-            [col("SNP")],
-            [col("SNP")],
-            JoinArgs::new(JoinType::Inner),
-        )
-        .join(
-            w_ld,
-            [col("SNP")],
-            [col("SNP")],
-            JoinArgs::new(JoinType::Inner),
-        )
-        .collect()
-        .context("merging sumstats with LD scores")?;
+    let merge_start = Instant::now();
+    let sumstats_df = sumstats_lf.collect().context("loading sumstats")?;
+    let ref_ld_df = ref_ld.collect().context("loading ref LD scores")?;
+    let (ref_ld_df, keep_idx, k_full) = drop_zero_variance_ld(&ref_ld_df)?;
+    let merged = smart_merge_on_snp(sumstats_df, ref_ld_df)
+        .context("merging sumstats with reference LD scores")?;
+    let w_ld_df = w_ld.collect().context("loading weight LD scores")?;
+    let merged = smart_merge_on_snp(merged, w_ld_df).context("merging with weight LD scores")?;
+    trace!("h2 merge time: {:?}", merge_start.elapsed());
 
     let n_total = merged.height();
     anyhow::ensure!(
@@ -445,10 +620,8 @@ pub fn run_h2(args: H2Args) -> Result<()> {
     );
 
     // Detect L2 annotation columns: everything that isn't a sumstats or weight column.
-    let non_l2_set: std::collections::HashSet<&str> = ["SNP", "A1", "A2", "Z", "N", "w_l2"]
-        .iter()
-        .copied()
-        .collect();
+    let non_l2_set: std::collections::HashSet<&str> =
+        ["SNP", "CHI2", "N", "w_l2"].iter().copied().collect();
     let l2_cols: Vec<String> = merged
         .get_column_names()
         .into_iter()
@@ -462,39 +635,96 @@ pub fn run_h2(args: H2Args) -> Result<()> {
         println!("  Detected K={} annotation columns (partitioned h2)", k);
     }
 
-    let chi2_raw = extract_f64(&merged, "Z")?.mapv(|z| (z * z).max(0.0));
-    let w_l2_raw = extract_f64(&merged, "w_l2")?.mapv(|l| l.max(0.0));
+    let chi2_raw = extract_f64(&merged, "CHI2")?;
+    let w_l2_raw = extract_f64(&merged, "w_l2")?;
     let n_vec_raw = extract_f64(&merged, "N")?;
     let ref_l2_raw_k: Vec<Array1<f64>> = l2_cols
         .iter()
-        .map(|name| extract_f64(&merged, name).map(|v| v.mapv(|l| l.max(0.0))))
+        .map(|name| extract_f64(&merged, name))
         .collect::<Result<Vec<_>>>()?;
 
-    let (chi2, w_l2, n_vec, ref_l2_k) = if let Some(chisq_max) = args.chisq_max {
-        let mask: Vec<bool> = chi2_raw.iter().map(|&c| c <= chisq_max).collect();
+    let valid_mask: Vec<bool> = (0..chi2_raw.len())
+        .map(|i| !chi2_raw[i].is_nan() && !n_vec_raw[i].is_nan())
+        .collect();
+
+    let mut chi2 = filter_by_mask(&chi2_raw, &valid_mask);
+    let mut w_l2 = filter_by_mask(&w_l2_raw, &valid_mask);
+    let mut n_vec = filter_by_mask(&n_vec_raw, &valid_mask);
+    let mut ref_l2_k: Vec<Array1<f64>> = ref_l2_raw_k
+        .iter()
+        .map(|v| filter_by_mask(v, &valid_mask))
+        .collect();
+
+    let chisq_max = if k > 1 {
+        match args.chisq_max {
+            Some(c) => Some(c),
+            None => {
+                let max_n = n_vec.iter().cloned().fold(0.0f64, f64::max);
+                Some((0.001 * max_n).max(80.0))
+            }
+        }
+    } else {
+        args.chisq_max
+    };
+
+    warn_small_snp_count(chi2.len());
+
+    if let Some(chisq_max) = chisq_max {
+        let mask: Vec<bool> = chi2.iter().map(|&c| c < chisq_max).collect();
         let n_removed = mask.iter().filter(|&&b| !b).count();
         if n_removed > 0 {
             println!("  Removed {} SNPs with chi2 > {:.1}", n_removed, chisq_max);
         }
-        (
-            filter_by_mask(&chi2_raw, &mask),
-            filter_by_mask(&w_l2_raw, &mask),
-            filter_by_mask(&n_vec_raw, &mask),
-            ref_l2_raw_k
-                .iter()
-                .map(|v| filter_by_mask(v, &mask))
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        (chi2_raw, w_l2_raw, n_vec_raw, ref_l2_raw_k)
-    };
+        chi2 = filter_by_mask(&chi2, &mask);
+        w_l2 = filter_by_mask(&w_l2, &mask);
+        n_vec = filter_by_mask(&n_vec, &mask);
+        ref_l2_k = ref_l2_k
+            .iter()
+            .map(|v| filter_by_mask(v, &mask))
+            .collect::<Vec<_>>();
+    }
     let n_obs = chi2.len();
     let n_mean = n_vec.mean().unwrap_or(1.0);
+    debug!(
+        "h2 regression inputs: n_obs={} n_mean={:.3} k={}",
+        n_obs, n_mean, k
+    );
+    trace_array_stats("chi2", &chi2);
+    trace_array_stats("w_l2", &w_l2);
+    trace_array_stats("N", &n_vec);
+    trace_ref_l2_stats(&l2_cols, &ref_l2_k);
 
     if k > 1 {
+        let reg_start = Instant::now();
+        if args.two_step.is_some() {
+            anyhow::bail!("--two-step is not compatible with partitioned h2");
+        }
+        let keep_idx_opt = if keep_idx.len() == k_full {
+            None
+        } else {
+            Some(keep_idx.as_slice())
+        };
+        let m_vec = resolve_m_vec(
+            args.m_snps,
+            args.ref_ld_chr.as_deref(),
+            args.not_m_5_50,
+            n_obs,
+            k,
+            keep_idx_opt,
+            Some(k_full),
+        );
         let fit = run_h2_partitioned(
-            &chi2, &ref_l2_k, &w_l2, &n_vec, &l2_cols, n_obs, n_mean, &args,
+            &chi2,
+            &ref_l2_k,
+            &w_l2,
+            &n_vec,
+            &l2_cols,
+            n_obs,
+            n_mean,
+            &args,
+            Some(&m_vec),
         )?;
+        trace!("h2 regression time: {:?}", reg_start.elapsed());
 
         if args.overlap_annot {
             let chr_split = args.ref_ld_chr.is_some();
@@ -535,7 +765,7 @@ pub fn run_h2(args: H2Args) -> Result<()> {
         return Ok(());
     }
 
-    // Scalar h2 (K == 1).
+    // Scalar h2 (K == 1) — match Python LDSC weights + IRWLS + jackknife.
     let ref_l2 = ref_l2_k.into_iter().next().unwrap();
     let m_snps = resolve_m(
         args.m_snps,
@@ -543,111 +773,58 @@ pub fn run_h2(args: H2Args) -> Result<()> {
         args.not_m_5_50,
         n_obs,
     );
-
-    // Two-step: step 1 estimates intercept on SNPs with chi2 ≤ threshold;
-    // step 2 fixes that intercept and re-estimates slope on all SNPs.
-    if let Some(two_step_max) = args.two_step {
-        let mask1: Vec<bool> = chi2.iter().map(|&c| c <= two_step_max).collect();
-        let n_s1 = mask1.iter().filter(|&&b| b).count();
-        println!(
-            "  Two-step: step 1 uses {} SNPs (chi2 <= {})",
-            n_s1, two_step_max
-        );
-
-        let chi2_s1 = filter_by_mask(&chi2, &mask1);
-        let l2_s1 = filter_by_mask(&ref_l2, &mask1);
-        let wl2_s1 = filter_by_mask(&w_l2, &mask1);
-        let n_s1v = filter_by_mask(&n_vec, &mask1);
-
-        let mut x_s1 = Array2::<f64>::zeros((n_s1, 2));
-        let mut w_s1 = Array1::<f64>::zeros(n_s1);
-        for i in 0..n_s1 {
-            x_s1[[i, 0]] = l2_s1[i];
-            x_s1[[i, 1]] = 1.0;
-            let v = (wl2_s1[i] / m_snps + 1.0 / n_s1v[i]).max(1e-9);
-            w_s1[i] = 1.0 / (2.0 * v * v);
-        }
-        let res_s1 = jackknife::jackknife(&x_s1, &chi2_s1, &w_s1, args.n_blocks, 2)
-            .context("jackknife step 1 for two-step h2")?;
-        let intercept_fixed = res_s1.est[1];
-        println!("  Two-step: step 1 intercept = {:.4}", intercept_fixed);
-
-        let y2 = chi2.mapv(|c| c - intercept_fixed);
-        let mut x2 = Array2::<f64>::zeros((n_obs, 1));
-        let mut w2 = Array1::<f64>::zeros(n_obs);
-        for i in 0..n_obs {
-            x2[[i, 0]] = ref_l2[i];
-            let v = (w_l2[i] / m_snps + 1.0 / n_vec[i]).max(1e-9);
-            w2[i] = 1.0 / (2.0 * v * v);
-        }
-        let res2 = jackknife::jackknife(&x2, &y2, &w2, args.n_blocks, 2)
-            .context("jackknife step 2 for two-step h2")?;
-        let h2 = res2.est[0] * m_snps / n_mean;
-        let h2_se_str = res2
-            .jknife_se
-            .as_ref()
-            .map(|se| format!("{:.4}", se[0] * m_snps / n_mean))
-            .unwrap_or_else(|| "N/A".to_string());
-        println!("Total observed-scale h2: {:.4} (SE: {})", h2, h2_se_str);
-        println!("Intercept: {:.4} (fixed from step 1)", intercept_fixed);
-        if let (Some(samp_prev), Some(pop_prev)) = (args.samp_prev, args.pop_prev) {
-            let c = liability_conversion_factor(samp_prev, pop_prev);
-            println!("Liability-scale h2: {:.4}", h2 * c);
-        }
-        return Ok(());
-    }
+    let n_blocks = n_obs.min(args.n_blocks);
 
     // Priority: --intercept-h2 > --no-intercept > free intercept.
-    let (y_reg, x_reg, fixed_intercept) = if let Some(fixed) = args.intercept_h2 {
-        let y_adj = chi2.mapv(|c| c - fixed);
-        let mut x = Array2::<f64>::zeros((n_obs, 1));
-        for i in 0..n_obs {
-            x[[i, 0]] = ref_l2[i];
-        }
-        (y_adj, x, Some(fixed))
+    let fixed_intercept = if let Some(fixed) = args.intercept_h2 {
+        Some(fixed)
     } else if args.no_intercept {
-        let y_adj = chi2.mapv(|c| c - 1.0);
-        let mut x = Array2::<f64>::zeros((n_obs, 1));
-        for i in 0..n_obs {
-            x[[i, 0]] = ref_l2[i];
-        }
-        (y_adj, x, Some(1.0f64))
+        Some(1.0)
     } else {
-        let mut x = Array2::<f64>::zeros((n_obs, 2));
-        for i in 0..n_obs {
-            x[[i, 0]] = ref_l2[i];
-            x[[i, 1]] = 1.0;
-        }
-        (chi2.clone(), x, None)
+        None
     };
-
-    let mut weights: Array1<f64> = Array1::zeros(n_obs);
-    for i in 0..n_obs {
-        let v = (w_l2[i] / m_snps + 1.0 / n_vec[i]).max(1e-9);
-        weights[i] = 1.0 / (2.0 * v * v);
+    let mut two_step = args.two_step;
+    if two_step.is_none() && fixed_intercept.is_none() {
+        two_step = Some(30.0);
+    }
+    if let Some(ts) = two_step {
+        println!("Using two-step estimator with cutoff at {ts}.");
     }
 
-    let result = jackknife::jackknife(&x_reg, &y_reg, &weights, args.n_blocks, 2)
-        .context("jackknife IRWLS for h2")?;
+    let reg_start = Instant::now();
+    let res = run_h2_ldsc(
+        &chi2,
+        &ref_l2,
+        &w_l2,
+        &n_vec,
+        m_snps,
+        n_blocks,
+        two_step,
+        fixed_intercept,
+    )?;
+    trace!("h2 regression time: {:?}", reg_start.elapsed());
 
-    // h2 = slope × M / N_mean
-    let h2 = result.est[0] * m_snps / n_mean;
-    let intercept = fixed_intercept.unwrap_or_else(|| result.est[1]);
-
-    let h2_se_str = result
-        .jknife_se
-        .as_ref()
-        .map(|se| format!("{:.4}", se[0] * m_snps / n_mean))
-        .unwrap_or_else(|| "N/A".to_string());
-
-    println!("Total observed-scale h2: {:.4} (SE: {})", h2, h2_se_str);
-    println!("Intercept: {:.4}", intercept);
-
-    print_jackknife_diagnostics(&result, args.print_cov, args.print_delete_vals);
+    println!("Total Observed scale h2: {:.4} ({:.4})", res.h2, res.h2_se);
+    println!("Lambda GC: {:.4}", res.lambda_gc);
+    println!("Mean Chi^2: {:.4}", res.mean_chi2);
+    if fixed_intercept.is_some() {
+        println!("Intercept: constrained to {:.4}", res.intercept);
+    } else {
+        println!("Intercept: {:.4} ({:.4})", res.intercept, res.intercept_se);
+        if let Some((ratio, ratio_se)) = res.ratio {
+            if ratio < 0.0 {
+                println!("Ratio < 0 (usually indicates GC correction).");
+            } else {
+                println!("Ratio: {:.4} ({:.4})", ratio, ratio_se);
+            }
+        } else {
+            println!("Ratio: NA (mean chi^2 < 1)");
+        }
+    }
 
     if let (Some(samp_prev), Some(pop_prev)) = (args.samp_prev, args.pop_prev) {
         let c = liability_conversion_factor(samp_prev, pop_prev);
-        println!("Liability-scale h2: {:.4}", h2 * c);
+        println!("Liability-scale h2: {:.4}", res.h2 * c);
     }
 
     Ok(())
@@ -693,25 +870,28 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
         "--h2-cts requires --w-ld-chr (not --w-ld)"
     );
 
-    let sumstats_lf = parse::scan_sumstats(sumstats_path)?;
-    let ref_ld = load_ld_ref(args.ref_ld.as_deref(), args.ref_ld_chr.as_deref())?;
-    let w_ld = load_ld(args.w_ld.as_deref(), args.w_ld_chr.as_deref(), "w_l2")?;
+    let z = col("Z").cast(DataType::Float64);
+    let sumstats_lf = parse::scan_sumstats(sumstats_path)?
+        .with_columns([
+            col("N").cast(DataType::Float64).alias("N"),
+            (z.clone() * z).alias("CHI2"),
+        ])
+        .select([col("SNP"), col("N"), col("CHI2")]);
+    let ref_ld =
+        load_ld_ref(args.ref_ld.as_deref(), args.ref_ld_chr.as_deref())?.with_columns([all()
+            .exclude_cols(["SNP"])
+            .as_expr()
+            .cast(DataType::Float64)]);
+    let w_ld = load_ld(args.w_ld.as_deref(), args.w_ld_chr.as_deref(), "w_l2")?
+        .with_columns([col("w_l2").cast(DataType::Float64).alias("w_l2")]);
 
-    let merged = sumstats_lf
-        .join(
-            ref_ld,
-            [col("SNP")],
-            [col("SNP")],
-            JoinArgs::new(JoinType::Inner),
-        )
-        .join(
-            w_ld,
-            [col("SNP")],
-            [col("SNP")],
-            JoinArgs::new(JoinType::Inner),
-        )
-        .collect()
-        .context("merging sumstats with LD scores")?;
+    let sumstats_df = sumstats_lf.collect().context("loading sumstats")?;
+    let ref_ld_df = ref_ld.collect().context("loading ref LD scores")?;
+    let (ref_ld_df, keep_idx, k_full) = drop_zero_variance_ld(&ref_ld_df)?;
+    let merged = smart_merge_on_snp(sumstats_df, ref_ld_df)
+        .context("merging sumstats with reference LD scores")?;
+    let w_ld_df = w_ld.collect().context("loading weight LD scores")?;
+    let merged = smart_merge_on_snp(merged, w_ld_df).context("merging with weight LD scores")?;
 
     let n_total = merged.height();
     anyhow::ensure!(
@@ -723,7 +903,7 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
         n_total, sumstats_path
     );
 
-    let non_l2_set: std::collections::HashSet<&str> = ["SNP", "A1", "A2", "Z", "N", "w_l2"]
+    let non_l2_set: std::collections::HashSet<&str> = ["SNP", "CHI2", "N", "w_l2"]
         .iter()
         .copied()
         .collect();
@@ -739,69 +919,76 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
         "No L2 annotation columns found in merged dataset"
     );
 
-    let chi2_raw = extract_f64(&merged, "Z")?.mapv(|z| (z * z).max(0.0));
-    let w_l2_raw = extract_f64(&merged, "w_l2")?.mapv(|l| l.max(0.0));
+    let chi2_raw = extract_f64(&merged, "CHI2")?;
+    let w_l2_raw = extract_f64(&merged, "w_l2")?;
     let n_vec_raw = extract_f64(&merged, "N")?;
     let ref_l2_raw_k: Vec<Array1<f64>> = l2_cols
         .iter()
-        .map(|name| extract_f64(&merged, name).map(|v| v.mapv(|l| l.max(0.0))))
+        .map(|name| extract_f64(&merged, name))
         .collect::<Result<Vec<_>>>()?;
+
+    let snp_raw: Vec<String> = merged
+        .column("SNP")?
+        .as_materialized_series()
+        .str()?
+        .into_iter()
+        .map(|opt| opt.unwrap_or("").to_string())
+        .collect();
+
+    let valid_mask: Vec<bool> = (0..chi2_raw.len())
+        .map(|i| !chi2_raw[i].is_nan() && !n_vec_raw[i].is_nan())
+        .collect();
+
+    let mut chi2 = filter_by_mask(&chi2_raw, &valid_mask);
+    let mut w_l2 = filter_by_mask(&w_l2_raw, &valid_mask);
+    let mut n_vec = filter_by_mask(&n_vec_raw, &valid_mask);
+    let mut ref_l2_k: Vec<Array1<f64>> = ref_l2_raw_k
+        .iter()
+        .map(|v| filter_by_mask(v, &valid_mask))
+        .collect();
+    let mut keep_snps = filter_strings_by_mask(&snp_raw, &valid_mask);
+
+    warn_small_snp_count(chi2.len());
 
     let chisq_max = if let Some(c) = args.chisq_max {
         Some(c)
     } else {
-        let max_n = n_vec_raw.iter().cloned().fold(0.0f64, f64::max);
+        let max_n = n_vec.iter().cloned().fold(0.0f64, f64::max);
         Some((0.001 * max_n).max(80.0))
     };
 
-    let (chi2, w_l2, n_vec, ref_l2_k, keep_snps) = if let Some(cmax) = chisq_max {
-        let mask: Vec<bool> = chi2_raw.iter().map(|&c| c <= cmax).collect();
+    if let Some(cmax) = chisq_max {
+        let mask: Vec<bool> = chi2.iter().map(|&c| c < cmax).collect();
         let n_removed = mask.iter().filter(|&&b| !b).count();
         if n_removed > 0 {
             println!("  Removed {} SNPs with chi2 > {:.1}", n_removed, cmax);
         }
-        let keep_snps_all: Vec<String> = merged
-            .column("SNP")?
-            .as_materialized_series()
-            .str()?
-            .into_iter()
-            .map(|opt| opt.unwrap_or("").to_string())
-            .collect();
-        let keep_snps: Vec<String> = keep_snps_all
-            .into_iter()
-            .zip(mask.iter())
-            .filter_map(|(s, keep)| if *keep { Some(s) } else { None })
-            .collect();
-        (
-            filter_by_mask(&chi2_raw, &mask),
-            filter_by_mask(&w_l2_raw, &mask),
-            filter_by_mask(&n_vec_raw, &mask),
-            ref_l2_raw_k
-                .iter()
-                .map(|v| filter_by_mask(v, &mask))
-                .collect::<Vec<_>>(),
-            keep_snps,
-        )
-    } else {
-        let keep_snps: Vec<String> = merged
-            .column("SNP")?
-            .as_materialized_series()
-            .str()?
-            .into_iter()
-            .map(|opt| opt.unwrap_or("").to_string())
-            .collect();
-        (chi2_raw, w_l2_raw, n_vec_raw, ref_l2_raw_k, keep_snps)
-    };
+        chi2 = filter_by_mask(&chi2, &mask);
+        w_l2 = filter_by_mask(&w_l2, &mask);
+        n_vec = filter_by_mask(&n_vec, &mask);
+        ref_l2_k = ref_l2_k
+            .iter()
+            .map(|v| filter_by_mask(v, &mask))
+            .collect::<Vec<_>>();
+        keep_snps = filter_strings_by_mask(&keep_snps, &mask);
+    }
 
     let n_obs = chi2.len();
     let n_mean = n_vec.mean().unwrap_or(1.0);
 
+    let keep_idx_opt = if keep_idx.len() == k_full {
+        None
+    } else {
+        Some(keep_idx.as_slice())
+    };
     let m_base = resolve_m_vec(
         args.m_snps,
         args.ref_ld_chr.as_deref(),
         args.not_m_5_50,
         n_obs,
         k_base,
+        keep_idx_opt,
+        Some(k_full),
     );
     anyhow::ensure!(
         m_base.len() == ref_l2_k.len(),
@@ -869,7 +1056,7 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
                         "Missing some LD scores from cts files. Are you sure all SNPs in ref-ld-chr are also in ref-ld-chr-cts?"
                     )
                 })?;
-                v.push(val.max(0.0));
+                v.push(val);
             }
             cts_arrays.push(Array1::from(v));
         }
@@ -1021,73 +1208,77 @@ fn fit_h2_partitioned(
             args.not_m_5_50,
             n_obs,
             k,
+            None,
+            None,
         )
     };
     let m_total: f64 = m_vec.iter().sum();
+    let n_blocks = n_obs.min(args.n_blocks);
 
-    let (y_reg, x_reg, fixed_intercept) = if let Some(fixed) = args.intercept_h2 {
-        let y_adj = chi2.mapv(|c| c - fixed);
-        let mut x = Array2::<f64>::zeros((n_obs, k));
-        for (j, col_v) in ref_l2_k.iter().enumerate() {
-            for i in 0..n_obs {
-                x[[i, j]] = col_v[i];
-            }
-        }
-        (y_adj, x, Some(fixed))
-    } else if args.no_intercept {
-        let y_adj = chi2.mapv(|c| c - 1.0);
-        let mut x = Array2::<f64>::zeros((n_obs, k));
-        for (j, col_v) in ref_l2_k.iter().enumerate() {
-            for i in 0..n_obs {
-                x[[i, j]] = col_v[i];
-            }
-        }
-        (y_adj, x, Some(1.0f64))
-    } else {
-        let mut x = Array2::<f64>::zeros((n_obs, k + 1));
-        for (j, col_v) in ref_l2_k.iter().enumerate() {
-            for i in 0..n_obs {
-                x[[i, j]] = col_v[i];
-            }
-        }
+    let mut x_raw = Array2::<f64>::zeros((n_obs, k));
+    for (j, col_v) in ref_l2_k.iter().enumerate() {
         for i in 0..n_obs {
-            x[[i, k]] = 1.0;
+            x_raw[[i, j]] = col_v[i];
         }
-        (chi2.clone(), x, None)
-    };
-
-    let mut weights = Array1::<f64>::zeros(n_obs);
+    }
+    let mut x_tot = Array1::<f64>::zeros(n_obs);
     for i in 0..n_obs {
-        let v = (w_l2[i] / m_total + 1.0 / n_vec[i]).max(1e-9);
-        weights[i] = 1.0 / (2.0 * v * v);
+        let mut sum = 0.0;
+        for j in 0..k {
+            sum += x_raw[[i, j]];
+        }
+        x_tot[i] = sum;
     }
 
-    let result: IrwlsResult = jackknife::jackknife(&x_reg, &y_reg, &weights, args.n_blocks, 2)
-        .context("jackknife IRWLS for partitioned h2")?;
+    let fixed_intercept = if let Some(fixed) = args.intercept_h2 {
+        Some(fixed)
+    } else if args.no_intercept {
+        Some(1.0)
+    } else {
+        None
+    };
 
-    let h2_per_annot: Vec<f64> = (0..k).map(|j| result.est[j] * m_vec[j] / n_mean).collect();
+    let y_reg = if let Some(fixed) = fixed_intercept {
+        chi2.mapv(|c| c - fixed)
+    } else {
+        chi2.clone()
+    };
+
+    let x_cols = if fixed_intercept.is_some() { k } else { k + 1 };
+    let mut x_reg = Array2::<f64>::zeros((n_obs, x_cols));
+    for i in 0..n_obs {
+        let scale = n_vec[i] / n_mean;
+        for j in 0..k {
+            x_reg[[i, j]] = x_raw[[i, j]] * scale;
+        }
+        if fixed_intercept.is_none() {
+            x_reg[[i, k]] = 1.0;
+        }
+    }
+
+    let agg_intercept = fixed_intercept.unwrap_or(1.0);
+    let hsq = aggregate(chi2, &x_tot, n_vec, m_total, agg_intercept);
+    let initial_w = ldsc_weights(&x_tot, w_l2, n_vec, m_total, hsq, agg_intercept);
+    let w_sqrt = initial_w.mapv(|v| v.sqrt());
+    let (xw, yw) = weight_xy(&x_reg, &y_reg, &w_sqrt)?;
+    let jknife: JackknifeResult =
+        jackknife_fast(&xw, &yw, n_blocks, None).context("jackknife for partitioned h2")?;
+
+    let coef = jknife.est.slice(s![..k]).to_owned() / n_mean;
+    let h2_per_annot: Vec<f64> = (0..k).map(|j| coef[j] * m_vec[j]).collect();
     let h2_total: f64 = h2_per_annot.iter().sum();
-    let intercept = fixed_intercept.unwrap_or_else(|| result.est[k]);
-
-    let jknife_cov = result
-        .jknife_cov
-        .clone()
-        .context("missing jackknife covariance")?;
-    let delete_values = result
-        .delete_values
-        .clone()
-        .context("missing jackknife delete values")?;
+    let intercept = fixed_intercept.unwrap_or_else(|| jknife.est[k]);
 
     Ok(PartitionedFit {
-        est: result.est,
-        jknife_cov,
-        delete_values,
+        est: jknife.est,
+        jknife_cov: jknife.jknife_cov,
+        delete_values: jknife.delete_values,
         m_vec,
         n_mean,
         h2_per_annot,
         h2_total,
         intercept,
-        n_blocks: args.n_blocks,
+        n_blocks,
     })
 }
 
@@ -1316,8 +1507,18 @@ fn run_h2_partitioned(
     n_obs: usize,
     n_mean: f64,
     args: &H2Args,
+    m_override: Option<&[f64]>,
 ) -> Result<PartitionedFit> {
-    let fit = fit_h2_partitioned(chi2, ref_l2_k, w_l2, n_vec, n_obs, n_mean, args, None)?;
+    let fit = fit_h2_partitioned(
+        chi2,
+        ref_l2_k,
+        w_l2,
+        n_vec,
+        n_obs,
+        n_mean,
+        args,
+        m_override,
+    )?;
 
     print_partitioned_summary(&fit, l2_cols, args);
     print_jackknife_diagnostics(
@@ -1344,6 +1545,463 @@ fn run_h2_partitioned(
 // Genetic correlation (--rg)
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct HsqFit {
+    tot: f64,
+    tot_se: f64,
+    intercept: f64,
+    intercept_se: f64,
+    mean_chi2: f64,
+    lambda_gc: f64,
+    ratio: Option<(f64, f64)>,
+    tot_delete_values: Array1<f64>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct GencovFit {
+    tot: f64,
+    tot_se: f64,
+    intercept: f64,
+    intercept_se: f64,
+    mean_z1z2: f64,
+    tot_delete_values: Array1<f64>,
+}
+
+fn mean(arr: &Array1<f64>) -> f64 {
+    arr.mean().unwrap_or(f64::NAN)
+}
+
+fn sum_ref_l2(ref_l2_k: &[Array1<f64>]) -> Result<Array1<f64>> {
+    anyhow::ensure!(!ref_l2_k.is_empty(), "No L2 columns supplied");
+    let n = ref_l2_k[0].len();
+    let mut out = Array1::<f64>::zeros(n);
+    for col in ref_l2_k {
+        anyhow::ensure!(col.len() == n, "L2 column length mismatch");
+        out += col;
+    }
+    Ok(out)
+}
+
+fn total_from_jknife(
+    jknife: &JackknifeResult,
+    m_vec: &[f64],
+    nbar: f64,
+) -> Result<(f64, f64, Array1<f64>)> {
+    let k = m_vec.len();
+    anyhow::ensure!(
+        jknife.est.len() >= k,
+        "Jackknife estimate has {} params but K={}",
+        jknife.est.len(),
+        k
+    );
+    let coef_cov = jknife.jknife_cov.slice(s![0..k, 0..k]).to_owned() / (nbar * nbar);
+
+    let mut tot = 0.0;
+    for (j, m) in m_vec.iter().enumerate().take(k) {
+        tot += m * (jknife.est[j] / nbar);
+    }
+
+    let mut tot_cov = 0.0;
+    for i in 0..k {
+        for j in 0..k {
+            tot_cov += m_vec[i] * m_vec[j] * coef_cov[[i, j]];
+        }
+    }
+    let tot_se = tot_cov.max(0.0).sqrt();
+
+    let n_blocks = jknife.delete_values.nrows();
+    let mut tot_delete = Array1::<f64>::zeros(n_blocks);
+    for b in 0..n_blocks {
+        let mut sum = 0.0;
+        for (j, m) in m_vec.iter().enumerate().take(k) {
+            sum += m * jknife.delete_values[[b, j]];
+        }
+        tot_delete[b] = sum / nbar;
+    }
+
+    Ok((tot, tot_se, tot_delete))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gencov_weights(
+    ld: &Array1<f64>,
+    w_ld: &Array1<f64>,
+    n1: &Array1<f64>,
+    n2: &Array1<f64>,
+    m_total: f64,
+    h1: f64,
+    h2: f64,
+    rho_g: f64,
+    intercept_gencov: f64,
+    intercept_hsq1: f64,
+    intercept_hsq2: f64,
+) -> Array1<f64> {
+    let h1 = h1.clamp(0.0, 1.0);
+    let h2 = h2.clamp(0.0, 1.0);
+    let rho_g = rho_g.clamp(-1.0, 1.0);
+
+    let mut out = Array1::<f64>::zeros(ld.len());
+    for i in 0..ld.len() {
+        let ld_i = ld[i].max(1.0);
+        let w_i = w_ld[i].max(1.0);
+        let a = n1[i] * h1 * ld_i / m_total + intercept_hsq1;
+        let b = n2[i] * h2 * ld_i / m_total + intercept_hsq2;
+        let c = (n1[i] * n2[i]).sqrt() * rho_g * ld_i / m_total + intercept_gencov;
+        let het_w = 1.0 / (a * b + c * c);
+        let oc_w = 1.0 / w_i;
+        out[i] = het_w * oc_w;
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_hsq_ldsc(
+    chi2: &Array1<f64>,
+    ref_l2_k: &[Array1<f64>],
+    w_l2: &Array1<f64>,
+    n_vec: &Array1<f64>,
+    m_vec: &[f64],
+    n_blocks: usize,
+    two_step: Option<f64>,
+    fixed_intercept: Option<f64>,
+) -> Result<HsqFit> {
+    let n = chi2.len();
+    let k = ref_l2_k.len();
+    anyhow::ensure!(k > 0, "run_hsq_ldsc: no L2 columns");
+    anyhow::ensure!(
+        w_l2.len() == n && n_vec.len() == n,
+        "run_hsq_ldsc: length mismatch"
+    );
+    for col in ref_l2_k {
+        anyhow::ensure!(col.len() == n, "run_hsq_ldsc: L2 length mismatch");
+    }
+
+    let nbar = mean(n_vec);
+    let m_total: f64 = m_vec.iter().sum();
+    let ref_l2_tot = sum_ref_l2(ref_l2_k)?;
+
+    let intercept0 = fixed_intercept.unwrap_or(1.0);
+    let tot_agg = aggregate(chi2, &ref_l2_tot, n_vec, m_total, intercept0);
+    let initial_w = ldsc_weights(&ref_l2_tot, w_l2, n_vec, m_total, tot_agg, intercept0);
+
+    let mut x_scaled = Array2::<f64>::zeros((n, k));
+    for (j, col) in ref_l2_k.iter().enumerate() {
+        for i in 0..n {
+            x_scaled[[i, j]] = n_vec[i] * col[i] / nbar;
+        }
+    }
+
+    let (y_reg, x_reg) = if let Some(fixed) = fixed_intercept {
+        let y_adj = chi2.mapv(|c| c - fixed);
+        (y_adj, x_scaled.clone())
+    } else {
+        let mut x_i = Array2::<f64>::zeros((n, k + 1));
+        x_i.slice_mut(s![.., 0..k]).assign(&x_scaled);
+        x_i.column_mut(k).fill(1.0);
+        (chi2.clone(), x_i)
+    };
+
+    if two_step.is_some() && fixed_intercept.is_some() {
+        anyhow::bail!("twostep is not compatible with constrained intercept");
+    }
+    if two_step.is_some() && k > 1 {
+        anyhow::bail!("twostep not compatible with partitioned LD Score");
+    }
+
+    let jknife = if let Some(twostep) = two_step {
+        let mask: Vec<bool> = chi2.iter().map(|&c| c < twostep).collect();
+        let n_s1 = mask.iter().filter(|&&b| b).count();
+
+        let mut x1 = Array2::<f64>::zeros((n_s1, x_reg.ncols()));
+        let mut y1 = Array1::<f64>::zeros(n_s1);
+        let mut w1 = Array1::<f64>::zeros(n_s1);
+        let mut n1v = Array1::<f64>::zeros(n_s1);
+        let mut idx = 0usize;
+        for i in 0..n {
+            if mask[i] {
+                x1.row_mut(idx).assign(&x_reg.row(i));
+                y1[idx] = y_reg[i];
+                w1[idx] = w_l2[i];
+                n1v[idx] = n_vec[i];
+                idx += 1;
+            }
+        }
+        let initial_w1_vec: Vec<f64> = initial_w
+            .iter()
+            .zip(mask.iter())
+            .filter_map(|(&v, keep)| if *keep { Some(v) } else { None })
+            .collect();
+        let initial_w1 = Array1::from_vec(initial_w1_vec);
+
+        let x1_col0 = x1.column(0).to_owned();
+        let update_func1 = move |coef: &Array1<f64>| {
+            let hsq = m_total * coef[0] / nbar;
+            let intercept = coef[1];
+            ldsc_weights(&x1_col0, &w1, &n1v, m_total, hsq, intercept)
+        };
+
+        let step1 = irwls_ldsc(&x1, &y1, &initial_w1, update_func1, n_blocks, None)?;
+        let step1_int = step1.est[k];
+
+        let y2 = y_reg.mapv(|c| c - step1_int);
+        let x2 = x_scaled.clone();
+        let update_func2 = |coef: &Array1<f64>| {
+            let hsq = m_total * coef[0] / nbar;
+            ldsc_weights(&ref_l2_tot, w_l2, n_vec, m_total, hsq, step1_int)
+        };
+
+        let seps = update_separators(&step1.separators, &mask);
+        let step2 = irwls_ldsc(&x2, &y2, &initial_w, update_func2, n_blocks, Some(&seps))?;
+
+        let num = (&initial_w * &x2.column(0)).sum();
+        let denom = (&initial_w * &x2.column(0).mapv(|v| v * v)).sum();
+        let c = num / denom;
+        combine_twostep(&step1, &step2, c)?
+    } else {
+        let update_func = |coef: &Array1<f64>| {
+            let hsq = m_total * coef[0] / nbar;
+            let intercept = fixed_intercept.unwrap_or(coef[k]);
+            ldsc_weights(&ref_l2_tot, w_l2, n_vec, m_total, hsq, intercept)
+        };
+        irwls_ldsc(&x_reg, &y_reg, &initial_w, update_func, n_blocks, None)?
+    };
+
+    let (tot, tot_se, tot_delete_values) = total_from_jknife(&jknife, m_vec, nbar)?;
+
+    let (intercept, intercept_se) = if let Some(fixed) = fixed_intercept {
+        (fixed, f64::NAN)
+    } else {
+        (jknife.est[k], jknife.jknife_se[k])
+    };
+
+    let mean_chi2 = mean(chi2);
+    let lambda_gc = {
+        let mut vals = chi2.to_vec();
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = vals.len();
+        let mid = if n == 0 {
+            f64::NAN
+        } else if n % 2 == 1 {
+            vals[n / 2]
+        } else {
+            let hi = vals[n / 2];
+            let lo = vals[n / 2 - 1];
+            (lo + hi) / 2.0
+        };
+        mid / 0.4549
+    };
+    let ratio = if mean_chi2 > 1.0 && fixed_intercept.is_none() {
+        let ratio = (intercept - 1.0) / (mean_chi2 - 1.0);
+        let ratio_se = intercept_se / (mean_chi2 - 1.0);
+        Some((ratio, ratio_se))
+    } else {
+        None
+    };
+
+    Ok(HsqFit {
+        tot,
+        tot_se,
+        intercept,
+        intercept_se,
+        mean_chi2,
+        lambda_gc,
+        ratio,
+        tot_delete_values,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_gencov_ldsc(
+    z1: &Array1<f64>,
+    z2: &Array1<f64>,
+    ref_l2_k: &[Array1<f64>],
+    w_l2: &Array1<f64>,
+    n1: &Array1<f64>,
+    n2: &Array1<f64>,
+    m_vec: &[f64],
+    n_blocks: usize,
+    two_step: Option<f64>,
+    intercept_gencov: Option<f64>,
+    hsq1: &HsqFit,
+    hsq2: &HsqFit,
+) -> Result<GencovFit> {
+    let n = z1.len();
+    let k = ref_l2_k.len();
+    anyhow::ensure!(k > 0, "run_gencov_ldsc: no L2 columns");
+    anyhow::ensure!(
+        z2.len() == n && w_l2.len() == n && n1.len() == n && n2.len() == n,
+        "run_gencov_ldsc: length mismatch"
+    );
+    for col in ref_l2_k {
+        anyhow::ensure!(col.len() == n, "run_gencov_ldsc: L2 length mismatch");
+    }
+
+    let m_total: f64 = m_vec.iter().sum();
+    let ref_l2_tot = sum_ref_l2(ref_l2_k)?;
+    let sqrt_n1n2 = Array1::from_iter(n1.iter().zip(n2.iter()).map(|(&a, &b)| (a * b).sqrt()));
+    let nbar = mean(&sqrt_n1n2);
+
+    let intercept0 = intercept_gencov.unwrap_or(0.0);
+    let prod = z1 * z2;
+    let tot_agg = aggregate(&prod, &ref_l2_tot, &sqrt_n1n2, m_total, intercept0);
+    let initial_w = gencov_weights(
+        &ref_l2_tot,
+        w_l2,
+        n1,
+        n2,
+        m_total,
+        hsq1.tot,
+        hsq2.tot,
+        tot_agg,
+        intercept0,
+        hsq1.intercept,
+        hsq2.intercept,
+    );
+
+    let mut x_scaled = Array2::<f64>::zeros((n, k));
+    for (j, col) in ref_l2_k.iter().enumerate() {
+        for i in 0..n {
+            x_scaled[[i, j]] = sqrt_n1n2[i] * col[i] / nbar;
+        }
+    }
+
+    let (y_reg, x_reg) = if let Some(fixed) = intercept_gencov {
+        let y_adj = prod.mapv(|p| p - fixed);
+        (y_adj, x_scaled.clone())
+    } else {
+        let mut x_i = Array2::<f64>::zeros((n, k + 1));
+        x_i.slice_mut(s![.., 0..k]).assign(&x_scaled);
+        x_i.column_mut(k).fill(1.0);
+        (prod.clone(), x_i)
+    };
+
+    if two_step.is_some() && intercept_gencov.is_some() {
+        anyhow::bail!("twostep is not compatible with constrained intercept");
+    }
+    if two_step.is_some() && k > 1 {
+        anyhow::bail!("twostep not compatible with partitioned LD Score");
+    }
+
+    let jknife = if let Some(twostep) = two_step {
+        let mask: Vec<bool> = z1
+            .iter()
+            .zip(z2.iter())
+            .map(|(&a, &b)| a * a < twostep && b * b < twostep)
+            .collect();
+        let n_s1 = mask.iter().filter(|&&b| b).count();
+
+        let mut x1 = Array2::<f64>::zeros((n_s1, x_reg.ncols()));
+        let mut y1 = Array1::<f64>::zeros(n_s1);
+        let mut w1 = Array1::<f64>::zeros(n_s1);
+        let mut n1v = Array1::<f64>::zeros(n_s1);
+        let mut n2v = Array1::<f64>::zeros(n_s1);
+        let mut idx = 0usize;
+        for i in 0..n {
+            if mask[i] {
+                x1.row_mut(idx).assign(&x_reg.row(i));
+                y1[idx] = y_reg[i];
+                w1[idx] = w_l2[i];
+                n1v[idx] = n1[i];
+                n2v[idx] = n2[i];
+                idx += 1;
+            }
+        }
+        let initial_w1_vec: Vec<f64> = initial_w
+            .iter()
+            .zip(mask.iter())
+            .filter_map(|(&v, keep)| if *keep { Some(v) } else { None })
+            .collect();
+        let initial_w1 = Array1::from_vec(initial_w1_vec);
+
+        let x1_col0 = x1.column(0).to_owned();
+        let update_func1 = move |coef: &Array1<f64>| {
+            let rho_g = m_total * coef[0] / nbar;
+            let intercept = coef[1];
+            gencov_weights(
+                &x1_col0,
+                &w1,
+                &n1v,
+                &n2v,
+                m_total,
+                hsq1.tot,
+                hsq2.tot,
+                rho_g,
+                intercept,
+                hsq1.intercept,
+                hsq2.intercept,
+            )
+        };
+
+        let step1 = irwls_ldsc(&x1, &y1, &initial_w1, update_func1, n_blocks, None)?;
+        let step1_int = step1.est[k];
+
+        let y2 = y_reg.mapv(|p| p - step1_int);
+        let x2 = x_scaled.clone();
+        let update_func2 = |coef: &Array1<f64>| {
+            let rho_g = m_total * coef[0] / nbar;
+            gencov_weights(
+                &ref_l2_tot,
+                w_l2,
+                n1,
+                n2,
+                m_total,
+                hsq1.tot,
+                hsq2.tot,
+                rho_g,
+                step1_int,
+                hsq1.intercept,
+                hsq2.intercept,
+            )
+        };
+
+        let seps = update_separators(&step1.separators, &mask);
+        let step2 = irwls_ldsc(&x2, &y2, &initial_w, update_func2, n_blocks, Some(&seps))?;
+
+        let num = (&initial_w * &x2.column(0)).sum();
+        let denom = (&initial_w * &x2.column(0).mapv(|v| v * v)).sum();
+        let c = num / denom;
+        combine_twostep(&step1, &step2, c)?
+    } else {
+        let update_func = |coef: &Array1<f64>| {
+            let rho_g = m_total * coef[0] / nbar;
+            let intercept = intercept_gencov.unwrap_or(coef[k]);
+            gencov_weights(
+                &ref_l2_tot,
+                w_l2,
+                n1,
+                n2,
+                m_total,
+                hsq1.tot,
+                hsq2.tot,
+                rho_g,
+                intercept,
+                hsq1.intercept,
+                hsq2.intercept,
+            )
+        };
+        irwls_ldsc(&x_reg, &y_reg, &initial_w, update_func, n_blocks, None)?
+    };
+
+    let (tot, tot_se, tot_delete_values) = total_from_jknife(&jknife, m_vec, nbar)?;
+    let (intercept, intercept_se) = if let Some(fixed) = intercept_gencov {
+        (fixed, f64::NAN)
+    } else {
+        (jknife.est[k], jknife.jknife_se[k])
+    };
+    let mean_z1z2 = mean(&prod);
+
+    Ok(GencovFit {
+        tot,
+        tot_se,
+        intercept,
+        intercept_se,
+        mean_z1z2,
+        tot_delete_values,
+    })
+}
+
 pub fn run_rg(args: RgArgs) -> Result<()> {
     anyhow::ensure!(
         args.rg.len() >= 2,
@@ -1359,90 +2017,126 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
     }
 
     let n_traits = args.rg.len();
-    anyhow::ensure!(
-        args.intercept_h2.is_empty() || args.intercept_h2.len() == n_traits,
-        "--intercept-h2 expects one value per trait ({} values for this run)",
-        n_traits
-    );
-    let intercept_h2 = if args.intercept_h2.is_empty() {
-        None
+    let mut intercept_h2: Vec<Option<f64>> = if args.intercept_h2.is_empty() {
+        vec![None; n_traits]
     } else {
-        Some(args.intercept_h2.as_slice())
+        anyhow::ensure!(
+            args.intercept_h2.len() == n_traits,
+            "--intercept-h2 expects one value per trait ({} values for this run)",
+            n_traits
+        );
+        args.intercept_h2.iter().copied().map(Some).collect()
     };
 
-    let ref_ld = load_ld(args.ref_ld.as_deref(), args.ref_ld_chr.as_deref(), "ref_l2")?
+    let mut intercept_gencov: Vec<Option<f64>> = if args.intercept_gencov.is_empty() {
+        vec![None; n_traits]
+    } else if args.intercept_gencov.len() == n_traits {
+        args.intercept_gencov.iter().copied().map(Some).collect()
+    } else if args.intercept_gencov.len() == n_traits - 1 {
+        println!(
+            "WARNING: --intercept-gencov has {} values; mapping to trait1-vs-others pairs. \
+To match Python, provide {} values (first ignored).",
+            args.intercept_gencov.len(),
+            n_traits
+        );
+        let mut vals = vec![None; n_traits];
+        for (i, v) in args.intercept_gencov.iter().copied().enumerate() {
+            vals[i + 1] = Some(v);
+        }
+        vals
+    } else {
+        anyhow::bail!(
+            "--intercept-gencov expects either {} values (per trait, first ignored) or {} values (trait1 vs others)",
+            n_traits,
+            n_traits.saturating_sub(1)
+        );
+    };
+
+    if args.no_intercept {
+        intercept_h2 = vec![Some(1.0); n_traits];
+        intercept_gencov = vec![Some(0.0); n_traits];
+    }
+
+    if !args.samp_prev.is_empty() {
+        anyhow::ensure!(
+            args.samp_prev.len() == n_traits,
+            "--samp-prev expects one value per trait ({} values for this run)",
+            n_traits
+        );
+    }
+    if !args.pop_prev.is_empty() {
+        anyhow::ensure!(
+            args.pop_prev.len() == n_traits,
+            "--pop-prev expects one value per trait ({} values for this run)",
+            n_traits
+        );
+    }
+
+    let ref_ld = load_ld_ref(args.ref_ld.as_deref(), args.ref_ld_chr.as_deref())?
         .collect()
         .context("loading ref LD scores")?;
-
     let w_ld = load_ld(args.w_ld.as_deref(), args.w_ld_chr.as_deref(), "w_l2")?
         .collect()
         .context("loading weight LD scores")?;
 
-    // Determine M before the per-pair loop; falls back to n_obs per pair if not found.
-    let m_from_files: Option<f64> = if let Some(m) = args.m_snps {
-        println!("Using M = {:.0} from --M", m);
-        Some(m)
-    } else if let Some(prefix) = &args.ref_ld_chr {
-        let suffix = if args.not_m_5_50 {
-            ".l2.M"
-        } else {
-            ".l2.M_5_50"
-        };
-        let prefixes = split_paths(prefix);
-        let m_res = if prefixes.len() == 1 {
-            parse::read_m_total(prefixes[0].as_str(), suffix)
-        } else {
-            parse::read_m_total_list(&prefixes, suffix)
-        };
-        match m_res {
-            Ok(m) => {
-                println!("Read M = {:.0} from {} files", m, suffix);
-                Some(m)
-            }
-            Err(_) => None, // fall back to n_obs per pair
-        }
+    let ref_l2_cols: Vec<String> = ref_ld
+        .get_column_names()
+        .into_iter()
+        .filter(|n| n.as_str() != "SNP")
+        .map(|s| s.to_string())
+        .collect();
+    anyhow::ensure!(
+        !ref_l2_cols.is_empty(),
+        "No L2 annotation columns found in reference LD scores"
+    );
+    let k = ref_l2_cols.len();
+
+    let two_step = args.two_step;
+    if let Some(ts) = two_step {
+        println!("Using two-step estimator with cutoff at {ts}.");
+    }
+
+    let file1 = &args.rg[0];
+    if !args.no_check_alleles {
+        ensure_sumstats_have_alleles(file1)?;
+    }
+
+    let ss1 = if args.no_check_alleles {
+        parse::scan_sumstats(file1)?.select([
+            col("SNP"),
+            col("Z").alias("Z1"),
+            col("N").alias("N1"),
+        ])
     } else {
-        None // single-file --ref-ld: no M files
-    };
+        parse::scan_sumstats(file1)?.select([
+            col("SNP"),
+            col("A1").alias("A1_1"),
+            col("A2").alias("A2_1"),
+            col("Z").alias("Z1"),
+            col("N").alias("N1"),
+        ])
+    }
+    .join(
+        ref_ld.clone().lazy(),
+        [col("SNP")],
+        [col("SNP")],
+        JoinArgs::new(JoinType::Inner),
+    )
+    .join(
+        w_ld.clone().lazy(),
+        [col("SNP")],
+        [col("SNP")],
+        JoinArgs::new(JoinType::Inner),
+    );
 
-    for (pair_idx, pair) in args.rg.windows(2).enumerate() {
-        let file1 = &pair[0];
-        let file2 = &pair[1];
+    let ss1_df = ss1.collect().context("loading primary sumstats")?;
+
+    for trait_idx in 1..n_traits {
+        let file2 = &args.rg[trait_idx];
         println!("Computing rg: {} vs {}", file1, file2);
-
         if !args.no_check_alleles {
-            ensure_sumstats_have_alleles(file1)?;
             ensure_sumstats_have_alleles(file2)?;
         }
-
-        // Load both sumstats and suffix their Z/N columns to avoid conflicts.
-        let ss1 = if args.no_check_alleles {
-            parse::scan_sumstats(file1)?.select([
-                col("SNP"),
-                col("Z").alias("Z1"),
-                col("N").alias("N1"),
-            ])
-        } else {
-            parse::scan_sumstats(file1)?.select([
-                col("SNP"),
-                col("A1").alias("A1_1"),
-                col("A2").alias("A2_1"),
-                col("Z").alias("Z1"),
-                col("N").alias("N1"),
-            ])
-        }
-        .join(
-            ref_ld.clone().lazy(),
-            [col("SNP")],
-            [col("SNP")],
-            JoinArgs::new(JoinType::Inner),
-        )
-        .join(
-            w_ld.clone().lazy(),
-            [col("SNP")],
-            [col("SNP")],
-            JoinArgs::new(JoinType::Inner),
-        );
 
         let ss2 = if args.no_check_alleles {
             parse::scan_sumstats(file2)?.select([
@@ -1460,15 +2154,10 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
             ])
         };
 
-        let merged = ss1
-            .join(
-                ss2,
-                [col("SNP")],
-                [col("SNP")],
-                JoinArgs::new(JoinType::Inner),
-            )
-            .collect()
+        let merge_start = Instant::now();
+        let merged = smart_merge_on_snp(ss1_df.clone(), ss2.collect()?)
             .with_context(|| format!("merging {} vs {}", file1, file2))?;
+        trace!("rg merge time: {:?}", merge_start.elapsed());
 
         let n_obs = merged.height();
         if n_obs == 0 {
@@ -1478,197 +2167,226 @@ pub fn run_rg(args: RgArgs) -> Result<()> {
 
         let z1_raw = extract_f64(&merged, "Z1")?;
         let z2_raw = extract_f64(&merged, "Z2")?;
-        let ref_l2_raw = extract_f64(&merged, "ref_l2")?.mapv(|l| l.max(0.0));
         let w_l2_raw = extract_f64(&merged, "w_l2")?.mapv(|l| l.max(0.0));
         let n1_raw = extract_f64(&merged, "N1")?;
         let n2_raw = extract_f64(&merged, "N2")?;
+        let ref_l2_raw_k: Vec<Array1<f64>> = ref_l2_cols
+            .iter()
+            .map(|name| extract_f64(&merged, name).map(|v| v.mapv(|l| l.max(0.0))))
+            .collect::<Result<Vec<_>>>()?;
 
-        let (z1_raw, z2_raw, ref_l2_raw, w_l2_raw, n1_raw, n2_raw) = if args.no_check_alleles {
-            (z1_raw, z2_raw, ref_l2_raw, w_l2_raw, n1_raw, n2_raw)
+        let (z1_raw, z2_raw, w_l2_raw, n1_raw, n2_raw, ref_l2_raw_k) = if args.no_check_alleles {
+            (z1_raw, z2_raw, w_l2_raw, n1_raw, n2_raw, ref_l2_raw_k)
         } else {
+            let align_start = Instant::now();
             let (mask, z2_aligned, n_removed) =
                 align_rg_alleles(&merged, &z2_raw).context("aligning alleles")?;
+            trace!(
+                "rg align time: {:?} (removed {})",
+                align_start.elapsed(),
+                n_removed
+            );
             if n_removed > 0 {
                 println!("  Removed {} SNPs with incompatible alleles", n_removed);
             }
-            (
-                filter_by_mask(&z1_raw, &mask),
-                Array1::from_vec(z2_aligned),
-                filter_by_mask(&ref_l2_raw, &mask),
-                filter_by_mask(&w_l2_raw, &mask),
-                filter_by_mask(&n1_raw, &mask),
-                filter_by_mask(&n2_raw, &mask),
-            )
+            let z1_f = filter_by_mask(&z1_raw, &mask);
+            let z2_f = Array1::from_vec(z2_aligned);
+            let w_f = filter_by_mask(&w_l2_raw, &mask);
+            let n1_f = filter_by_mask(&n1_raw, &mask);
+            let n2_f = filter_by_mask(&n2_raw, &mask);
+            let ref_f = ref_l2_raw_k
+                .iter()
+                .map(|v| filter_by_mask(v, &mask))
+                .collect::<Vec<_>>();
+            (z1_f, z2_f, w_f, n1_f, n2_f, ref_f)
         };
 
-        let prod_raw = &z1_raw * &z2_raw;
+        let mut finite_mask = vec![true; z1_raw.len()];
+        for i in 0..z1_raw.len() {
+            if !z1_raw[i].is_finite()
+                || !z2_raw[i].is_finite()
+                || !w_l2_raw[i].is_finite()
+                || !n1_raw[i].is_finite()
+                || !n2_raw[i].is_finite()
+            {
+                finite_mask[i] = false;
+                continue;
+            }
+            if ref_l2_raw_k.iter().any(|v| !v[i].is_finite()) {
+                finite_mask[i] = false;
+            }
+        }
+        if finite_mask.iter().any(|&v| !v) {
+            let removed = finite_mask.iter().filter(|&&v| !v).count();
+            println!("  Removed {} SNPs with non-finite values", removed);
+        }
+        let z1_raw = filter_by_mask(&z1_raw, &finite_mask);
+        let z2_raw = filter_by_mask(&z2_raw, &finite_mask);
+        let w_l2_raw = filter_by_mask(&w_l2_raw, &finite_mask);
+        let n1_raw = filter_by_mask(&n1_raw, &finite_mask);
+        let n2_raw = filter_by_mask(&n2_raw, &finite_mask);
+        let ref_l2_raw_k: Vec<Array1<f64>> = ref_l2_raw_k
+            .into_iter()
+            .map(|v| filter_by_mask(&v, &finite_mask))
+            .collect();
 
-        let (prod, ref_l2, w_l2, n1, n2) = if let Some(chisq_max) = args.chisq_max {
-            let mask: Vec<bool> = prod_raw.iter().map(|&p| p.abs() <= chisq_max).collect();
+        let prod_raw = &z1_raw * &z2_raw;
+        let (z1, z2, prod, w_l2, n1, n2, ref_l2_k) = if let Some(chisq_max) = args.chisq_max {
+            let mask: Vec<bool> = prod_raw.iter().map(|&p| p.abs() < chisq_max).collect();
             let n_removed = mask.iter().filter(|&&b| !b).count();
             if n_removed > 0 {
                 println!(
-                    "  Removed {} SNPs with |Z1*Z2| > {:.1}",
+                    "  Removed {} SNPs with |Z1*Z2| >= {:.1}",
                     n_removed, chisq_max
                 );
             }
             (
+                filter_by_mask(&z1_raw, &mask),
+                filter_by_mask(&z2_raw, &mask),
                 filter_by_mask(&prod_raw, &mask),
-                filter_by_mask(&ref_l2_raw, &mask),
                 filter_by_mask(&w_l2_raw, &mask),
                 filter_by_mask(&n1_raw, &mask),
                 filter_by_mask(&n2_raw, &mask),
+                ref_l2_raw_k
+                    .iter()
+                    .map(|v| filter_by_mask(v, &mask))
+                    .collect::<Vec<_>>(),
             )
         } else {
-            (prod_raw, ref_l2_raw, w_l2_raw, n1_raw, n2_raw)
+            (
+                z1_raw,
+                z2_raw,
+                prod_raw,
+                w_l2_raw,
+                n1_raw,
+                n2_raw,
+                ref_l2_raw_k,
+            )
         };
         let n_obs_filtered = prod.len();
+        if n_obs_filtered == 0 {
+            println!("  No SNPs remaining after filtering — skipping pair");
+            continue;
+        }
 
-        let m_snps = m_from_files.unwrap_or_else(|| {
-            println!(
-                "  No M files; using M = {} (regression SNPs)",
-                n_obs_filtered
-            );
-            n_obs_filtered as f64
-        });
-        let n1_mean = n1.mean().unwrap_or(1.0);
-        let n2_mean = n2.mean().unwrap_or(1.0);
+        let n_blocks = n_obs_filtered.min(args.n_blocks);
+        let m_vec = resolve_m_vec(
+            args.m_snps,
+            args.ref_ld_chr.as_deref(),
+            args.not_m_5_50,
+            n_obs_filtered,
+            k,
+            None,
+            None,
+        );
+        let n1_mean = mean(&n1);
+        let n2_mean = mean(&n2);
+        debug!(
+            "rg regression inputs: n_obs={} n_obs_filtered={} m_total={:.0} n1_mean={:.3} n2_mean={:.3}",
+            n_obs,
+            n_obs_filtered,
+            m_vec.iter().sum::<f64>(),
+            n1_mean,
+            n2_mean
+        );
+        trace_array_stats("rg_prod", &prod);
+        trace_array_stats("rg_w_l2", &w_l2);
+        trace_array_stats("rg_n1", &n1);
+        trace_array_stats("rg_n2", &n2);
+        trace_ref_l2_stats(&ref_l2_cols, &ref_l2_k);
 
-        // Per-trait liability-scale prevalences (one per file in --rg).
-        let samp_prev1 = args.samp_prev.get(pair_idx).copied();
-        let samp_prev2 = args.samp_prev.get(pair_idx + 1).copied();
-        let pop_prev1 = args.pop_prev.get(pair_idx).copied();
-        let pop_prev2 = args.pop_prev.get(pair_idx + 1).copied();
+        let samp_prev1 = args.samp_prev.first().copied();
+        let pop_prev1 = args.pop_prev.first().copied();
+        let samp_prev2 = args.samp_prev.get(trait_idx).copied();
+        let pop_prev2 = args.pop_prev.get(trait_idx).copied();
 
-        let (gencov, gencov_intercept) = if let Some(two_step_max) = args.two_step {
-            let mask1: Vec<bool> = prod.iter().map(|&p| p.abs() <= two_step_max).collect();
-            let n_s1 = mask1.iter().filter(|&&b| b).count();
-            println!(
-                "  Two-step: step 1 uses {} SNPs (|Z1*Z2| <= {})",
-                n_s1, two_step_max
-            );
+        let rg_reg_start = Instant::now();
+        let h2_int1 = intercept_h2[0];
+        let h2_int2 = intercept_h2[trait_idx];
+        let gencov_int = intercept_gencov[trait_idx];
 
-            let prod_s1 = filter_by_mask(&prod, &mask1);
-            let l2_s1 = filter_by_mask(&ref_l2, &mask1);
-            let wl2_s1 = filter_by_mask(&w_l2, &mask1);
-            let n1_s1 = filter_by_mask(&n1, &mask1);
-            let n2_s1 = filter_by_mask(&n2, &mask1);
-
-            let mut x_s1 = Array2::<f64>::zeros((n_s1, 2));
-            let mut w_s1 = Array1::<f64>::zeros(n_s1);
-            for i in 0..n_s1 {
-                x_s1[[i, 0]] = l2_s1[i];
-                x_s1[[i, 1]] = 1.0;
-                let v = (wl2_s1[i] / m_snps + 1.0 / n1_s1[i] + 1.0 / n2_s1[i]).max(1e-9);
-                w_s1[i] = 1.0 / (2.0 * v * v);
-            }
-            let res_s1 = jackknife::jackknife(&x_s1, &prod_s1, &w_s1, args.n_blocks, 2)
-                .with_context(|| format!("jackknife step 1 gencov {} vs {}", file1, file2))?;
-            let intercept_fixed = res_s1.est[1];
-            println!("  Two-step: step 1 intercept = {:.4}", intercept_fixed);
-
-            let prod2 = prod.mapv(|p| p - intercept_fixed);
-            let mut x2 = Array2::<f64>::zeros((n_obs_filtered, 1));
-            let mut w2 = Array1::<f64>::zeros(n_obs_filtered);
-            for i in 0..n_obs_filtered {
-                x2[[i, 0]] = ref_l2[i];
-                let v = (w_l2[i] / m_snps + 1.0 / n1[i] + 1.0 / n2[i]).max(1e-9);
-                w2[i] = 1.0 / (2.0 * v * v);
-            }
-            let res2 = jackknife::jackknife(&x2, &prod2, &w2, args.n_blocks, 2)
-                .with_context(|| format!("jackknife step 2 gencov {} vs {}", file1, file2))?;
-            (
-                res2.est[0] * m_snps / (n1_mean * n2_mean).sqrt(),
-                intercept_fixed,
-            )
-        } else {
-            let pair_intercept = args.intercept_gencov.get(pair_idx).copied();
-            let (y_reg, x_cov, fixed_intercept) = if let Some(fixed) = pair_intercept {
-                let y_adj = prod.mapv(|p| p - fixed);
-                let mut x = Array2::<f64>::zeros((n_obs_filtered, 1));
-                for i in 0..n_obs_filtered {
-                    x[[i, 0]] = ref_l2[i];
-                }
-                (y_adj, x, Some(fixed))
-            } else if args.no_intercept {
-                let mut x = Array2::<f64>::zeros((n_obs_filtered, 1));
-                for i in 0..n_obs_filtered {
-                    x[[i, 0]] = ref_l2[i];
-                }
-                (prod.clone(), x, Some(0.0f64))
-            } else {
-                let mut x = Array2::<f64>::zeros((n_obs_filtered, 2));
-                for i in 0..n_obs_filtered {
-                    x[[i, 0]] = ref_l2[i];
-                    x[[i, 1]] = 1.0;
-                }
-                (prod.clone(), x, None)
-            };
-            let mut w_cov: Array1<f64> = Array1::zeros(n_obs_filtered);
-            for i in 0..n_obs_filtered {
-                let v = (w_l2[i] / m_snps + 1.0 / n1[i] + 1.0 / n2[i]).max(1e-9);
-                w_cov[i] = 1.0 / (2.0 * v * v);
-            }
-            let res_cov = jackknife::jackknife(&x_cov, &y_reg, &w_cov, args.n_blocks, 2)
-                .with_context(|| format!("jackknife for gencov {} vs {}", file1, file2))?;
-            if args.print_cov || args.print_delete_vals {
-                print_jackknife_diagnostics(&res_cov, args.print_cov, args.print_delete_vals);
-            }
-            (
-                res_cov.est[0] * m_snps / (n1_mean * n2_mean).sqrt(),
-                fixed_intercept.unwrap_or_else(|| res_cov.est[1]),
-            )
-        };
-
-        let chi2_1 = extract_f64(&merged, "Z1")?.mapv(|z| (z * z).max(0.0));
-        let chi2_2 = extract_f64(&merged, "Z2")?.mapv(|z| (z * z).max(0.0));
-        let h2_int1 = intercept_h2
-            .map(|vals| vals[pair_idx])
-            .or(if args.no_intercept { Some(1.0) } else { None });
-        let h2_int2 = intercept_h2
-            .map(|vals| vals[pair_idx + 1])
-            .or(if args.no_intercept { Some(1.0) } else { None });
-        let h2_1 = run_h2_scalar(
-            &chi2_1,
-            &ref_l2_raw2(&merged)?,
-            &w_l2_raw2(&merged)?,
-            &n1_raw2(&merged)?,
-            m_snps,
-            args.n_blocks,
+        let hsq1 = run_hsq_ldsc(
+            &z1.mapv(|z| (z * z).max(0.0)),
+            &ref_l2_k,
+            &w_l2,
+            &n1,
+            &m_vec,
+            n_blocks,
+            two_step,
             h2_int1,
         )?;
-        let h2_2 = run_h2_scalar(
-            &chi2_2,
-            &ref_l2_raw2(&merged)?,
-            &w_l2_raw2(&merged)?,
-            &n2_raw2(&merged)?,
-            m_snps,
-            args.n_blocks,
+        let hsq2 = run_hsq_ldsc(
+            &z2.mapv(|z| (z * z).max(0.0)),
+            &ref_l2_k,
+            &w_l2,
+            &n2,
+            &m_vec,
+            n_blocks,
+            two_step,
             h2_int2,
         )?;
 
-        let rg = if h2_1 > 0.0 && h2_2 > 0.0 {
-            gencov / (h2_1 * h2_2).sqrt()
+        let gencov = run_gencov_ldsc(
+            &z1, &z2, &ref_l2_k, &w_l2, &n1, &n2, &m_vec, n_blocks, two_step, gencov_int, &hsq1,
+            &hsq2,
+        )?;
+
+        let (rg_ratio, rg_se) = if hsq1.tot > 0.0 && hsq2.tot > 0.0 {
+            let rg_ratio = gencov.tot / (hsq1.tot * hsq2.tot).sqrt();
+            let denom_delete: Vec<f64> = hsq1
+                .tot_delete_values
+                .iter()
+                .zip(hsq2.tot_delete_values.iter())
+                .map(|(&a, &b)| {
+                    let prod = a * b;
+                    if prod.is_finite() && prod >= 0.0 {
+                        prod.sqrt()
+                    } else {
+                        f64::NAN
+                    }
+                })
+                .collect();
+            let numer_delete =
+                Array2::from_shape_vec((n_blocks, 1), gencov.tot_delete_values.to_vec())
+                    .context("building rg numer delete values")?;
+            let denom_delete = Array2::from_shape_vec((n_blocks, 1), denom_delete)
+                .context("building rg denom delete values")?;
+            let est = Array1::from_vec(vec![rg_ratio]);
+            let (_cov, se) = ratio_jackknife(&est, &numer_delete, &denom_delete);
+            (rg_ratio, se[0])
         } else {
-            f64::NAN
+            (f64::NAN, f64::NAN)
         };
+        trace!("rg regression time: {:?}", rg_reg_start.elapsed());
 
         println!(
-            "  gencov = {:.4}  (intercept: {:.4})",
-            gencov, gencov_intercept
+            "  gencov = {:.4} ({:.4})  (intercept: {:.4} ± {:.4})",
+            gencov.tot, gencov.tot_se, gencov.intercept, gencov.intercept_se
         );
-        println!("  h2({}) = {:.4}", file1, h2_1);
-        println!("  h2({}) = {:.4}", file2, h2_2);
-        println!("  rg = {:.4}", rg);
+        println!(
+            "  h2({}) = {:.4} ({:.4})  (intercept: {:.4} ± {:.4})",
+            file1, hsq1.tot, hsq1.tot_se, hsq1.intercept, hsq1.intercept_se
+        );
+        println!(
+            "  h2({}) = {:.4} ({:.4})  (intercept: {:.4} ± {:.4})",
+            file2, hsq2.tot, hsq2.tot_se, hsq2.intercept, hsq2.intercept_se
+        );
+        if args.return_silly_things {
+            println!("  rg = {:.4} ({:.4})", rg_ratio, rg_se);
+        } else if rg_ratio.is_finite() && !(-1.2..=1.2).contains(&rg_ratio) {
+            println!("  rg = nan (nan) (rg out of bounds)");
+        } else {
+            println!("  rg = {:.4} ({:.4})", rg_ratio, rg_se);
+        }
 
         if let (Some(sp1), Some(pp1), Some(sp2), Some(pp2)) =
             (samp_prev1, pop_prev1, samp_prev2, pop_prev2)
         {
             let c1 = liability_conversion_factor(sp1, pp1);
             let c2 = liability_conversion_factor(sp2, pp2);
-            let h2_1_liab = h2_1 * c1;
-            let h2_2_liab = h2_2 * c2;
-            let gencov_liab = gencov * (c1 * c2).sqrt();
+            let h2_1_liab = hsq1.tot * c1;
+            let h2_2_liab = hsq2.tot * c2;
+            let gencov_liab = gencov.tot * (c1 * c2).sqrt();
             let rg_liab = if h2_1_liab > 0.0 && h2_2_liab > 0.0 {
                 gencov_liab / (h2_1_liab * h2_2_liab).sqrt()
             } else {
@@ -1715,57 +2433,6 @@ fn print_jackknife_diagnostics(
             println!("  Block {:3}: {}", k, row.join("  "));
         }
     }
-}
-
-fn ref_l2_raw2(merged: &DataFrame) -> Result<Array1<f64>> {
-    extract_f64(merged, "ref_l2").map(|v| v.mapv(|l| l.max(0.0)))
-}
-fn w_l2_raw2(merged: &DataFrame) -> Result<Array1<f64>> {
-    extract_f64(merged, "w_l2").map(|v| v.mapv(|l| l.max(0.0)))
-}
-fn n1_raw2(merged: &DataFrame) -> Result<Array1<f64>> {
-    extract_f64(merged, "N1")
-}
-fn n2_raw2(merged: &DataFrame) -> Result<Array1<f64>> {
-    extract_f64(merged, "N2")
-}
-
-fn run_h2_scalar(
-    chi2: &Array1<f64>,
-    ref_l2: &Array1<f64>,
-    w_l2: &Array1<f64>,
-    n_vec: &Array1<f64>,
-    m_snps: f64,
-    n_blocks: usize,
-    fixed_intercept: Option<f64>,
-) -> Result<f64> {
-    let n_obs = chi2.len();
-    let n_mean = n_vec.mean().unwrap_or(1.0);
-
-    let (y, x) = if let Some(fixed) = fixed_intercept {
-        let y_adj = chi2.mapv(|c| c - fixed);
-        let mut x = Array2::<f64>::zeros((n_obs, 1));
-        for i in 0..n_obs {
-            x[[i, 0]] = ref_l2[i];
-        }
-        (y_adj, x)
-    } else {
-        let mut x = Array2::<f64>::zeros((n_obs, 2));
-        for i in 0..n_obs {
-            x[[i, 0]] = ref_l2[i];
-            x[[i, 1]] = 1.0;
-        }
-        (chi2.clone(), x)
-    };
-
-    let mut weights: Array1<f64> = Array1::zeros(n_obs);
-    for i in 0..n_obs {
-        let v = (w_l2[i] / m_snps + 1.0 / n_vec[i]).max(1e-9);
-        weights[i] = 1.0 / (2.0 * v * v);
-    }
-
-    let result = jackknife::jackknife(&x, &y, &weights, n_blocks, 2)?;
-    Ok(result.est[0] * m_snps / n_mean)
 }
 
 // ---------------------------------------------------------------------------

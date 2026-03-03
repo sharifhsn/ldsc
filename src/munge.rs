@@ -1,7 +1,7 @@
 /// Summary statistics munging — Polars LazyFrame pipeline for streaming large files.
 use anyhow::{Context, Result};
 use polars::prelude::*;
-use statrs::distribution::{ContinuousCDF, Normal};
+use statrs::function::erf::erfc_inv;
 use std::fs::File;
 use std::io::BufWriter;
 
@@ -104,6 +104,7 @@ pub fn run(args: MungeArgs) -> Result<()> {
     let lf = normalize_columns(lf)?;
     let lf = apply_info_list(lf, args.info_list.as_deref())?;
     let lf = apply_n_override(lf, &args)?;
+    let lf = filter_pvals(lf)?;
     let lf = derive_z(lf, args.signed_sumstats.as_deref(), args.a1_inc)?;
     let lf = filter_snps(lf, args.maf, args.n_min, args.info_min, args.no_alleles)?;
     let lf = apply_nstudy_filter(lf, args.nstudy.as_deref(), args.nstudy_min)?;
@@ -115,7 +116,7 @@ pub fn run(args: MungeArgs) -> Result<()> {
     };
 
     // Drop rows with missing required values (aligns with Python's dropna).
-    let lf = drop_missing_required(lf, args.no_alleles)?;
+    let lf = drop_missing_required(lf)?;
 
     // Select output columns: --no-alleles omits A1/A2; --keep-maf includes FRQ.
     let lf = {
@@ -408,28 +409,19 @@ fn derive_z(lf: LazyFrame, signed_sumstats: Option<&str>, a1_inc: bool) -> Resul
     let cols = header.get_column_names();
     let has = |n: &str| cols.iter().any(|c| *c == n);
 
-    if has("Z") {
-        return Ok(lf);
-    }
-
-    // BETA / SE → Z = BETA / SE (lazy expression, no collect needed).
-    if has("BETA") && has("SE") {
-        return Ok(lf.with_column((col("BETA") / col("SE")).alias("Z")));
-    }
-
-    // --a1-inc: A1 always increases → Z = +|Φ⁻¹(1 − P/2)|.
-    if a1_inc && has("P") {
-        let mut df = lf
-            .collect()
-            .context("collecting for P→Z (a1-inc) conversion")?;
-        let z_col = p_always_positive(&df).context("P→Z conversion with --a1-inc")?;
-        df.with_column(z_col.into())
-            .context("adding Z column (a1-inc)")?;
-        return Ok(df.lazy());
-    }
-
-    // P-value + signed column → materialise and compute Z.
+    // If P is present, match Python: always compute Z from P (signed if possible).
     if has("P") {
+        // --a1-inc: A1 always increases → Z = +|Φ⁻¹(1 − P/2)|.
+        if a1_inc {
+            let mut df = lf
+                .collect()
+                .context("collecting for P→Z (a1-inc) conversion")?;
+            let z_col = p_always_positive(&df).context("P→Z conversion with --a1-inc")?;
+            df.with_column(z_col.into())
+                .context("adding Z column (a1-inc)")?;
+            return Ok(df.lazy());
+        }
+
         let sign_info: Option<(String, f64)> = if let Some(ss) = signed_sumstats {
             // --signed-sumstats COLNAME,null_value
             let parts: Vec<&str> = ss.splitn(2, ',').collect();
@@ -468,12 +460,31 @@ fn derive_z(lf: LazyFrame, signed_sumstats: Option<&str>, a1_inc: bool) -> Resul
         }
     }
 
+    if has("Z") {
+        return Ok(lf);
+    }
+
+    // BETA / SE → Z = BETA / SE (lazy expression, no collect needed).
+    if has("BETA") && has("SE") {
+        return Ok(lf.with_column((col("BETA") / col("SE")).alias("Z")));
+    }
+
+    // --a1-inc: A1 always increases → Z = +|Φ⁻¹(1 − P/2)|.
+    if a1_inc && has("P") {
+        let mut df = lf
+            .collect()
+            .context("collecting for P→Z (a1-inc) conversion")?;
+        let z_col = p_always_positive(&df).context("P→Z conversion with --a1-inc")?;
+        df.with_column(z_col.into())
+            .context("adding Z column (a1-inc)")?;
+        return Ok(df.lazy());
+    }
+
     Ok(lf)
 }
 
 /// Compute Z = +|Φ⁻¹(1 − P/2)| for each row (--a1-inc: sign always positive).
 fn p_always_positive(df: &DataFrame) -> Result<Series> {
-    let normal = Normal::new(0.0, 1.0).expect("Normal(0,1)");
     let p_series = df.column("P")?.cast(&DataType::Float64)?;
     let p_ca = p_series.f64().context("P column as f64")?;
     let z_vals: Vec<Option<f64>> = p_ca
@@ -483,8 +494,8 @@ fn p_always_positive(df: &DataFrame) -> Result<Series> {
             if !p.is_finite() || p <= 0.0 || p > 1.0 {
                 return None;
             }
-            let p_clip = p.clamp(1e-300, 1.0 - 1e-15);
-            Some(normal.inverse_cdf(1.0 - p_clip / 2.0))
+            let p_clip = p.clamp(1e-300, 1.0);
+            Some((2.0f64).sqrt() * erfc_inv(p_clip))
         })
         .collect();
     Ok(Series::new("Z".into(), z_vals))
@@ -496,8 +507,6 @@ fn p_always_positive(df: &DataFrame) -> Result<Series> {
 ///   • 0.0 for BETA, LOG_ODDS, Z  →  sign = sign(value)
 ///   • 1.0 for OR                 →  sign = sign(OR − 1)
 fn p_and_sign_to_z(df: &DataFrame, sign_col: &str, null_val: f64) -> Result<Series> {
-    let normal = Normal::new(0.0, 1.0).expect("Normal(0,1)");
-
     let p_series = df.column("P")?.cast(&DataType::Float64)?;
     let p_ca = p_series.f64().context("P column as f64")?;
 
@@ -515,8 +524,8 @@ fn p_and_sign_to_z(df: &DataFrame, sign_col: &str, null_val: f64) -> Result<Seri
             if !p.is_finite() || p <= 0.0 || p > 1.0 {
                 return None;
             }
-            let p_clip = p.clamp(1e-300, 1.0 - 1e-15);
-            let abs_z = normal.inverse_cdf(1.0 - p_clip / 2.0);
+            let p_clip = p.clamp(1e-300, 1.0);
+            let abs_z = (2.0f64).sqrt() * erfc_inv(p_clip);
             // sign = sign(s - null_val)
             let signed = s - null_val;
             let sign = if signed > 0.0 {
@@ -564,18 +573,19 @@ fn filter_snps(
         lf = lf.filter(col("N").cast(DataType::Float64).gt_eq(lit(n_min)));
     }
 
-    // Filter by MAF: keep FRQ in [maf, 1−maf].
-    if maf > 0.0 && has("FRQ") {
-        lf = lf.filter(
-            col("FRQ")
-                .cast(DataType::Float64)
-                .gt_eq(lit(maf))
-                .and(col("FRQ").cast(DataType::Float64).lt_eq(lit(1.0 - maf))),
-        );
+    // Filter by MAF: remove out-of-bounds FRQ and keep MAF > maf.
+    if has("FRQ") {
+        let frq = col("FRQ").cast(DataType::Float64);
+        let bad = frq.clone().lt(lit(0.0)).or(frq.clone().gt(lit(1.0)));
+        let maf_expr = when(frq.clone().lt(lit(0.5)))
+            .then(frq.clone())
+            .otherwise(lit(1.0) - frq.clone());
+        let pred = bad.not().and(maf_expr.gt(lit(maf)));
+        lf = lf.filter(pred);
     }
 
-    // Filter by INFO score.
-    if info_min > 0.0 && has("INFO") {
+    // Filter by INFO score (applies even if info_min == 0).
+    if has("INFO") {
         lf = lf.filter(col("INFO").cast(DataType::Float64).gt_eq(lit(info_min)));
     }
 
@@ -635,17 +645,37 @@ fn compute_default_n_min(lf: &LazyFrame) -> Result<Option<f64>> {
     Ok(Some(p90 / 1.5))
 }
 
-fn drop_missing_required(lf: LazyFrame, no_alleles: bool) -> Result<LazyFrame> {
-    let mut predicate = col("SNP")
-        .is_not_null()
-        .and(col("Z").is_not_null())
-        .and(col("N").is_not_null());
-    if !no_alleles {
-        predicate = predicate
-            .and(col("A1").is_not_null())
-            .and(col("A2").is_not_null());
+fn drop_missing_required(lf: LazyFrame) -> Result<LazyFrame> {
+    let header = lf.clone().limit(0).collect()?;
+    let schema = header.schema();
+    let mut predicate = lit(true);
+    for field in schema.iter_fields() {
+        let name = field.name().as_str();
+        if name == "INFO" {
+            continue;
+        }
+        let mut expr = col(name).is_not_null();
+        if matches!(field.dtype(), DataType::Float32 | DataType::Float64) {
+            expr = expr.and(col(name).is_nan().not());
+        }
+        predicate = predicate.and(expr);
     }
     Ok(lf.filter(predicate))
+}
+
+fn filter_pvals(lf: LazyFrame) -> Result<LazyFrame> {
+    let header = lf.clone().limit(0).collect()?;
+    let cols = header.get_column_names();
+    let has_p = cols.iter().any(|c| *c == "P");
+    if !has_p {
+        return Ok(lf);
+    }
+    Ok(lf.filter(
+        col("P")
+            .cast(DataType::Float64)
+            .gt(lit(0.0))
+            .and(col("P").cast(DataType::Float64).lt_eq(lit(1.0))),
+    ))
 }
 
 fn complement_expr(col_name: &str) -> Expr {
@@ -811,6 +841,8 @@ fn write_sumstats_gz(path: &str, df: &mut DataFrame) -> Result<()> {
     let gz = GzEncoder::new(BufWriter::new(file), Compression::fast());
     CsvWriter::new(gz)
         .with_separator(b'\t')
+        .with_float_scientific(Some(false))
+        .with_float_precision(Some(3))
         .finish(df)
         .with_context(|| format!("writing '{}'", path))?;
     Ok(())

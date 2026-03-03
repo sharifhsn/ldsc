@@ -24,6 +24,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub polars_threads: Option<usize>,
 
+    /// Logging level for Rust tracing (error, warn, info, debug, trace).
+    #[arg(long, default_value = "warn", global = true)]
+    pub log_level: String,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -32,8 +36,9 @@ pub struct Cli {
 pub enum Command {
     /// Pre-process GWAS summary statistics (replaces munge_sumstats.py)
     MungeSumstats(MungeArgs),
-    /// Compute LD scores from PLINK binary files (replaces --l2 in ldsc.py)
-    Ldscore(LdscoreArgs),
+    /// Compute LD scores from PLINK binary files (matches Python --l2)
+    #[command(name = "l2")]
+    L2(L2Args),
     /// Estimate SNP heritability (replaces --h2 in ldsc.py)
     H2(H2Args),
     /// Estimate genetic correlation (replaces --rg in ldsc.py)
@@ -180,11 +185,11 @@ pub struct MungeArgs {
 }
 
 // ---------------------------------------------------------------------------
-// ldscore (--l2)
+// l2 (--l2)
 // ---------------------------------------------------------------------------
 
 #[derive(Args)]
-pub struct LdscoreArgs {
+pub struct L2Args {
     /// PLINK binary file prefix
     #[arg(long)]
     pub bfile: String,
@@ -194,8 +199,8 @@ pub struct LdscoreArgs {
     pub out: String,
 
     /// LD window in cM (default 1.0; mutually exclusive with --ld-wind-kb / --ld-wind-snps)
-    #[arg(long, default_value_t = 1.0)]
-    pub ld_wind_cm: f64,
+    #[arg(long)]
+    pub ld_wind_cm: Option<f64>,
 
     /// LD window in kilobases (overrides --ld-wind-cm when set)
     #[arg(long)]
@@ -211,6 +216,19 @@ pub struct LdscoreArgs {
     #[arg(long)]
     pub annot: Option<String>,
 
+    /// Compute partitioned LD scores by binning continuous annotations (Python --cts-bin).
+    /// Provide a single file or a comma-separated list of files.
+    #[arg(long)]
+    pub cts_bin: Option<String>,
+
+    /// Breakpoints for --cts-bin (comma-separated, use 'x' to separate files).
+    #[arg(long)]
+    pub cts_breaks: Option<String>,
+
+    /// Names for --cts-bin variables (comma-separated).
+    #[arg(long)]
+    pub cts_names: Option<String>,
+
     /// The annot file contains only annotation columns (no CHR/SNP/BP/CM columns).
     /// Use when working with "thin" annotation files.
     #[arg(long, default_value_t = false)]
@@ -223,13 +241,13 @@ pub struct LdscoreArgs {
 
     /// Exclude SNPs with minor allele frequency below FLOAT from LD computation.
     /// Applied after --extract; MAF is computed from the genotype data.
-    /// Default behavior applies the filter to output only (see --maf-pre).
+    /// Default behavior applies the filter before LD computation (Python parity).
     #[arg(long)]
     pub maf: Option<f64>,
 
     /// Apply --maf before LD computation (Python behavior). Slower but identical to Python.
-    /// Default: post-filter output only (faster).
-    #[arg(long, default_value_t = false)]
+    /// Default: enabled.
+    #[arg(long, default_value_t = true)]
     pub maf_pre: bool,
 
     /// File containing SNP IDs (one per line) to print LD scores for.
@@ -252,7 +270,7 @@ pub struct LdscoreArgs {
     #[arg(long)]
     pub pq_exp: Option<f64>,
 
-    /// No-op (accepted for Python CLI parity): Rust does not emit annot matrices in ldscore.
+    /// Do not write the annot matrix produced by --cts-bin.
     #[arg(long, default_value_t = false)]
     pub no_print_annot: bool,
 
