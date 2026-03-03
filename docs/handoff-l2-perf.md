@@ -7,6 +7,14 @@
 - Aggressively optimize `l2` while **preserving exact parity**.
 - Parity check rule: **full 1000G run** and **SHA256 match** against baseline outputs.
 
+## Perf Directory Minimal Keep List (enforced)
+Only keep the following files:
+- `/Users/sharif/Code/ldsc/perf/l2/rust_l2_full_f64_trace.sha256`
+- `/Users/sharif/Code/ldsc/perf/l2/rust_l2_full_f64_trace.stdout`
+- `/Users/sharif/Code/ldsc/perf/l2/rust_l2_full_f64_trace.stderr`
+
+All other `perf/` subdirectories and files are removed.
+
 ## Baseline (f64-only, parity-correct)
 
 **Baseline outputs (hash manifest)**
@@ -89,6 +97,33 @@ cd /Users/sharif/Code/ldsc/perf/l2
 shasum -a 256 -c rust_l2_full_f64_trace.sha256
 ```
 4. Record any new changes and timings in `/Users/sharif/Code/ldsc/docs/perf-log.md`.
+
+## Adversarial Workflow (Parity-Safe Perf Iteration)
+Use this every time you change performance-sensitive code:
+
+1. **Start clean**: ensure only the minimal keep list exists under `perf/`.
+   - `ls /Users/sharif/Code/ldsc/perf/l2` should show exactly the three keep files.
+2. **Run full 1000G trace** (Rust only, no Python):
+```
+/usr/bin/time -p env RUST_LOG=ldsc=trace ldsc l2 \
+  --bfile /Users/sharif/Code/ldsc/data/1000G.EUR.QC \
+  --out /Users/sharif/Code/ldsc/perf/l2/rust_l2_full_f64_trace \
+  --ld-wind-cm 1 \
+  > /Users/sharif/Code/ldsc/perf/l2/rust_l2_full_f64_trace.stdout \
+  2> /Users/sharif/Code/ldsc/perf/l2/rust_l2_full_f64_trace.stderr
+```
+3. **Parity check**: compare outputs against the baseline hash manifest.
+```
+cd /Users/sharif/Code/ldsc/perf/l2
+shasum -a 256 -c rust_l2_full_f64_trace.sha256
+```
+   - If any file mismatches: treat as parity regression, revert or investigate before proceeding.
+4. **Update perf log**: record new timing breakdowns and wall time in
+   `/Users/sharif/Code/ldsc/docs/perf-log.md`.
+
+Notes:
+- The hash manifest is the source of truth for parity (not decimal rounding).
+- If you need to regenerate the manifest (rare), do it once and document why.
 
 ## Known Hotspots
 - `ab_dot` remains dominant (~90–94s).
