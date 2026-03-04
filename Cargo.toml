@@ -41,7 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 flate2 = "1"
 
 # Bzip2 decompression for .bz2 inputs
-bzip2-rs = "0.1.2"
+bzip2-rs = "0.1"
 
 # Temp files for on-the-fly .bz2 decompression
 tempfile = "3"
