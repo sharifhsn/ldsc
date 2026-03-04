@@ -53,8 +53,7 @@ pub fn irwls(x: &MatF, y: &ColF, weights: &mut ColF, n_iter: usize) -> Result<Ir
         // Solve weighted OLS via SVD.
         let svd =
             Svd::new(xw.as_ref()).map_err(|err| anyhow::anyhow!("svd for irwls: {:?}", err))?;
-        let mut rhs = yw.clone();
-        svd.solve_lstsq_in_place(rhs.as_mut());
+        let rhs = svd.solve_lstsq(yw.as_ref());
         est = rhs;
 
         // Update weights: w[i] = 1 / fitted[i]².

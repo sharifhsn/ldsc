@@ -40,20 +40,22 @@ pub fn jackknife(
         .map(|k| {
             let lo = k * block_size;
             let hi = ((k + 1) * block_size).min(n);
-            let keep = n - (hi - lo);
+            let mut keep_rows = Vec::with_capacity(n);
+            for i in 0..n {
+                if i < lo || i >= hi {
+                    keep_rows.push(i);
+                }
+            }
+            let keep = keep_rows.len();
             let mut x_jack = MatF::zeros(keep, p);
             let mut y_jack = col_zeros(keep);
             let mut w_jack = col_zeros(keep);
-            let mut row = 0usize;
-            for i in 0..n {
-                if i < lo || i >= hi {
-                    for j in 0..p {
-                        x_jack[(row, j)] = x[(i, j)];
-                    }
-                    y_jack[(row, 0)] = y[(i, 0)];
-                    w_jack[(row, 0)] = weights[(i, 0)];
-                    row += 1;
+            for (row, &i) in keep_rows.iter().enumerate() {
+                for j in 0..p {
+                    x_jack[(row, j)] = x[(i, j)];
                 }
+                y_jack[(row, 0)] = y[(i, 0)];
+                w_jack[(row, 0)] = weights[(i, 0)];
             }
 
             irwls(&x_jack, &y_jack, &mut w_jack, n_iter)
