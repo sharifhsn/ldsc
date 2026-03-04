@@ -221,13 +221,34 @@ ldsc cts-annot \
 
 ## Installation Details
 
-Native builds require Rust ≥ 1.85. The Rust implementation uses `faer` for dense linear algebra,
-so there is no external BLAS/LAPACK dependency to install.
+Native builds require Rust ≥ 1.85. The Rust implementation uses `faer` for dense linear algebra.
+
+### Optional fast-f32 build (experimental)
+
+The `fast-f32` feature compiles `l2` to run core matmuls in `f32` while accumulating
+in `f64`. This can be faster but **is not parity-safe** compared to the default `f64`
+path.
+
+Observed differences on full 1000G (Phase 3, `--ld-wind-kb 1000`, `--chunk-size 200`):
+- Speedup: ~1.44x (f32 vs f64)
+- Output deltas: `mean_abs_diff=3.03e-4`, `rmse=5.79e-4`, `max_abs_diff=0.008`,
+  `max_rel_diff=6.51e-4` (relative to f64)
+
+Build:
+
+```bash
+cargo build --release --features fast-f32
+```
+
+Default build (parity-safe f64):
+
+```bash
+cargo build --release
+```
 
 ### Prebuilt Binaries
 
 Releases include Linux, macOS, and Windows archives that contain `ldsc`, `LICENSE`, and `README.md`.
-There are no external BLAS runtime dependencies.
 
 ```bash
 # Linux (x86_64)
@@ -569,4 +590,4 @@ docker build -t ldsc .
 
 The multi-stage `Dockerfile` uses [cargo-chef](https://github.com/LukeMathWalker/cargo-chef) to
 cache dependency compilation in a separate layer, so incremental rebuilds only recompile changed
-source files. The runtime image is `debian:bookworm-slim` with no external BLAS runtime dependency.
+source files.

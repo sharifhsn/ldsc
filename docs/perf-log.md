@@ -275,6 +275,28 @@ how changes affect runtime.
   `ab_wrap_copy=1.755s`, `ab_contig_matmul=21.899s`, `ab_wrap_matmul=3.790s`.
 - Wall time: `real 62.550s` (from `/home/sharif/Code/ldsc/perf/full_l2_trace/rust_l2_trace_kb1000_chunk200_align_mafpre.time`).
 
+## 2026-03-04 (bed reader streaming + faer branch, full 1000G)
+- Change: new internal streaming BED reader (no mmap), strict header/length validation, contiguous block reads, negative indices.
+- Dataset: 1000G_phase3_common_norel (full dataset), ring aligned, `--chunk-size 200`, `--ld-wind-kb 1000`.
+- Command: `RUST_LOG=ldsc=trace ldsc l2 --bfile /home/sharif/Code/ldsc/data/1000G_phase3_common_norel --out /home/sharif/Code/ldsc/perf/full_l2_trace/rust_l2_full_kb1000_chunk200_align_bedstream --ld-wind-kb 1000 --chunk-size 200 --yes-really`
+- Trace output: `/home/sharif/Code/ldsc/perf/full_l2_trace/rust_l2_full_kb1000_chunk200_align_bedstream.stdout`
+- Timing (from trace): `maf_prefilter=0.607s`, `compute_ldscore=57.748s` with
+  `bed_read=5.166s`, `norm=9.526s`, `bb_dot=9.324s`, `ab_dot=25.232s`, `r2u_ab=4.306s`,
+  `ab_wrap_copy=1.684s`, `ab_contig_matmul=21.502s`, `ab_wrap_matmul=3.731s`.
+- Wall time: `real 61.597s` (from `/home/sharif/Code/ldsc/perf/full_l2_trace/rust_l2_trace_kb1000_chunk200_align_bedstream.time`).
+- Comparison vs prior full trace (maf prefilter fast path): slightly lower `bed_read` and `compute_ldscore` (~1–2%); likely small but real. More runs needed to reduce noise.
+
+## 2026-03-04 (faer nightly SIMD flag, full 1000G)
+- Change: enabled `faer` feature `nightly` (SIMD-enabled kernels).
+- Dataset: 1000G_phase3_common_norel (full dataset), ring aligned, `--chunk-size 200`, `--ld-wind-kb 1000`.
+- Command: `RUST_LOG=ldsc=trace ldsc l2 --bfile /home/sharif/Code/ldsc/data/1000G_phase3_common_norel --out /home/sharif/Code/ldsc/perf/full_l2_trace/rust_l2_full_kb1000_chunk200_align_faer_nightly --ld-wind-kb 1000 --chunk-size 200 --yes-really`
+- Trace output: `/home/sharif/Code/ldsc/perf/full_l2_trace/rust_l2_full_kb1000_chunk200_align_faer_nightly.stdout`
+- Timing (from trace): `maf_prefilter=2.586s`, `compute_ldscore=64.307s` with
+  `bed_read=9.167s`, `norm=10.314s`, `bb_dot=9.663s`, `ab_dot=26.506s`, `r2u_ab=4.456s`,
+  `ab_wrap_copy=1.643s`, `ab_contig_matmul=22.618s`, `ab_wrap_matmul=3.888s`.
+- Wall time: `real 70.212s` (from `/home/sharif/Code/ldsc/perf/full_l2_trace/rust_l2_trace_kb1000_chunk200_align_faer_nightly.time`).
+- Observation: regression vs non-nightly build (slower `bed_read` and `compute_ldscore`); likely due to different codegen/CPU feature usage. Consider reverting `faer` nightly unless further investigation shows a config issue.
+
 ## 2026-03-04 (parity + perf checkpoint, 200k extract)
 - Dataset: 1000G_phase3_common_norel (extract 200k SNPs), `--ld-wind-kb 1000`, `--chunk-size 200`.
 - Python command: `uv run --project /home/sharif/Code/ldsc/ldsc_py --with bitarray==2 python /home/sharif/Code/ldsc/ldsc_py/ldsc.py --l2 --bfile /home/sharif/Code/ldsc/data/1000G_phase3_common_norel --out /home/sharif/Code/ldsc/perf/parity_l2_200k/py_l2 --ld-wind-kb 1000 --chunk-size 200 --extract /home/sharif/Code/ldsc/perf/parity_l2_200k/extract.snps --yes-really --log-level warn`
@@ -294,3 +316,38 @@ how changes affect runtime.
   - `kb=500`: Python `48.429s`, Rust `6.213s` → `7.79x`
   - `kb=1000`: Python `53.719s`, Rust `8.614s` → `6.24x`
   - `kb=2000`: Python `61.834s`, Rust `12.884s` → `4.80x`
+
+## 2026-03-04 (Rust scaling sweep, full 1000G)
+- Dataset: 1000G_phase3_common_norel (full dataset), `--ld-wind-kb 1000`, `--chunk-size 200`.
+- Command template: `RUST_LOG=ldsc=trace ldsc l2 --rayon-threads {N} --bfile /home/sharif/Code/ldsc/data/1000G_phase3_common_norel --out /home/sharif/Code/ldsc/perf/scale_full_trace/rust_full_t{N} --ld-wind-kb 1000 --chunk-size 200 --yes-really`
+- Summary CSV: `/home/sharif/Code/ldsc/perf/scale_full_trace/summary.csv`
+- `compute_ldscore` scaling (single-run):
+  - `N=1`: `158.143s` (baseline)
+  - `N=2`: `96.186s` (1.64x)
+  - `N=3`: `75.388s` (2.10x)
+  - `N=4`: `65.987s` (2.40x)
+  - `N=6`: `56.762s` (2.79x)
+  - `N=8`: `60.007s` (2.64x)
+  - `N=10`: `64.073s` (2.47x)
+  - `N=12`: `70.682s` (2.24x)
+- Observation: scaling improves to ~6 threads then saturates/declines; likely memory bandwidth + overhead ceiling on this machine. Keep Rayon defaults for now.
+
+## 2026-03-04 (fast-f32 feature, 200k extract)
+- Change: compile-time `fast-f32` feature to run `l2` core matmuls in f32 while accumulating in f64.
+- Dataset: 1000G_phase3_common_norel (extract 200k SNPs), `--ld-wind-kb 1000`, `--chunk-size 200`.
+- Command (f64): `ldsc l2 --bfile /home/sharif/Code/ldsc/data/1000G_phase3_common_norel --out /home/sharif/Code/ldsc/perf/fast_f32_200k/rust_l2_f64 --ld-wind-kb 1000 --chunk-size 200 --extract /home/sharif/Code/ldsc/perf/parity_l2_200k/extract.snps --yes-really`
+- Command (f32): `cargo build --release --features fast-f32` then `ldsc l2 --bfile /home/sharif/Code/ldsc/data/1000G_phase3_common_norel --out /home/sharif/Code/ldsc/perf/fast_f32_200k/rust_l2_f32 --ld-wind-kb 1000 --chunk-size 200 --extract /home/sharif/Code/ldsc/perf/parity_l2_200k/extract.snps --yes-really`
+- Timing: f64 `real 8.428s`, f32 `real 6.054s` → `1.39x` speedup.
+- Note: f32 path is **not parity‑safe**; use for performance experiments only.
+
+## 2026-03-04 (fast-f32 feature, full 1000G)
+- Change: compile-time `fast-f32` feature to run `l2` core matmuls in f32 while accumulating in f64.
+- Dataset: 1000G_phase3_common_norel (full dataset), `--ld-wind-kb 1000`, `--chunk-size 200`.
+- Command (f64): `ldsc l2 --bfile /home/sharif/Code/ldsc/data/1000G_phase3_common_norel --out /home/sharif/Code/ldsc/perf/fast_f32_full/rust_l2_f64 --ld-wind-kb 1000 --chunk-size 200 --yes-really`
+- Command (f32): `cargo build --release --features fast-f32` then `ldsc l2 --bfile /home/sharif/Code/ldsc/data/1000G_phase3_common_norel --out /home/sharif/Code/ldsc/perf/fast_f32_full/rust_l2_f32 --ld-wind-kb 1000 --chunk-size 200 --yes-really`
+- Timing: f64 `real 68.468s`, f32 `real 47.502s` → `1.44x` speedup.
+- Output diff (all 22 chr files, 1,664,852 values):
+  - `mean_abs_diff=0.000303151`, `rmse=0.00057935`
+  - `max_abs_diff=0.008`
+  - `max_rel_diff=0.000651466` (relative to f64, excluding zero refs)
+- Note: f32 path is **not parity‑safe**; use for performance experiments only.
