@@ -115,8 +115,7 @@ ldsc l2 \
   [--maf 0.01] \
   [--keep keep_individuals.txt] \
   [--per-allele] \
-  [--pq-exp 1.0] \
-  [--blas-threads 4]
+  [--pq-exp 1.0]
 ```
 
 `ldsc l2` warns if the LD window spans an entire chromosome; use `--yes-really` to silence.
@@ -222,22 +221,13 @@ ldsc cts-annot \
 
 ## Installation Details
 
-Native builds require Rust ≥ 1.85. By default the crate links against the **system OpenBLAS**
-via `pkg-config`, so you need the OpenBLAS development package installed. If you opt into the
-static OpenBLAS feature, you’ll need a C/Fortran toolchain to build from source.
-
-On Debian/Ubuntu (default system build):
-
-```bash
-sudo apt-get install libopenblas-dev pkg-config
-```
+Native builds require Rust ≥ 1.85. The Rust implementation uses `faer` for dense linear algebra,
+so there is no external BLAS/LAPACK dependency to install.
 
 ### Prebuilt Binaries
 
 Releases include Linux, macOS, and Windows archives that contain `ldsc`, `LICENSE`, and `README.md`.
-Linux/macOS binaries are built against **system OpenBLAS** (dynamic), so you may need to install
-OpenBLAS on the target machine (or use Docker for a self-contained run). The Windows zip bundles
-the required OpenBLAS/Clapack DLLs alongside `ldsc.exe`.
+There are no external BLAS runtime dependencies.
 
 ```bash
 # Linux (x86_64)
@@ -280,8 +270,7 @@ tag and a short-SHA tag (`:sha-XXXXXXX`).
 
 ### Building from source
 
-Requires a Rust toolchain (≥ 1.85; edition 2024 features used). By default OpenBLAS is linked
-dynamically via the system package; install OpenBLAS before building (see above).
+Requires a Rust toolchain (≥ 1.85; edition 2024 features used).
 
 ```bash
 cargo build --release
@@ -290,39 +279,13 @@ cargo build --release
 
 The release profile sets `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`.
 
-### BLAS configuration
-
-By default this crate uses the **system OpenBLAS** (`blas-openblas-system`) and links it
-dynamically via `pkg-config`. For a self-contained binary, enable the static feature instead:
-
-```bash
-# Debian/Ubuntu static OpenBLAS
-sudo apt-get install cmake gfortran libgfortran-dev
-cargo build --release --no-default-features --features blas-openblas-static
-```
-
-The static feature builds OpenBLAS from source and links it into the binary.
-Keep the default system build if you prefer dynamic linking.
-
-Windows (MSVC) users can use vcpkg for the system build:
-
-```powershell
-vcpkg install openblas clapack
-setx VCPKGRS_DYNAMIC 1
-setx VCPKGRS_TRIPLET x64-windows
-cargo build --release --no-default-features --features blas-openblas-system
-```
-
 ### Runtime tuning (optional)
 
 The following global flags are available for performance tuning but are **not
 heavily battle-tested**. Use them only when needed:
 
-- `--blas-threads N`: OpenBLAS thread count (default 4; affects all subcommands).
 - `--rayon-threads N`: Rayon thread count for jackknife in `h2`/`rg`.
 - `--polars-threads N`: Polars thread count for CSV streaming in `munge-sumstats`.
-
-`ldsc --version` prints the compiled BLAS backend (e.g., `openblas-system`).
 
 ---
 
@@ -434,12 +397,12 @@ The original Python implementation is bottlenecked by three independent factors:
 #### 1. Ring-buffer genotype store (`l2.rs`)
 
 Python allocates a new `rfuncA` matrix every chunk. Rust pre-allocates a single F-order
-`Array2<f64>` of shape `(n_indiv, ring_size)` where `ring_size = max_window + chunk_c`. SNP columns
+`MatF` of shape `(n_indiv, ring_size)` where `ring_size = max_window + chunk_c`. SNP columns
 are written into successive ring slots modulo `ring_size`; evicted slots are reused. This eliminates
 ~33,000 heap allocations for a 1M-SNP genome and improves cache locality because each active column
 occupies a contiguous 8-byte stride in memory.
 
-#### 2. Single DGEMM per chunk
+#### 2. Single matmul per chunk
 
 For each chunk of B SNPs the computation is:
 
@@ -448,17 +411,14 @@ BB = Bᵀ · B          (chunk × chunk, unbiased r²)
 AB = Aᵀ · B          (window × chunk, unbiased r²)
 ```
 
-Both are single `ndarray::dot` calls dispatched to OpenBLAS DGEMM. The window matrix `A` is
-assembled from ring slots into a pre-allocated F-order `a_buf` so columns are contiguous in memory
-and the DGEMM kernel can stride through them without gather operations.
+Both are single `faer` matmul calls. The window matrix `A` is assembled from ring slots into a
+pre-allocated column-major `a_buf` so columns are contiguous in memory and the matmul kernel can
+stride through them without gather operations.
 
-#### 3. Tuned BLAS thread count
+#### 3. Threading control
 
-OpenBLAS defaults to using all available cores, which creates thread-spawning overhead that
-outweighs the parallelism benefit for the small matrices in 1000G-scale LD computation
-(n ≈ 2,500, window ≈ 200). The Rust binary calls `openblas_set_num_threads(4)` at startup
-(overridable with `--blas-threads`). This is optimal for 1000G; biobank data (n > 10,000) may
-benefit from higher values.
+Small matrix multiplications benefit from fewer threads; the `--rayon-threads` flag controls the
+global Rayon thread count used by jackknife and matrix ops.
 
 #### 4. Global sequential pass — no cross-chromosome boundary artefact
 
@@ -473,7 +433,7 @@ in BIM order, with per-chromosome files written from the global L2 array after t
 #### 5. Parallel block jackknife (`jackknife.rs`)
 
 The 200 leave-one-block-out IRWLS refits are independent. Rayon's `into_par_iter` distributes them
-across all available cores. Each refit allocates two ndarray views and one LAPACK SVD call; the total
+across all available cores. Each refit allocates two `faer` matrices and one SVD call; the total
 wall time for h2 and rg is dominated by the file I/O and merge join, not the jackknife.
 
 #### 6. Polars LazyFrame for munge (`munge.rs`)
@@ -498,7 +458,7 @@ src/
 │                    · scan_sumstats / scan_ldscore  → Polars LazyFrame
 │                    · concat_chrs(prefix, suffix)   → concat per-chr files
 │                    · read_m_total / read_m_vec      → .l2.M files
-│                    · read_annot(prefix, thin)       → Array2<f64> + col names
+│                    · read_annot(prefix, thin)       → MatF + col names
 │
 ├── munge.rs         munge-sumstats pipeline (Polars LazyFrame, no data loaded until
 │                    collect). Internal functions:
@@ -565,7 +525,7 @@ make_annot.rs        BED → 0/1 annotation generator.
 - `--extract` filters the BIM *before* window computation; `--print-snps` filters only the output.
 - `bed_idx` (original BIM row index) differs from `pos` (index in the filtered `all_snps` slice)
   when `--extract` is active; `bed_idx_to_pos` in `run()` maps between them.
-- `--keep` passes `iid_indices: Option<&Array1<isize>>` to `bed-reader`; `n_indiv_actual` (not
+- `--keep` passes `iid_indices: Option<&[isize]>` to the internal BED reader; `n_indiv_actual` (not
   the FAM total) is used for normalization and the r²-unbiased correction.
 - The ring buffer `ring_size = max_window + chunk_c` guarantees no live window slot is overwritten
   before it has been consumed in the A×B product.
@@ -576,10 +536,9 @@ make_annot.rs        BED → 0/1 annotation generator.
 
 | Crate | Version | Role |
 |-------|---------|------|
-| `bed-reader` | 1 | mmap-based PLINK .bed reading; only touched pages loaded |
+| internal `bed` module | - | minimal PLINK .bed reader tailored to LDSC |
 | `polars` | 0.53 | lazy CSV streaming (munge + LD score file loading) |
-| `ndarray` + `ndarray-linalg` | 0.16 + 0.17 | dense matrix algebra; SVD for IRWLS |
-| `blas-src` + OpenBLAS | 0.10 | OpenBLAS backend (system or static) for DGEMM |
+| `faer` | 0.24 | dense matrix algebra; SVD for IRWLS |
 | `rayon` | 1 | data-parallel jackknife blocks |
 | `statrs` | 0.18 | Normal CDF/quantile for P→Z conversion |
 | `clap` | 4 | derive-macro CLI argument parsing |
@@ -610,5 +569,4 @@ docker build -t ldsc .
 
 The multi-stage `Dockerfile` uses [cargo-chef](https://github.com/LukeMathWalker/cargo-chef) to
 cache dependency compilation in a separate layer, so incremental rebuilds only recompile changed
-source files. The runtime image is `debian:bookworm-slim` plus `libgfortran5` for OpenBLAS
-runtime support when needed.
+source files. The runtime image is `debian:bookworm-slim` with no external BLAS runtime dependency.

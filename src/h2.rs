@@ -1,14 +1,18 @@
 //! LDSC h2 regression logic aligned to the Python implementation.
+use crate::la::{
+    ColF, MatF, col_from_vec, col_len, col_mean, col_sum, col_zeros, mat_add_in_place, mat_slice,
+    matmul_tn_to,
+};
 use anyhow::{Result, bail};
-use ndarray::{Array1, Array2, Axis, s};
-use ndarray_linalg::{LeastSquaresSvd, Solve};
+use faer::linalg::solvers::{PartialPivLu, Solve, SolveLstsq, Svd};
+use faer::{Accum, Par};
 
 #[derive(Debug, Clone)]
 pub struct JackknifeResult {
-    pub est: Array1<f64>,
-    pub jknife_se: Array1<f64>,
-    pub jknife_cov: Array2<f64>,
-    pub delete_values: Array2<f64>,
+    pub est: ColF,
+    pub jknife_se: ColF,
+    pub jknife_cov: MatF,
+    pub delete_values: MatF,
     pub separators: Vec<usize>,
 }
 
@@ -23,8 +27,8 @@ pub struct H2Result {
     pub ratio: Option<(f64, f64)>,
 }
 
-fn mean(arr: &Array1<f64>) -> f64 {
-    arr.mean().unwrap_or(f64::NAN)
+fn mean(arr: &ColF) -> f64 {
+    col_mean(arr)
 }
 
 fn get_separators(n: usize, n_blocks: usize) -> Vec<usize> {
@@ -56,44 +60,54 @@ pub(crate) fn update_separators(seps: &[usize], mask: &[bool]) -> Vec<usize> {
     out
 }
 
-pub(crate) fn weight_xy(
-    x: &Array2<f64>,
-    y: &Array1<f64>,
-    w: &Array1<f64>,
-) -> Result<(Array2<f64>, Array1<f64>)> {
+pub(crate) fn weight_xy(x: &MatF, y: &ColF, w: &ColF) -> Result<(MatF, ColF)> {
     let n = x.nrows();
-    if y.len() != n || w.len() != n {
+    let p = x.ncols();
+    if col_len(y) != n || col_len(w) != n {
         bail!("weight_xy: shape mismatch");
     }
-    if w.iter().any(|&v| v <= 0.0) {
-        bail!("weights must be > 0");
-    }
-    let sum_w = w.sum();
-    let mut xw = Array2::<f64>::zeros(x.raw_dim());
-    let mut yw = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let wi = w[i] / sum_w;
-        xw.row_mut(i).assign(&(&x.row(i) * wi));
-        yw[i] = y[i] * wi;
+        if w[(i, 0)] <= 0.0 {
+            bail!("weights must be > 0");
+        }
+    }
+    let sum_w = col_sum(w);
+    let mut xw = MatF::zeros(n, p);
+    let mut yw = col_zeros(n);
+    for i in 0..n {
+        let wi = w[(i, 0)] / sum_w;
+        for j in 0..p {
+            xw[(i, j)] = x[(i, j)] * wi;
+        }
+        yw[(i, 0)] = y[(i, 0)] * wi;
     }
     Ok((xw, yw))
 }
 
-fn wls(x: &Array2<f64>, y: &Array1<f64>, w: &Array1<f64>) -> Result<Array1<f64>> {
+fn wls(x: &MatF, y: &ColF, w: &ColF) -> Result<ColF> {
     let (xw, yw) = weight_xy(x, y, w)?;
-    let res = xw.least_squares(&yw)?;
-    Ok(res.solution)
+    let svd = Svd::new(xw.as_ref()).map_err(|err| anyhow::anyhow!("svd for wls: {:?}", err))?;
+    let mut rhs = yw.clone();
+    svd.solve_lstsq_in_place(rhs.as_mut());
+    Ok(rhs)
+}
+
+fn solve_square(xtx: &MatF, xty: &ColF) -> Result<ColF> {
+    let lu = PartialPivLu::new(xtx.as_ref());
+    let mut rhs = xty.clone();
+    lu.solve_in_place(rhs.as_mut());
+    Ok(rhs)
 }
 
 pub(crate) fn jackknife_fast(
-    x: &Array2<f64>,
-    y: &Array1<f64>,
+    x: &MatF,
+    y: &ColF,
     n_blocks: usize,
     separators: Option<&[usize]>,
 ) -> Result<JackknifeResult> {
     let n = x.nrows();
     let p = x.ncols();
-    if y.len() != n {
+    if col_len(y) != n {
         bail!("jackknife_fast: shape mismatch");
     }
     let seps = if let Some(s) = separators {
@@ -109,46 +123,98 @@ pub(crate) fn jackknife_fast(
         bail!("More blocks than data points.");
     }
 
-    let mut xty_blocks = Array2::<f64>::zeros((n_blocks, p));
-    let mut xtx_blocks = Vec::with_capacity(n_blocks);
+    let mut xty_blocks = MatF::zeros(n_blocks, p);
+    let mut xtx_blocks: Vec<MatF> = Vec::with_capacity(n_blocks);
     for i in 0..n_blocks {
         let lo = seps[i];
         let hi = seps[i + 1];
-        let xb = x.slice(s![lo..hi, ..]);
-        let yb = y.slice(s![lo..hi]);
-        let xty = xb.t().dot(&yb);
-        xty_blocks.row_mut(i).assign(&xty);
-        let xtx = xb.t().dot(&xb);
+        let xb = mat_slice(x.as_ref(), lo..hi, 0..p);
+        let yb = mat_slice(y.as_ref(), lo..hi, 0..1);
+
+        let mut xty = MatF::zeros(p, 1);
+        matmul_tn_to(xty.as_mut(), xb, yb, 1.0, Accum::Replace, Par::rayon(0));
+        for j in 0..p {
+            xty_blocks[(i, j)] = xty[(j, 0)];
+        }
+
+        let mut xtx = MatF::zeros(p, p);
+        matmul_tn_to(xtx.as_mut(), xb, xb, 1.0, Accum::Replace, Par::rayon(0));
         xtx_blocks.push(xtx);
     }
 
-    let xty_tot = xty_blocks.sum_axis(Axis(0));
-    let mut xtx_tot = Array2::<f64>::zeros((p, p));
-    for xtx in &xtx_blocks {
-        xtx_tot += xtx;
-    }
-    let est = xtx_tot.solve_into(xty_tot.clone())?;
-
-    let mut delete_values = Array2::<f64>::zeros((n_blocks, p));
-    for (i, xtx_block) in xtx_blocks.iter().enumerate() {
-        let xty_del = &xty_tot - &xty_blocks.row(i);
-        let xtx_del = &xtx_tot - xtx_block;
-        let coef = xtx_del.solve_into(xty_del)?;
-        delete_values.row_mut(i).assign(&coef);
-    }
-
-    let mut pseudovalues = Array2::<f64>::zeros((n_blocks, p));
+    let mut xty_tot = col_zeros(p);
     for i in 0..n_blocks {
-        let pv = &est * (n_blocks as f64) - &delete_values.row(i) * ((n_blocks - 1) as f64);
-        pseudovalues.row_mut(i).assign(&pv);
+        for j in 0..p {
+            xty_tot[(j, 0)] += xty_blocks[(i, j)];
+        }
     }
 
-    let mean_pv = pseudovalues.mean_axis(Axis(0)).unwrap();
-    let centered = Array2::from_shape_fn((n_blocks, p), |(i, j)| pseudovalues[[i, j]] - mean_pv[j]);
-    let jknife_cov = centered.t().dot(&centered) / ((n_blocks - 1) as f64 * n_blocks as f64);
-    let mut jknife_se = Array1::<f64>::zeros(p);
+    let mut xtx_tot = MatF::zeros(p, p);
+    for xtx in &xtx_blocks {
+        mat_add_in_place(xtx_tot.as_mut(), xtx.as_ref());
+    }
+    let est = solve_square(&xtx_tot, &xty_tot)?;
+
+    let mut delete_values = MatF::zeros(n_blocks, p);
+    for (i, xtx_block) in xtx_blocks.iter().enumerate() {
+        let mut xty_del = col_zeros(p);
+        for j in 0..p {
+            xty_del[(j, 0)] = xty_tot[(j, 0)] - xty_blocks[(i, j)];
+        }
+        let mut xtx_del = MatF::zeros(p, p);
+        for r in 0..p {
+            for c in 0..p {
+                xtx_del[(r, c)] = xtx_tot[(r, c)] - xtx_block[(r, c)];
+            }
+        }
+        let coef = solve_square(&xtx_del, &xty_del)?;
+        for j in 0..p {
+            delete_values[(i, j)] = coef[(j, 0)];
+        }
+    }
+
+    let mut pseudovalues = MatF::zeros(n_blocks, p);
+    for i in 0..n_blocks {
+        for j in 0..p {
+            let pv =
+                est[(j, 0)] * (n_blocks as f64) - delete_values[(i, j)] * ((n_blocks - 1) as f64);
+            pseudovalues[(i, j)] = pv;
+        }
+    }
+
+    let mut mean_pv = vec![0.0f64; p];
     for j in 0..p {
-        jknife_se[j] = jknife_cov[[j, j]].sqrt();
+        let mut sum = 0.0;
+        for i in 0..n_blocks {
+            sum += pseudovalues[(i, j)];
+        }
+        mean_pv[j] = sum / n_blocks as f64;
+    }
+
+    let mut centered = MatF::zeros(n_blocks, p);
+    for i in 0..n_blocks {
+        for j in 0..p {
+            centered[(i, j)] = pseudovalues[(i, j)] - mean_pv[j];
+        }
+    }
+    let mut jknife_cov = MatF::zeros(p, p);
+    matmul_tn_to(
+        jknife_cov.as_mut(),
+        centered.as_ref(),
+        centered.as_ref(),
+        1.0,
+        Accum::Replace,
+        Par::rayon(0),
+    );
+    let denom = (n_blocks - 1) as f64 * n_blocks as f64;
+    for i in 0..p {
+        for j in 0..p {
+            jknife_cov[(i, j)] /= denom;
+        }
+    }
+    let mut jknife_se = col_zeros(p);
+    for j in 0..p {
+        jknife_se[(j, 0)] = jknife_cov[(j, j)].sqrt();
     }
 
     Ok(JackknifeResult {
@@ -161,36 +227,36 @@ pub(crate) fn jackknife_fast(
 }
 
 pub(crate) fn ldsc_weights(
-    ld: &Array1<f64>,
-    w_ld: &Array1<f64>,
-    n_vec: &Array1<f64>,
+    ld: &ColF,
+    w_ld: &ColF,
+    n_vec: &ColF,
     m: f64,
     hsq: f64,
     intercept: f64,
-) -> Array1<f64> {
+) -> ColF {
     let mut hsq = hsq;
     hsq = hsq.clamp(0.0, 1.0);
-    let mut out = Array1::<f64>::zeros(ld.len());
-    for i in 0..ld.len() {
-        let ld_i = ld[i].max(1.0);
-        let w_i = w_ld[i].max(1.0);
-        let c = hsq * n_vec[i] / m;
+    let n = col_len(ld);
+    let mut out = col_zeros(n);
+    for i in 0..n {
+        let ld_i = ld[(i, 0)].max(1.0);
+        let w_i = w_ld[(i, 0)].max(1.0);
+        let c = hsq * n_vec[(i, 0)] / m;
         let het_w = 1.0 / (2.0 * (intercept + c * ld_i).powi(2));
         let oc_w = 1.0 / w_i;
-        out[i] = het_w * oc_w;
+        out[(i, 0)] = het_w * oc_w;
     }
     out
 }
 
-pub(crate) fn aggregate(
-    y: &Array1<f64>,
-    x: &Array1<f64>,
-    n_vec: &Array1<f64>,
-    m: f64,
-    intercept: f64,
-) -> f64 {
+pub(crate) fn aggregate(y: &ColF, x: &ColF, n_vec: &ColF, m: f64, intercept: f64) -> f64 {
     let num = m * (mean(y) - intercept);
-    let denom = mean(&(x * n_vec));
+    let n = col_len(x);
+    let mut denom_vec = col_zeros(n);
+    for i in 0..n {
+        denom_vec[(i, 0)] = x[(i, 0)] * n_vec[(i, 0)];
+    }
+    let denom = mean(&denom_vec);
     num / denom
 }
 
@@ -201,39 +267,66 @@ pub(crate) fn combine_twostep(
 ) -> Result<JackknifeResult> {
     let n_blocks = step1.delete_values.nrows();
     let n_annot = step2.delete_values.ncols();
-    let step1_int = step1.est[n_annot];
+    let step1_int = step1.est[(n_annot, 0)];
 
-    let mut est = Array1::<f64>::zeros(n_annot + 1);
+    let mut est = col_zeros(n_annot + 1);
     for j in 0..n_annot {
-        est[j] = step2.est[j];
+        est[(j, 0)] = step2.est[(j, 0)];
     }
-    est[n_annot] = step1_int;
+    est[(n_annot, 0)] = step1_int;
 
-    let mut delete_values = Array2::<f64>::zeros((n_blocks, n_annot + 1));
-    delete_values
-        .column_mut(n_annot)
-        .assign(&step1.delete_values.column(n_annot));
+    let mut delete_values = MatF::zeros(n_blocks, n_annot + 1);
+    for k in 0..n_blocks {
+        delete_values[(k, n_annot)] = step1.delete_values[(k, n_annot)];
+    }
 
     for k in 0..n_blocks {
         for j in 0..n_annot {
-            let adj = c * (step1.delete_values[[k, n_annot]] - step1_int);
-            delete_values[[k, j]] = step2.delete_values[[k, j]] - adj;
+            let adj = c * (step1.delete_values[(k, n_annot)] - step1_int);
+            delete_values[(k, j)] = step2.delete_values[(k, j)] - adj;
         }
     }
 
-    let mut pseudovalues = Array2::<f64>::zeros((n_blocks, n_annot + 1));
+    let mut pseudovalues = MatF::zeros(n_blocks, n_annot + 1);
     for k in 0..n_blocks {
-        let pv = &est * (n_blocks as f64) - &delete_values.row(k) * ((n_blocks - 1) as f64);
-        pseudovalues.row_mut(k).assign(&pv);
+        for j in 0..(n_annot + 1) {
+            let pv =
+                est[(j, 0)] * (n_blocks as f64) - delete_values[(k, j)] * ((n_blocks - 1) as f64);
+            pseudovalues[(k, j)] = pv;
+        }
     }
-    let mean_pv = pseudovalues.mean_axis(Axis(0)).unwrap();
-    let centered = Array2::from_shape_fn((n_blocks, n_annot + 1), |(i, j)| {
-        pseudovalues[[i, j]] - mean_pv[j]
-    });
-    let jknife_cov = centered.t().dot(&centered) / ((n_blocks - 1) as f64 * n_blocks as f64);
-    let mut jknife_se = Array1::<f64>::zeros(n_annot + 1);
-    for j in 0..n_annot + 1 {
-        jknife_se[j] = jknife_cov[[j, j]].sqrt();
+    let mut mean_pv = vec![0.0f64; n_annot + 1];
+    for j in 0..(n_annot + 1) {
+        let mut sum = 0.0;
+        for k in 0..n_blocks {
+            sum += pseudovalues[(k, j)];
+        }
+        mean_pv[j] = sum / n_blocks as f64;
+    }
+    let mut centered = MatF::zeros(n_blocks, n_annot + 1);
+    for i in 0..n_blocks {
+        for j in 0..(n_annot + 1) {
+            centered[(i, j)] = pseudovalues[(i, j)] - mean_pv[j];
+        }
+    }
+    let mut jknife_cov = MatF::zeros(n_annot + 1, n_annot + 1);
+    matmul_tn_to(
+        jknife_cov.as_mut(),
+        centered.as_ref(),
+        centered.as_ref(),
+        1.0,
+        Accum::Replace,
+        Par::rayon(0),
+    );
+    let denom = (n_blocks - 1) as f64 * n_blocks as f64;
+    for i in 0..(n_annot + 1) {
+        for j in 0..(n_annot + 1) {
+            jknife_cov[(i, j)] /= denom;
+        }
+    }
+    let mut jknife_se = col_zeros(n_annot + 1);
+    for j in 0..(n_annot + 1) {
+        jknife_se[(j, 0)] = jknife_cov[(j, j)].sqrt();
     }
 
     Ok(JackknifeResult {
@@ -247,17 +340,17 @@ pub(crate) fn combine_twostep(
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_h2_ldsc(
-    chi2: &Array1<f64>,
-    ref_l2: &Array1<f64>,
-    w_l2: &Array1<f64>,
-    n_vec: &Array1<f64>,
+    chi2: &ColF,
+    ref_l2: &ColF,
+    w_l2: &ColF,
+    n_vec: &ColF,
     m_snps: f64,
     n_blocks: usize,
     two_step: Option<f64>,
     fixed_intercept: Option<f64>,
 ) -> Result<H2Result> {
-    let n = chi2.len();
-    if ref_l2.len() != n || w_l2.len() != n || n_vec.len() != n {
+    let n = col_len(chi2);
+    if col_len(ref_l2) != n || col_len(w_l2) != n || col_len(n_vec) != n {
         bail!("run_h2_ldsc: input length mismatch");
     }
     let nbar = mean(n_vec);
@@ -266,18 +359,23 @@ pub fn run_h2_ldsc(
     let tot_agg = aggregate(chi2, ref_l2, n_vec, m_snps, intercept0);
     let initial_w = ldsc_weights(ref_l2, w_l2, n_vec, m_snps, tot_agg, intercept0);
 
-    let mut x = Array2::<f64>::zeros((n, 1));
+    let mut x = MatF::zeros(n, 1);
     for i in 0..n {
-        x[[i, 0]] = n_vec[i] * ref_l2[i] / nbar;
+        x[(i, 0)] = n_vec[(i, 0)] * ref_l2[(i, 0)] / nbar;
     }
 
     let (y_reg, x_reg) = if let Some(intercept) = fixed_intercept {
-        let y_adj = chi2.mapv(|c| c - intercept);
+        let mut y_adj = chi2.clone();
+        for i in 0..n {
+            y_adj[(i, 0)] -= intercept;
+        }
         (y_adj, x)
     } else {
-        let mut x_i = Array2::<f64>::zeros((n, 2));
-        x_i.column_mut(0).assign(&x.column(0));
-        x_i.column_mut(1).fill(1.0);
+        let mut x_i = MatF::zeros(n, 2);
+        for i in 0..n {
+            x_i[(i, 0)] = x[(i, 0)];
+            x_i[(i, 1)] = 1.0;
+        }
         (chi2.clone(), x_i)
     };
 
@@ -286,78 +384,102 @@ pub fn run_h2_ldsc(
     }
 
     let jknife = if let Some(twostep) = two_step {
-        let mask: Vec<bool> = chi2.iter().map(|&c| c < twostep).collect();
+        let mut mask: Vec<bool> = Vec::with_capacity(n);
+        for i in 0..n {
+            mask.push(chi2[(i, 0)] < twostep);
+        }
         let n1 = mask.iter().filter(|&&b| b).count();
 
-        let mut x1 = Array2::<f64>::zeros((n1, x_reg.ncols()));
-        let mut y1 = Array1::<f64>::zeros(n1);
-        let mut w1 = Array1::<f64>::zeros(n1);
-        let mut n1v = Array1::<f64>::zeros(n1);
+        let mut x1 = MatF::zeros(n1, x_reg.ncols());
+        let mut y1 = col_zeros(n1);
+        let mut w1 = col_zeros(n1);
+        let mut n1v = col_zeros(n1);
         let mut idx = 0usize;
         for i in 0..n {
             if mask[i] {
-                x1.row_mut(idx).assign(&x_reg.row(i));
-                y1[idx] = y_reg[i];
-                w1[idx] = w_l2[i];
-                n1v[idx] = n_vec[i];
+                for j in 0..x_reg.ncols() {
+                    x1[(idx, j)] = x_reg[(i, j)];
+                }
+                y1[(idx, 0)] = y_reg[(i, 0)];
+                w1[(idx, 0)] = w_l2[(i, 0)];
+                n1v[(idx, 0)] = n_vec[(i, 0)];
                 idx += 1;
             }
         }
-        let initial_w1_vec: Vec<f64> = initial_w
-            .iter()
-            .zip(mask.iter())
-            .filter_map(|(&v, keep)| if *keep { Some(v) } else { None })
-            .collect();
-        let initial_w1 = Array1::from_vec(initial_w1_vec);
+        let mut initial_w1_vec = Vec::with_capacity(n1);
+        for (i, keep) in mask.iter().enumerate() {
+            if *keep {
+                initial_w1_vec.push(initial_w[(i, 0)]);
+            }
+        }
+        let initial_w1 = col_from_vec(initial_w1_vec);
 
-        let x1_col0 = x1.column(0).to_owned();
-        let update_func1 = move |coef: &Array1<f64>| {
-            let hsq = m_snps * coef[0] / nbar;
-            let intercept = coef[1];
+        let mut x1_col0 = col_zeros(n1);
+        for i in 0..n1 {
+            x1_col0[(i, 0)] = x1[(i, 0)];
+        }
+        let update_func1 = move |coef: &ColF| {
+            let hsq = m_snps * coef[(0, 0)] / nbar;
+            let intercept = coef[(1, 0)];
             ldsc_weights(&x1_col0, &w1, &n1v, m_snps, hsq, intercept)
         };
 
         let step1 = irwls_ldsc(&x1, &y1, &initial_w1, update_func1, n_blocks, None)?;
-        let step1_int = step1.est[1];
+        let step1_int = step1.est[(1, 0)];
 
-        let y2 = y_reg.mapv(|c| c - step1_int);
-        let x2 = x_reg.slice(s![.., 0..1]).to_owned(); // remove intercept column
+        let mut y2 = y_reg.clone();
+        for i in 0..n {
+            y2[(i, 0)] -= step1_int;
+        }
+        let mut x2 = MatF::zeros(n, 1);
+        for i in 0..n {
+            x2[(i, 0)] = x_reg[(i, 0)];
+        }
 
-        let update_func2 = |coef: &Array1<f64>| {
-            let hsq = m_snps * coef[0] / nbar;
+        let update_func2 = |coef: &ColF| {
+            let hsq = m_snps * coef[(0, 0)] / nbar;
             ldsc_weights(ref_l2, w_l2, n_vec, m_snps, hsq, step1_int)
         };
 
         let seps = update_separators(&step1.separators, &mask);
         let step2 = irwls_ldsc(&x2, &y2, &initial_w, update_func2, n_blocks, Some(&seps))?;
 
-        let num = (&initial_w * &x2.column(0)).sum();
-        let denom = (&initial_w * &x2.column(0).mapv(|v| v * v)).sum();
+        let mut num = 0.0f64;
+        let mut denom = 0.0f64;
+        for i in 0..n {
+            let w = initial_w[(i, 0)];
+            let x0 = x2[(i, 0)];
+            num += w * x0;
+            denom += w * x0 * x0;
+        }
         let c = num / denom;
         combine_twostep(&step1, &step2, c)?
     } else {
-        let update_func = |coef: &Array1<f64>| {
-            let hsq = m_snps * coef[0] / nbar;
-            let intercept = fixed_intercept.unwrap_or(coef[1]);
+        let update_func = |coef: &ColF| {
+            let hsq = m_snps * coef[(0, 0)] / nbar;
+            let intercept = fixed_intercept.unwrap_or(coef[(1, 0)]);
             ldsc_weights(ref_l2, w_l2, n_vec, m_snps, hsq, intercept)
         };
         irwls_ldsc(&x_reg, &y_reg, &initial_w, update_func, n_blocks, None)?
     };
 
-    let coef = jknife.est[0] / nbar;
-    let coef_cov = jknife.jknife_cov[[0, 0]] / (nbar * nbar);
+    let coef = jknife.est[(0, 0)] / nbar;
+    let coef_cov = jknife.jknife_cov[(0, 0)] / (nbar * nbar);
     let h2 = m_snps * coef;
     let h2_se = (m_snps * m_snps * coef_cov).sqrt();
 
     let (intercept, intercept_se) = if let Some(fixed) = fixed_intercept {
         (fixed, f64::NAN)
     } else {
-        (jknife.est[1], jknife.jknife_se[1])
+        (jknife.est[(1, 0)], jknife.jknife_se[(1, 0)])
     };
 
     let mean_chi2 = mean(chi2);
     let lambda_gc = {
-        let mut vals = chi2.to_vec();
+        let mut vals = Vec::with_capacity(n);
+        for i in 0..n {
+            vals.push(chi2[(i, 0)]);
+        }
         vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let n = vals.len();
         let mid = if n == 0 {
@@ -391,18 +513,24 @@ pub fn run_h2_ldsc(
 }
 
 pub(crate) fn irwls_ldsc(
-    x: &Array2<f64>,
-    y: &Array1<f64>,
-    initial_w: &Array1<f64>,
-    update_func: impl Fn(&Array1<f64>) -> Array1<f64>,
+    x: &MatF,
+    y: &ColF,
+    initial_w: &ColF,
+    update_func: impl Fn(&ColF) -> ColF,
     n_blocks: usize,
     separators: Option<&[usize]>,
 ) -> Result<JackknifeResult> {
-    let mut w = initial_w.mapv(|v| v.sqrt());
+    let mut w = initial_w.clone();
+    for i in 0..col_len(&w) {
+        w[(i, 0)] = w[(i, 0)].sqrt();
+    }
     for _ in 0..2 {
         let coef = wls(x, y, &w)?;
         let new_w = update_func(&coef);
-        w = new_w.mapv(|v| v.sqrt());
+        w = new_w;
+        for i in 0..col_len(&w) {
+            w[(i, 0)] = w[(i, 0)].sqrt();
+        }
     }
 
     let (xw, yw) = weight_xy(x, y, &w)?;

@@ -19,9 +19,8 @@
 # build image; the compiled binary is independent of the toolchain version.
 FROM rust:1 AS base
 
-# Build against the system OpenBLAS (default feature).
+# Base build tools (no external BLAS required).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libopenblas-dev \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -63,12 +62,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ── runtime: minimal final image ─────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
-# libopenblas0 + libgfortran5: runtime deps for OpenBLAS.
 # ca-certificates: needed for HTTPS downloads (LD score files, summary stats).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
-        libopenblas0 \
-        libgfortran5 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/ldsc /usr/local/bin/ldsc

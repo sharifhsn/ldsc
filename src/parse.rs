@@ -1,6 +1,7 @@
+use crate::la::{MatF, mat_add_in_place, matmul_tn_to};
 /// File parsing utilities: Polars LazyFrame readers for `.sumstats` and `.ldscore` files.
 use anyhow::{Context, Result};
-use ndarray::{Array2, s};
+use faer::{Accum, Par};
 use polars::prelude::*;
 use std::fs::File;
 use std::path::Path;
@@ -283,12 +284,12 @@ pub fn concat_chrs_any(prefix: &str, suffixes: &[&str]) -> Result<LazyFrame> {
 // Annotation file reader
 // ---------------------------------------------------------------------------
 
-/// Read a partitioned LD score annotation file into a dense `Array2<f64>`.
+/// Read a partitioned LD score annotation file into a dense `Mat<f64>`.
 ///
 /// Full format (`thin=false`): `CHR SNP BP CM ANNOT1 …` — skips first 4 columns.
 /// Thin format (`thin=true`): all columns are annotations.
 /// Tries `{prefix}.annot.gz`, `{prefix}.annot.bz2`, then `{prefix}.annot`.
-pub fn read_annot(prefix: &str, thin: bool) -> Result<(Array2<f64>, Vec<String>)> {
+pub fn read_annot(prefix: &str, thin: bool) -> Result<(MatF, Vec<String>)> {
     let path = resolve_annot_path(prefix)?;
     read_annot_path(&path, thin)
 }
@@ -296,9 +297,7 @@ pub fn read_annot(prefix: &str, thin: bool) -> Result<(Array2<f64>, Vec<String>)
 /// Resolve a single annotation file path.
 /// Accepts `prefix` with or without `.annot[.gz|.bz2]` suffix.
 pub fn resolve_annot_path(prefix: &str) -> Result<String> {
-    if prefix.ends_with(".annot")
-        || prefix.ends_with(".annot.gz")
-        || prefix.ends_with(".annot.bz2")
+    if prefix.ends_with(".annot") || prefix.ends_with(".annot.gz") || prefix.ends_with(".annot.bz2")
     {
         if std::path::Path::new(prefix).exists() {
             return Ok(prefix.to_string());
@@ -320,9 +319,9 @@ pub fn resolve_annot_path(prefix: &str) -> Result<String> {
     }
 }
 
-/// Read a partitioned LD score annotation file into a dense `Array2<f64>`.
+/// Read a partitioned LD score annotation file into a dense `Mat<f64>`.
 /// `path` must include the extension (e.g., `.annot.gz`).
-pub fn read_annot_path(path: &str, thin: bool) -> Result<(Array2<f64>, Vec<String>)> {
+pub fn read_annot_path(path: &str, thin: bool) -> Result<(MatF, Vec<String>)> {
     let resolved = resolve_text_path(path)?;
     let resolved_str = resolved.to_string_lossy();
     let df = LazyCsvReader::new(resolved_str.as_ref().into())
@@ -355,7 +354,7 @@ pub fn read_annot_path(path: &str, thin: bool) -> Result<(Array2<f64>, Vec<Strin
     let n_annot = col_names.len();
     let n_rows = df.height();
 
-    let mut matrix = Array2::<f64>::zeros((n_rows, n_annot));
+    let mut matrix = MatF::zeros(n_rows, n_annot);
     for (j, name) in col_names.iter().enumerate() {
         let s = df
             .column(name)
@@ -366,7 +365,7 @@ pub fn read_annot_path(path: &str, thin: bool) -> Result<(Array2<f64>, Vec<Strin
             .f64()
             .with_context(|| format!("annot column '{}' as f64", name))?;
         for (i, val) in ca.into_iter().enumerate() {
-            matrix[[i, j]] = val.unwrap_or(0.0);
+            matrix[(i, j)] = val.unwrap_or(0.0);
         }
     }
 
@@ -452,11 +451,11 @@ pub fn read_overlap_matrix(
     frqfile: Option<&str>,
     frqfile_chr: Option<&str>,
     chr_split: bool,
-) -> Result<(Array2<f64>, usize, Vec<String>)> {
+) -> Result<(MatF, usize, Vec<String>)> {
     anyhow::ensure!(!prefixes.is_empty(), "No annotation prefixes provided");
 
     let mut raw_names_per_prefix: Vec<Vec<String>> = Vec::new();
-    let mut overlap: Option<Array2<f64>> = None;
+    let mut overlap: Option<MatF> = None;
     let mut m_tot: usize = 0;
 
     if chr_split {
@@ -468,7 +467,7 @@ pub fn read_overlap_matrix(
         );
 
         for chr in chrs {
-            let mut matrices: Vec<Array2<f64>> = Vec::new();
+            let mut matrices: Vec<MatF> = Vec::new();
             let mut n_rows: Option<usize> = None;
             for (idx, prefix) in prefixes.iter().enumerate() {
                 let chr_prefix = make_chr_path(prefix, chr, "");
@@ -496,13 +495,15 @@ pub fn read_overlap_matrix(
 
             let n_rows = n_rows.unwrap_or(0);
             let total_cols: usize = matrices.iter().map(|m| m.ncols()).sum();
-            let mut stacked = Array2::<f64>::zeros((n_rows, total_cols));
+            let mut stacked = MatF::zeros(n_rows, total_cols);
             let mut col_offset = 0usize;
             for mat in matrices {
                 let cols = mat.ncols();
-                stacked
-                    .slice_mut(s![.., col_offset..col_offset + cols])
-                    .assign(&mat);
+                for i in 0..n_rows {
+                    for j in 0..cols {
+                        stacked[(i, col_offset + j)] = mat[(i, j)];
+                    }
+                }
                 col_offset += cols;
             }
 
@@ -517,28 +518,48 @@ pub fn read_overlap_matrix(
                     n_rows
                 );
                 let keep = mask.iter().filter(|&&b| b).count();
-                let mut filtered = Array2::<f64>::zeros((keep, total_cols));
+                let mut filtered = MatF::zeros(keep, total_cols);
                 let mut row = 0usize;
                 for (i, keep_row) in mask.iter().enumerate() {
                     if *keep_row {
-                        filtered.row_mut(row).assign(&stacked.row(i));
+                        for j in 0..total_cols {
+                            filtered[(row, j)] = stacked[(i, j)];
+                        }
                         row += 1;
                     }
                 }
-                (filtered.t().dot(&filtered), keep)
+                let mut matrix = MatF::zeros(total_cols, total_cols);
+                matmul_tn_to(
+                    matrix.as_mut(),
+                    filtered.as_ref(),
+                    filtered.as_ref(),
+                    1.0,
+                    Accum::Replace,
+                    Par::rayon(0),
+                );
+                (matrix, keep)
             } else {
-                (stacked.t().dot(&stacked), n_rows)
+                let mut matrix = MatF::zeros(total_cols, total_cols);
+                matmul_tn_to(
+                    matrix.as_mut(),
+                    stacked.as_ref(),
+                    stacked.as_ref(),
+                    1.0,
+                    Accum::Replace,
+                    Par::rayon(0),
+                );
+                (matrix, n_rows)
             };
 
             m_tot += m_chr;
             if let Some(ref mut acc) = overlap {
-                *acc += &matrix;
+                mat_add_in_place(acc.as_mut(), matrix.as_ref());
             } else {
                 overlap = Some(matrix);
             }
         }
     } else {
-        let mut matrices: Vec<Array2<f64>> = Vec::new();
+        let mut matrices: Vec<MatF> = Vec::new();
         let mut n_rows: Option<usize> = None;
         for (idx, prefix) in prefixes.iter().enumerate() {
             let (mat, names) = read_annot(prefix, false)?;
@@ -564,13 +585,15 @@ pub fn read_overlap_matrix(
 
         let n_rows = n_rows.unwrap_or(0);
         let total_cols: usize = matrices.iter().map(|m| m.ncols()).sum();
-        let mut stacked = Array2::<f64>::zeros((n_rows, total_cols));
+        let mut stacked = MatF::zeros(n_rows, total_cols);
         let mut col_offset = 0usize;
         for mat in matrices {
             let cols = mat.ncols();
-            stacked
-                .slice_mut(s![.., col_offset..col_offset + cols])
-                .assign(&mat);
+            for i in 0..n_rows {
+                for j in 0..cols {
+                    stacked[(i, col_offset + j)] = mat[(i, j)];
+                }
+            }
             col_offset += cols;
         }
 
@@ -585,17 +608,37 @@ pub fn read_overlap_matrix(
                 n_rows
             );
             let keep = mask.iter().filter(|&&b| b).count();
-            let mut filtered = Array2::<f64>::zeros((keep, total_cols));
+            let mut filtered = MatF::zeros(keep, total_cols);
             let mut row = 0usize;
             for (i, keep_row) in mask.iter().enumerate() {
                 if *keep_row {
-                    filtered.row_mut(row).assign(&stacked.row(i));
+                    for j in 0..total_cols {
+                        filtered[(row, j)] = stacked[(i, j)];
+                    }
                     row += 1;
                 }
             }
-            (filtered.t().dot(&filtered), keep)
+            let mut matrix = MatF::zeros(total_cols, total_cols);
+            matmul_tn_to(
+                matrix.as_mut(),
+                filtered.as_ref(),
+                filtered.as_ref(),
+                1.0,
+                Accum::Replace,
+                Par::rayon(0),
+            );
+            (matrix, keep)
         } else {
-            (stacked.t().dot(&stacked), n_rows)
+            let mut matrix = MatF::zeros(total_cols, total_cols);
+            matmul_tn_to(
+                matrix.as_mut(),
+                stacked.as_ref(),
+                stacked.as_ref(),
+                1.0,
+                Accum::Replace,
+                Par::rayon(0),
+            );
+            (matrix, n_rows)
         };
 
         m_tot += m_single;

@@ -94,22 +94,19 @@ Observed in munge:
 - Input rows: 4,000,000
 - Remaining after QC: 3,128,466
 
-## Benchmark Script (System OpenBLAS)
-
-We must use system OpenBLAS because building static OpenBLAS on macOS failed due to missing gfortran.
+## Benchmark Script
 
 The benchmark script handles:
 - Python env setup (if missing)
 - `cargo clippy --release` and `cargo build --release`
 - timing of Python vs Rust runs
 
-Run with system OpenBLAS:
+Run:
 ```bash
 SUMSTATS=/Users/sharif/Code/ldsc/data/biomarkers-30600-both_sexes-irnt.sample.sumstats.gz \
 POP=EUR \
 ID_SCHEME=chrpos \
 LDMS=none \
-USE_SYSTEM_OPENBLAS=1 \
 TWO_STEP=30 \
 /Users/sharif/Code/ldsc/scripts/bench_ukbb_py3_vs_rust.sh
 ```
@@ -183,7 +180,7 @@ uv run python /Users/sharif/Code/ldsc/ldsc_py3/munge_sumstats.py \
   --out /Users/sharif/Code/ldsc/data/biomarkers-30600-both_sexes-irnt.sample
 
 SUMSTATS=/Users/sharif/Code/ldsc/data/biomarkers-30600-both_sexes-irnt.sample.sumstats.gz \
-POP=EUR ID_SCHEME=chrpos LDMS=none USE_SYSTEM_OPENBLAS=1 TWO_STEP=30 \
+POP=EUR ID_SCHEME=chrpos LDMS=none TWO_STEP=30 \
 /Users/sharif/Code/ldsc/scripts/bench_ukbb_py3_vs_rust.sh
 ```
 
@@ -191,7 +188,6 @@ POP=EUR ID_SCHEME=chrpos LDMS=none USE_SYSTEM_OPENBLAS=1 TWO_STEP=30 \
 
 - Python LDSC expects `--ref-ld` prefix (no `.l2.ldscore.gz`), so the script strips suffixes for Python only.
 - Rust single-file `--ref-ld` lacked M sidecar auto-detection; the benchmark script now reads `*.l2.M_5_50` and passes `--M`.
-- OpenBLAS static build failed on macOS due to missing gfortran; system OpenBLAS path is used instead.
 - Python 3.9 venv is required for ldsc_py3 dependencies.
 - Python `read_csv` no longer emits "compression has no effect" warnings for gzipped sumstats.
 

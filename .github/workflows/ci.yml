@@ -9,9 +9,6 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: "0"
-  # Pin OpenBLAS to a conservative x86_64 target so cached artifacts are safe
-  # across different GitHub runner CPU generations (avoids SIGILL on cache hit).
-  OPENBLAS_TARGET: "SSE_GENERIC"
 
 jobs:
   test:
@@ -24,44 +21,19 @@ jobs:
         with:
           components: clippy
 
-      # Caches ~/.cargo/registry, ~/.cargo/git, and target/ (including the
-      # cmake-built OpenBLAS static library).  Key includes rustc version and
-      # Cargo.lock hash; OPENBLAS_DYNAMIC_ARCH is baked into the key so a
-      # config change triggers a clean rebuild.
+      # Caches ~/.cargo/registry, ~/.cargo/git, and target/.
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
-        with:
-          env-vars: OPENBLAS_TARGET
-          cache-on-failure: true
-
-      - name: Install BLAS dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake gfortran libopenblas-dev pkg-config
+        cache-on-failure: true
 
       - name: cargo check
-        run: cargo check --release --no-default-features --features blas-openblas-system
+        run: cargo check --release
 
       - name: cargo fmt
         run: cargo fmt --check
 
       - name: cargo clippy
-        run: cargo clippy --release --no-default-features --features blas-openblas-system -- -D warnings
+        run: cargo clippy --release -- -D warnings
 
       - name: cargo test
-        run: cargo test --release --no-default-features --features blas-openblas-system  # ldscore_smoke is #[ignore] — needs large BED file
-
-      - name: Dump OpenBLAS build logs on failure
-        if: failure()
-        run: |
-          echo "Searching for OpenBLAS build logs..."
-          find target -type f \( -name out.log -o -name err.log \) -print || true
-          for f in $(find target -type f \( -name out.log -o -name err.log \) -print); do
-            echo "===== $f ====="
-            tail -n 200 "$f" || true
-          done
-          if [ -d "$HOME/.local/share" ]; then
-            find "$HOME/.local/share" -type f \( -name out.log -o -name err.log \) -print || true
-            for f in $(find "$HOME/.local/share" -type f \( -name out.log -o -name err.log \) -print); do
-              echo "===== $f ====="
-              tail -n 200 "$f" || true
-            done
-          fi
+        run: cargo test --release  # ldscore_smoke is #[ignore] — needs large BED file

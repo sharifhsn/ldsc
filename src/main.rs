@@ -1,10 +1,11 @@
-mod blas;
+mod bed;
 mod cli;
 mod cts_annot;
 mod h2;
 mod irwls;
 mod jackknife;
 mod l2;
+mod la;
 mod make_annot;
 mod munge;
 mod parse;
@@ -64,8 +65,6 @@ fn main() -> Result<()> {
             std::env::set_var("POLARS_MAX_THREADS", n.to_string());
         }
     }
-
-    blas::set_openblas_threads(cli.blas_threads);
 
     match cli.command {
         Command::MungeSumstats(args) => munge::run(args),

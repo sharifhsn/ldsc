@@ -288,17 +288,11 @@ else
             --bfile "$BFILE" --extract "$TMP/chr22_snps.txt" \
             --ld-wind-cm 1 --per-allele --out "$LD/perallele"
 
-    # --chunk-size (BLAS tile size; larger values change window approximation)
+    # --chunk-size (matmul tile size; larger values change window approximation)
     run_test "--chunk-size 100" \
         "$BIN" l2 \
             --bfile "$BFILE" --extract "$TMP/chr22_snps.txt" \
             --ld-wind-cm 1 --chunk-size 100 --out "$LD/chunk100"
-
-    # --blas-threads (OpenBLAS thread count)
-    run_test "--blas-threads 2" \
-        "$BIN" l2 \
-            --bfile "$BFILE" --extract "$TMP/chr22_snps.txt" \
-            --ld-wind-cm 1 --blas-threads 2 --out "$LD/blas2"
 
     # --keep (restrict to a subset of individuals)
     awk 'NR<=100' "${BFILE}.fam" > "$TMP/keep100.txt"

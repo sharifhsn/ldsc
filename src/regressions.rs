@@ -1,10 +1,14 @@
+use crate::la::{
+    ColF, MatF, col_from_vec, col_len, col_mean, col_zeros, mat_zeros, matmul_nt_to, matmul_tn_to,
+    matmul_to,
+};
 /// Heritability and genetic correlation estimation — replaces ldscore/regressions.py.
 ///
 /// Pipeline:
-///   parse → merge (sumstats ⨝ ld_scores ⨝ weights) → build ndarray
+///   parse → merge (sumstats ⨝ ld_scores ⨝ weights) → build matrices
 ///   matrices → jackknife(IRWLS, n_blocks) → h2 / rg estimates.
 use anyhow::{Context, Result};
-use ndarray::{Array1, Array2, Axis, s};
+use faer::{Accum, Par};
 use polars::prelude::*;
 use statrs::distribution::StudentsT;
 use statrs::distribution::{ChiSquared, Continuous, ContinuousCDF, Normal};
@@ -102,12 +106,14 @@ fn smart_merge_on_snp(mut left: DataFrame, mut right: DataFrame) -> Result<DataF
     }
 }
 
-fn trace_array_stats(label: &str, arr: &Array1<f64>) {
+fn trace_array_stats(label: &str, arr: &ColF) {
     let mut count = 0usize;
     let mut sum = 0.0f64;
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
-    for &v in arr.iter() {
+    let n = col_len(arr);
+    for i in 0..n {
+        let v = arr[(i, 0)];
         if v.is_nan() {
             continue;
         }
@@ -128,7 +134,7 @@ fn trace_array_stats(label: &str, arr: &Array1<f64>) {
     trace!("{label}: n={count} mean={mean:.6} min={min:.6} max={max:.6}");
 }
 
-fn trace_ref_l2_stats(labels: &[String], cols: &[Array1<f64>]) {
+fn trace_ref_l2_stats(labels: &[String], cols: &[ColF]) {
     if labels.is_empty() || cols.is_empty() {
         return;
     }
@@ -332,7 +338,9 @@ fn resolve_m_vec(
                     );
                     return m_vec;
                 }
-                if let (Some(idx), Some(k_full)) = (keep_idx, k_full) && m_vec.len() == k_full {
+                if let (Some(idx), Some(k_full)) = (keep_idx, k_full)
+                    && m_vec.len() == k_full
+                {
                     let total: f64 = m_vec.iter().sum();
                     let mut kept = Vec::with_capacity(idx.len());
                     for &i in idx {
@@ -375,10 +383,12 @@ fn resolve_m_vec(
 // Helper: drop zero-variance LD score columns (partitioned h2 parity).
 // ---------------------------------------------------------------------------
 
-fn column_is_zero_variance(values: &Array1<f64>) -> bool {
+fn column_is_zero_variance(values: &ColF) -> bool {
     let mut count = 0usize;
     let mut first: Option<f64> = None;
-    for &v in values.iter() {
+    let n = col_len(values);
+    for i in 0..n {
+        let v = values[(i, 0)];
         if v.is_nan() {
             continue;
         }
@@ -418,7 +428,10 @@ fn drop_zero_variance_ld(ref_ld: &DataFrame) -> Result<(DataFrame, Vec<usize>, u
         total += 1;
     }
 
-    anyhow::ensure!(total > 0, "No L2 annotation columns found in reference LD scores");
+    anyhow::ensure!(
+        total > 0,
+        "No L2 annotation columns found in reference LD scores"
+    );
     if keep_cols.len() == 1 {
         anyhow::bail!("All L2 annotation columns have zero variance.");
     }
@@ -434,13 +447,15 @@ fn drop_zero_variance_ld(ref_ld: &DataFrame) -> Result<(DataFrame, Vec<usize>, u
 // Helper: filter multiple parallel arrays by a boolean mask
 // ---------------------------------------------------------------------------
 
-fn filter_by_mask(v: &Array1<f64>, mask: &[bool]) -> Array1<f64> {
-    Array1::from_vec(
-        v.iter()
-            .zip(mask.iter())
-            .filter_map(|(&val, &keep)| if keep { Some(val) } else { None })
-            .collect(),
-    )
+fn filter_by_mask(v: &ColF, mask: &[bool]) -> ColF {
+    let mut out = Vec::new();
+    let n = col_len(v);
+    for i in 0..n {
+        if *mask.get(i).unwrap_or(&false) {
+            out.push(v[(i, 0)]);
+        }
+    }
+    col_from_vec(out)
 }
 
 fn filter_strings_by_mask(v: &[String], mask: &[bool]) -> Vec<String> {
@@ -502,7 +517,7 @@ fn match_and_flip(a1: char, a2: char, b1: char, b2: char) -> Option<bool> {
     None
 }
 
-fn align_rg_alleles(merged: &DataFrame, z2: &Array1<f64>) -> Result<(Vec<bool>, Vec<f64>, usize)> {
+fn align_rg_alleles(merged: &DataFrame, z2: &ColF) -> Result<(Vec<bool>, Vec<f64>, usize)> {
     let a1_1 = merged.column("A1_1")?.as_materialized_series().str()?;
     let a2_1 = merged.column("A2_1")?.as_materialized_series().str()?;
     let a1_2 = merged.column("A1_2")?.as_materialized_series().str()?;
@@ -531,7 +546,7 @@ fn align_rg_alleles(merged: &DataFrame, z2: &Array1<f64>) -> Result<(Vec<bool>, 
         match match_and_flip(a1c, a2c, b1c, b2c) {
             Some(flip) => {
                 mask.push(true);
-                let z = z2[i];
+                let z = z2[(i, 0)];
                 z2_aligned.push(if flip { -z } else { z });
             }
             None => {
@@ -638,19 +653,24 @@ pub fn run_h2(args: H2Args) -> Result<()> {
     let chi2_raw = extract_f64(&merged, "CHI2")?;
     let w_l2_raw = extract_f64(&merged, "w_l2")?;
     let n_vec_raw = extract_f64(&merged, "N")?;
-    let ref_l2_raw_k: Vec<Array1<f64>> = l2_cols
+    let ref_l2_raw_k: Vec<ColF> = l2_cols
         .iter()
         .map(|name| extract_f64(&merged, name))
         .collect::<Result<Vec<_>>>()?;
 
-    let valid_mask: Vec<bool> = (0..chi2_raw.len())
-        .map(|i| !chi2_raw[i].is_nan() && !n_vec_raw[i].is_nan())
+    let n_mask = col_len(&chi2_raw);
+    let valid_mask: Vec<bool> = (0..n_mask)
+        .map(|i| {
+            let chi2_v = chi2_raw[(i, 0)];
+            let n_v = n_vec_raw[(i, 0)];
+            !chi2_v.is_nan() && !n_v.is_nan()
+        })
         .collect();
 
     let mut chi2 = filter_by_mask(&chi2_raw, &valid_mask);
     let mut w_l2 = filter_by_mask(&w_l2_raw, &valid_mask);
     let mut n_vec = filter_by_mask(&n_vec_raw, &valid_mask);
-    let mut ref_l2_k: Vec<Array1<f64>> = ref_l2_raw_k
+    let mut ref_l2_k: Vec<ColF> = ref_l2_raw_k
         .iter()
         .map(|v| filter_by_mask(v, &valid_mask))
         .collect();
@@ -659,7 +679,14 @@ pub fn run_h2(args: H2Args) -> Result<()> {
         match args.chisq_max {
             Some(c) => Some(c),
             None => {
-                let max_n = n_vec.iter().cloned().fold(0.0f64, f64::max);
+                let mut max_n = 0.0f64;
+                let n_len = col_len(&n_vec);
+                for i in 0..n_len {
+                    let v = n_vec[(i, 0)];
+                    if v > max_n {
+                        max_n = v;
+                    }
+                }
                 Some((0.001 * max_n).max(80.0))
             }
         }
@@ -667,10 +694,14 @@ pub fn run_h2(args: H2Args) -> Result<()> {
         args.chisq_max
     };
 
-    warn_small_snp_count(chi2.len());
+    warn_small_snp_count(col_len(&chi2));
 
     if let Some(chisq_max) = chisq_max {
-        let mask: Vec<bool> = chi2.iter().map(|&c| c < chisq_max).collect();
+        let mut mask: Vec<bool> = Vec::with_capacity(col_len(&chi2));
+        let n_mask = col_len(&chi2);
+        for i in 0..n_mask {
+            mask.push(chi2[(i, 0)] < chisq_max);
+        }
         let n_removed = mask.iter().filter(|&&b| !b).count();
         if n_removed > 0 {
             println!("  Removed {} SNPs with chi2 > {:.1}", n_removed, chisq_max);
@@ -683,8 +714,8 @@ pub fn run_h2(args: H2Args) -> Result<()> {
             .map(|v| filter_by_mask(v, &mask))
             .collect::<Vec<_>>();
     }
-    let n_obs = chi2.len();
-    let n_mean = n_vec.mean().unwrap_or(1.0);
+    let n_obs = col_len(&chi2);
+    let n_mean = col_mean(&n_vec);
     debug!(
         "h2 regression inputs: n_obs={} n_mean={:.3} k={}",
         n_obs, n_mean, k
@@ -903,10 +934,8 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
         n_total, sumstats_path
     );
 
-    let non_l2_set: std::collections::HashSet<&str> = ["SNP", "CHI2", "N", "w_l2"]
-        .iter()
-        .copied()
-        .collect();
+    let non_l2_set: std::collections::HashSet<&str> =
+        ["SNP", "CHI2", "N", "w_l2"].iter().copied().collect();
     let l2_cols: Vec<String> = merged
         .get_column_names()
         .into_iter()
@@ -922,7 +951,7 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
     let chi2_raw = extract_f64(&merged, "CHI2")?;
     let w_l2_raw = extract_f64(&merged, "w_l2")?;
     let n_vec_raw = extract_f64(&merged, "N")?;
-    let ref_l2_raw_k: Vec<Array1<f64>> = l2_cols
+    let ref_l2_raw_k: Vec<ColF> = l2_cols
         .iter()
         .map(|name| extract_f64(&merged, name))
         .collect::<Result<Vec<_>>>()?;
@@ -935,30 +964,45 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
         .map(|opt| opt.unwrap_or("").to_string())
         .collect();
 
-    let valid_mask: Vec<bool> = (0..chi2_raw.len())
-        .map(|i| !chi2_raw[i].is_nan() && !n_vec_raw[i].is_nan())
+    let n_raw = col_len(&chi2_raw);
+    let valid_mask: Vec<bool> = (0..n_raw)
+        .map(|i| {
+            let chi2_v = chi2_raw[(i, 0)];
+            let n_v = n_vec_raw[(i, 0)];
+            !chi2_v.is_nan() && !n_v.is_nan()
+        })
         .collect();
 
     let mut chi2 = filter_by_mask(&chi2_raw, &valid_mask);
     let mut w_l2 = filter_by_mask(&w_l2_raw, &valid_mask);
     let mut n_vec = filter_by_mask(&n_vec_raw, &valid_mask);
-    let mut ref_l2_k: Vec<Array1<f64>> = ref_l2_raw_k
+    let mut ref_l2_k: Vec<ColF> = ref_l2_raw_k
         .iter()
         .map(|v| filter_by_mask(v, &valid_mask))
         .collect();
     let mut keep_snps = filter_strings_by_mask(&snp_raw, &valid_mask);
 
-    warn_small_snp_count(chi2.len());
+    warn_small_snp_count(col_len(&chi2));
 
     let chisq_max = if let Some(c) = args.chisq_max {
         Some(c)
     } else {
-        let max_n = n_vec.iter().cloned().fold(0.0f64, f64::max);
+        let mut max_n = 0.0f64;
+        let n_len = col_len(&n_vec);
+        for i in 0..n_len {
+            let v = n_vec[(i, 0)];
+            if v > max_n {
+                max_n = v;
+            }
+        }
         Some((0.001 * max_n).max(80.0))
     };
 
     if let Some(cmax) = chisq_max {
-        let mask: Vec<bool> = chi2.iter().map(|&c| c < cmax).collect();
+        let mut mask = Vec::with_capacity(col_len(&chi2));
+        for i in 0..col_len(&chi2) {
+            mask.push(chi2[(i, 0)] < cmax);
+        }
         let n_removed = mask.iter().filter(|&&b| !b).count();
         if n_removed > 0 {
             println!("  Removed {} SNPs with chi2 > {:.1}", n_removed, cmax);
@@ -973,8 +1017,8 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
         keep_snps = filter_strings_by_mask(&keep_snps, &mask);
     }
 
-    let n_obs = chi2.len();
-    let n_mean = n_vec.mean().unwrap_or(1.0);
+    let n_obs = col_len(&chi2);
+    let n_mean = col_mean(&n_vec);
 
     let keep_idx_opt = if keep_idx.len() == k_full {
         None
@@ -1039,7 +1083,7 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
         )?;
         joined = joined.sort(["idx"], SortMultipleOptions::default())?;
 
-        let mut cts_arrays: Vec<Array1<f64>> = Vec::new();
+        let mut cts_arrays: Vec<ColF> = Vec::new();
         for col in &cts_cols {
             let s = joined
                 .column(col)
@@ -1058,7 +1102,7 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
                 })?;
                 v.push(val);
             }
-            cts_arrays.push(Array1::from(v));
+            cts_arrays.push(col_from_vec(v));
         }
 
         anyhow::ensure!(
@@ -1088,8 +1132,8 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
             Some(&m_vec),
         )?;
 
-        let coef = fit.est[0] / n_mean;
-        let coef_var = fit.jknife_cov[[0, 0]] / (n_mean * n_mean);
+        let coef = fit.est[(0, 0)] / n_mean;
+        let coef_var = fit.jknife_cov[(0, 0)] / (n_mean * n_mean);
         let coef_se = coef_var.max(0.0).sqrt();
         let z = if coef_se == 0.0 {
             f64::NAN
@@ -1101,11 +1145,11 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
 
         if args.print_all_cts {
             for i in 1..ct_prefixes.len() {
-                if i >= fit.est.len() {
+                if i >= col_len(&fit.est) {
                     break;
                 }
-                let coef = fit.est[i] / n_mean;
-                let coef_var = fit.jknife_cov[[i, i]] / (n_mean * n_mean);
+                let coef = fit.est[(i, 0)] / n_mean;
+                let coef_var = fit.jknife_cov[(i, i)] / (n_mean * n_mean);
                 let coef_se = coef_var.max(0.0).sqrt();
                 let z = if coef_se == 0.0 {
                     f64::NAN
@@ -1141,9 +1185,9 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 struct PartitionedFit {
-    est: Array1<f64>,
-    jknife_cov: Array2<f64>,
-    delete_values: Array2<f64>,
+    est: ColF,
+    jknife_cov: MatF,
+    delete_values: MatF,
     m_vec: Vec<f64>,
     n_mean: f64,
     h2_per_annot: Vec<f64>,
@@ -1152,41 +1196,65 @@ struct PartitionedFit {
     n_blocks: usize,
 }
 
-fn ratio_jackknife(
-    est: &Array1<f64>,
-    numer_delete: &Array2<f64>,
-    denom_delete: &Array2<f64>,
-) -> (Array2<f64>, Array1<f64>) {
+fn ratio_jackknife(est: &ColF, numer_delete: &MatF, denom_delete: &MatF) -> (MatF, ColF) {
     let n_blocks = numer_delete.nrows();
     let k = numer_delete.ncols();
-    let mut pseudo = Array2::<f64>::zeros((n_blocks, k));
+    let mut pseudo = mat_zeros(n_blocks, k);
     for b in 0..n_blocks {
         for j in 0..k {
-            let denom = denom_delete[[b, j]];
-            let numer = numer_delete[[b, j]];
-            pseudo[[b, j]] = if denom == 0.0 {
+            let denom = denom_delete[(b, j)];
+            let numer = numer_delete[(b, j)];
+            pseudo[(b, j)] = if denom == 0.0 {
                 f64::NAN
             } else {
-                n_blocks as f64 * est[j] - (n_blocks as f64 - 1.0) * (numer / denom)
+                n_blocks as f64 * est[(j, 0)] - (n_blocks as f64 - 1.0) * (numer / denom)
             };
         }
     }
-    let mean = pseudo.mean_axis(Axis(0)).unwrap();
-    let centered = Array2::from_shape_fn((n_blocks, k), |(b, j)| pseudo[[b, j]] - mean[j]);
-    let cov = centered.t().dot(&centered) / ((n_blocks as f64 - 1.0) * n_blocks as f64);
-    let mut se = Array1::<f64>::zeros(k);
+    let mut mean = col_zeros(k);
     for j in 0..k {
-        se[j] = cov[[j, j]].max(0.0).sqrt();
+        let mut sum = 0.0;
+        for b in 0..n_blocks {
+            sum += pseudo[(b, j)];
+        }
+        mean[(j, 0)] = sum / n_blocks as f64;
+    }
+    let mut centered = mat_zeros(n_blocks, k);
+    for b in 0..n_blocks {
+        for j in 0..k {
+            centered[(b, j)] = pseudo[(b, j)] - mean[(j, 0)];
+        }
+    }
+    let mut cov = mat_zeros(k, k);
+    matmul_tn_to(
+        cov.as_mut(),
+        centered.as_ref(),
+        centered.as_ref(),
+        1.0,
+        Accum::Replace,
+        Par::Seq,
+    );
+    let scale = (n_blocks as f64 - 1.0) * n_blocks as f64;
+    if scale > 0.0 {
+        for i in 0..k {
+            for j in 0..k {
+                cov[(i, j)] /= scale;
+            }
+        }
+    }
+    let mut se = col_zeros(k);
+    for j in 0..k {
+        se[(j, 0)] = cov[(j, j)].max(0.0).sqrt();
     }
     (cov, se)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn fit_h2_partitioned(
-    chi2: &Array1<f64>,
-    ref_l2_k: &[Array1<f64>],
-    w_l2: &Array1<f64>,
-    n_vec: &Array1<f64>,
+    chi2: &ColF,
+    ref_l2_k: &[ColF],
+    w_l2: &ColF,
+    n_vec: &ColF,
     n_obs: usize,
     n_mean: f64,
     args: &H2Args,
@@ -1215,19 +1283,19 @@ fn fit_h2_partitioned(
     let m_total: f64 = m_vec.iter().sum();
     let n_blocks = n_obs.min(args.n_blocks);
 
-    let mut x_raw = Array2::<f64>::zeros((n_obs, k));
+    let mut x_raw = mat_zeros(n_obs, k);
     for (j, col_v) in ref_l2_k.iter().enumerate() {
         for i in 0..n_obs {
-            x_raw[[i, j]] = col_v[i];
+            x_raw[(i, j)] = col_v[(i, 0)];
         }
     }
-    let mut x_tot = Array1::<f64>::zeros(n_obs);
+    let mut x_tot = col_zeros(n_obs);
     for i in 0..n_obs {
         let mut sum = 0.0;
         for j in 0..k {
-            sum += x_raw[[i, j]];
+            sum += x_raw[(i, j)];
         }
-        x_tot[i] = sum;
+        x_tot[(i, 0)] = sum;
     }
 
     let fixed_intercept = if let Some(fixed) = args.intercept_h2 {
@@ -1238,36 +1306,43 @@ fn fit_h2_partitioned(
         None
     };
 
-    let y_reg = if let Some(fixed) = fixed_intercept {
-        chi2.mapv(|c| c - fixed)
-    } else {
-        chi2.clone()
-    };
+    let mut y_reg = chi2.clone();
+    if let Some(fixed) = fixed_intercept {
+        for i in 0..n_obs {
+            y_reg[(i, 0)] -= fixed;
+        }
+    }
 
     let x_cols = if fixed_intercept.is_some() { k } else { k + 1 };
-    let mut x_reg = Array2::<f64>::zeros((n_obs, x_cols));
+    let mut x_reg = mat_zeros(n_obs, x_cols);
     for i in 0..n_obs {
-        let scale = n_vec[i] / n_mean;
+        let scale = n_vec[(i, 0)] / n_mean;
         for j in 0..k {
-            x_reg[[i, j]] = x_raw[[i, j]] * scale;
+            x_reg[(i, j)] = x_raw[(i, j)] * scale;
         }
         if fixed_intercept.is_none() {
-            x_reg[[i, k]] = 1.0;
+            x_reg[(i, k)] = 1.0;
         }
     }
 
     let agg_intercept = fixed_intercept.unwrap_or(1.0);
     let hsq = aggregate(chi2, &x_tot, n_vec, m_total, agg_intercept);
     let initial_w = ldsc_weights(&x_tot, w_l2, n_vec, m_total, hsq, agg_intercept);
-    let w_sqrt = initial_w.mapv(|v| v.sqrt());
+    let mut w_sqrt = initial_w.clone();
+    for i in 0..col_len(&w_sqrt) {
+        w_sqrt[(i, 0)] = w_sqrt[(i, 0)].sqrt();
+    }
     let (xw, yw) = weight_xy(&x_reg, &y_reg, &w_sqrt)?;
     let jknife: JackknifeResult =
         jackknife_fast(&xw, &yw, n_blocks, None).context("jackknife for partitioned h2")?;
 
-    let coef = jknife.est.slice(s![..k]).to_owned() / n_mean;
-    let h2_per_annot: Vec<f64> = (0..k).map(|j| coef[j] * m_vec[j]).collect();
+    let mut coef = col_zeros(k);
+    for j in 0..k {
+        coef[(j, 0)] = jknife.est[(j, 0)] / n_mean;
+    }
+    let h2_per_annot: Vec<f64> = (0..k).map(|j| coef[(j, 0)] * m_vec[j]).collect();
     let h2_total: f64 = h2_per_annot.iter().sum();
-    let intercept = fixed_intercept.unwrap_or_else(|| jknife.est[k]);
+    let intercept = fixed_intercept.unwrap_or_else(|| jknife.est[(k, 0)]);
 
     Ok(PartitionedFit {
         est: jknife.est,
@@ -1306,7 +1381,7 @@ fn print_partitioned_summary(fit: &PartitionedFit, l2_cols: &[String], args: &H2
             } else {
                 f64::NAN
             };
-            let coeff = fit.est[j] / fit.n_mean;
+            let coeff = fit.est[(j, 0)] / fit.n_mean;
             println!(
                 "{:<35} {:>10.4} {:>10.4} {:>12.4} {:>14.4e}",
                 col_name, prop_h2, prop_m, enrichment, coeff
@@ -1319,7 +1394,7 @@ fn print_partitioned_summary(fit: &PartitionedFit, l2_cols: &[String], args: &H2
 fn write_overlap_results(
     fit: &PartitionedFit,
     category_names: &[String],
-    overlap: &Array2<f64>,
+    overlap: &MatF,
     m_tot: usize,
     print_coefficients: bool,
     out_prefix: &str,
@@ -1336,14 +1411,23 @@ fn write_overlap_results(
     let m_vec = &fit.m_vec;
     let m_tot_f = m_tot as f64;
 
-    let coef = fit.est.slice(s![..k]).to_owned() / fit.n_mean;
-    let coef_cov = fit.jknife_cov.slice(s![..k, ..k]).to_owned() / (fit.n_mean * fit.n_mean);
-    let mut coef_se = Array1::<f64>::zeros(k);
+    let mut coef = col_zeros(k);
     for j in 0..k {
-        coef_se[j] = coef_cov[[j, j]].max(0.0).sqrt();
+        coef[(j, 0)] = fit.est[(j, 0)] / fit.n_mean;
+    }
+    let mut coef_cov = mat_zeros(k, k);
+    let scale = fit.n_mean * fit.n_mean;
+    for i in 0..k {
+        for j in 0..k {
+            coef_cov[(i, j)] = fit.jknife_cov[(i, j)] / scale;
+        }
+    }
+    let mut coef_se = col_zeros(k);
+    for j in 0..k {
+        coef_se[(j, 0)] = coef_cov[(j, j)].max(0.0).sqrt();
     }
 
-    let prop = Array1::from(
+    let prop = col_from_vec(
         fit.h2_per_annot
             .iter()
             .map(|&h| {
@@ -1357,71 +1441,124 @@ fn write_overlap_results(
     );
     let (prop_cov, _prop_se) = {
         let n_blocks = fit.delete_values.nrows();
-        let mut numer = Array2::<f64>::zeros((n_blocks, k));
+        let mut numer = mat_zeros(n_blocks, k);
         for b in 0..n_blocks {
             for j in 0..k {
-                numer[[b, j]] = m_vec[j] * fit.delete_values[[b, j]] / fit.n_mean;
+                numer[(b, j)] = m_vec[j] * fit.delete_values[(b, j)] / fit.n_mean;
             }
         }
-        let mut denom = Array2::<f64>::zeros((n_blocks, k));
+        let mut denom = mat_zeros(n_blocks, k);
         for b in 0..n_blocks {
-            let sum = numer.row(b).sum();
+            let mut sum = 0.0;
             for j in 0..k {
-                denom[[b, j]] = sum;
+                sum += numer[(b, j)];
+            }
+            for j in 0..k {
+                denom[(b, j)] = sum;
             }
         }
         ratio_jackknife(&prop, &numer, &denom)
     };
 
-    let mut overlap_prop = Array2::<f64>::zeros((k, k));
+    let mut overlap_prop = mat_zeros(k, k);
     for i in 0..k {
         for j in 0..k {
-            overlap_prop[[i, j]] = overlap[[i, j]] / m_vec[j];
+            overlap_prop[(i, j)] = overlap[(i, j)] / m_vec[j];
         }
     }
 
-    let prop_h2_overlap = overlap_prop.dot(&prop);
-    let prop_h2_overlap_var = overlap_prop.dot(&prop_cov).dot(&overlap_prop.t());
-    let mut prop_h2_overlap_se = Array1::<f64>::zeros(k);
+    let mut prop_h2_overlap = col_zeros(k);
+    for i in 0..k {
+        let mut sum = 0.0;
+        for j in 0..k {
+            sum += overlap_prop[(i, j)] * prop[(j, 0)];
+        }
+        prop_h2_overlap[(i, 0)] = sum;
+    }
+    let mut tmp = mat_zeros(k, k);
+    matmul_to(
+        tmp.as_mut(),
+        overlap_prop.as_ref(),
+        prop_cov.as_ref(),
+        1.0,
+        Accum::Replace,
+        Par::Seq,
+    );
+    let mut prop_h2_overlap_var = mat_zeros(k, k);
+    matmul_nt_to(
+        prop_h2_overlap_var.as_mut(),
+        tmp.as_ref(),
+        overlap_prop.as_ref(),
+        1.0,
+        Accum::Replace,
+        Par::Seq,
+    );
+    let mut prop_h2_overlap_se = col_zeros(k);
     for j in 0..k {
-        prop_h2_overlap_se[j] = prop_h2_overlap_var[[j, j]].max(0.0).sqrt();
+        prop_h2_overlap_se[(j, 0)] = prop_h2_overlap_var[(j, j)].max(0.0).sqrt();
     }
 
-    let prop_m_overlap = Array1::from(
-        m_vec
-            .iter()
-            .map(|&m| if m_tot_f > 0.0 { m / m_tot_f } else { f64::NAN })
-            .collect::<Vec<_>>(),
-    );
-    let enrichment = &prop_h2_overlap / &prop_m_overlap;
-    let enrichment_se = &prop_h2_overlap_se / &prop_m_overlap;
+    let prop_m_overlap: Vec<f64> = m_vec
+        .iter()
+        .map(|&m| if m_tot_f > 0.0 { m / m_tot_f } else { f64::NAN })
+        .collect();
+    let mut enrichment = vec![0.0; k];
+    let mut enrichment_se = vec![0.0; k];
+    for i in 0..k {
+        enrichment[i] = prop_h2_overlap[(i, 0)] / prop_m_overlap[i];
+        enrichment_se[i] = prop_h2_overlap_se[(i, 0)] / prop_m_overlap[i];
+    }
 
-    let mut overlap_diff = Array2::<f64>::zeros((k, k));
+    let mut overlap_diff = mat_zeros(k, k);
     for i in 0..k {
         if (m_tot_f - m_vec[i]).abs() < 1e-12 {
             continue;
         }
         for j in 0..k {
-            let term1 = overlap[[i, j]] / m_vec[i];
-            let term2 = (m_vec[j] - overlap[[i, j]]) / (m_tot_f - m_vec[i]);
-            overlap_diff[[i, j]] = term1 - term2;
+            let term1 = overlap[(i, j)] / m_vec[i];
+            let term2 = (m_vec[j] - overlap[(i, j)]) / (m_tot_f - m_vec[i]);
+            overlap_diff[(i, j)] = term1 - term2;
         }
     }
 
-    let diff_est = overlap_diff.dot(&coef);
-    let diff_cov: Array2<f64> = overlap_diff.dot(&coef_cov).dot(&overlap_diff.t());
-    let mut diff_se = Array1::<f64>::zeros(k);
+    let mut diff_est = col_zeros(k);
+    for i in 0..k {
+        let mut sum = 0.0;
+        for j in 0..k {
+            sum += overlap_diff[(i, j)] * coef[(j, 0)];
+        }
+        diff_est[(i, 0)] = sum;
+    }
+    let mut tmp2 = mat_zeros(k, k);
+    matmul_to(
+        tmp2.as_mut(),
+        overlap_diff.as_ref(),
+        coef_cov.as_ref(),
+        1.0,
+        Accum::Replace,
+        Par::Seq,
+    );
+    let mut diff_cov = mat_zeros(k, k);
+    matmul_nt_to(
+        diff_cov.as_mut(),
+        tmp2.as_ref(),
+        overlap_diff.as_ref(),
+        1.0,
+        Accum::Replace,
+        Par::Seq,
+    );
+    let mut diff_se = col_zeros(k);
     for j in 0..k {
-        diff_se[j] = diff_cov[[j, j]].max(0.0).sqrt();
+        diff_se[(j, 0)] = diff_cov[(j, j)].max(0.0).sqrt();
     }
     let tdist =
         StudentsT::new(0.0, 1.0, fit.n_blocks as f64).context("constructing t distribution")?;
     let diff_p: Vec<String> = (0..k)
         .map(|i| {
-            if diff_se[i] == 0.0 {
+            if diff_se[(i, 0)] == 0.0 {
                 "NA".to_string()
             } else {
-                let t = (diff_est[i] / diff_se[i]).abs();
+                let t = (diff_est[(i, 0)] / diff_se[(i, 0)]).abs();
                 format!("{}", 2.0 * tdist.sf(t))
             }
         })
@@ -1447,23 +1584,23 @@ fn write_overlap_results(
 
     for i in 0..k {
         if print_coefficients {
-            let z = if coef_se[i] == 0.0 {
+            let z = if coef_se[(i, 0)] == 0.0 {
                 f64::NAN
             } else {
-                coef[i] / coef_se[i]
+                coef[(i, 0)] / coef_se[(i, 0)]
             };
             writeln!(
                 w,
                 "{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6e}\t{:.6e}\t{:.6}",
                 category_names[i],
                 prop_m_overlap[i],
-                prop_h2_overlap[i],
-                prop_h2_overlap_se[i],
+                prop_h2_overlap[(i, 0)],
+                prop_h2_overlap_se[(i, 0)],
                 enrichment[i],
                 enrichment_se[i],
                 diff_p[i],
-                coef[i],
-                coef_se[i],
+                coef[(i, 0)],
+                coef_se[(i, 0)],
                 z
             )?;
         } else {
@@ -1472,8 +1609,8 @@ fn write_overlap_results(
                 "{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}",
                 category_names[i],
                 prop_m_overlap[i],
-                prop_h2_overlap[i],
-                prop_h2_overlap_se[i],
+                prop_h2_overlap[(i, 0)],
+                prop_h2_overlap_se[(i, 0)],
                 enrichment[i],
                 enrichment_se[i],
                 diff_p[i]
@@ -1499,26 +1636,17 @@ fn write_overlap_results(
 /// matching the scalar LDSC regression formula.
 #[allow(clippy::too_many_arguments)]
 fn run_h2_partitioned(
-    chi2: &Array1<f64>,
-    ref_l2_k: &[Array1<f64>],
-    w_l2: &Array1<f64>,
-    n_vec: &Array1<f64>,
+    chi2: &ColF,
+    ref_l2_k: &[ColF],
+    w_l2: &ColF,
+    n_vec: &ColF,
     l2_cols: &[String],
     n_obs: usize,
     n_mean: f64,
     args: &H2Args,
     m_override: Option<&[f64]>,
 ) -> Result<PartitionedFit> {
-    let fit = fit_h2_partitioned(
-        chi2,
-        ref_l2_k,
-        w_l2,
-        n_vec,
-        n_obs,
-        n_mean,
-        args,
-        m_override,
-    )?;
+    let fit = fit_h2_partitioned(chi2, ref_l2_k, w_l2, n_vec, n_obs, n_mean, args, m_override)?;
 
     print_partitioned_summary(&fit, l2_cols, args);
     print_jackknife_diagnostics(
@@ -1555,7 +1683,7 @@ struct HsqFit {
     mean_chi2: f64,
     lambda_gc: f64,
     ratio: Option<(f64, f64)>,
-    tot_delete_values: Array1<f64>,
+    tot_delete_values: ColF,
 }
 
 #[allow(dead_code)]
@@ -1566,20 +1694,22 @@ struct GencovFit {
     intercept: f64,
     intercept_se: f64,
     mean_z1z2: f64,
-    tot_delete_values: Array1<f64>,
+    tot_delete_values: ColF,
 }
 
-fn mean(arr: &Array1<f64>) -> f64 {
-    arr.mean().unwrap_or(f64::NAN)
+fn mean(arr: &ColF) -> f64 {
+    col_mean(arr)
 }
 
-fn sum_ref_l2(ref_l2_k: &[Array1<f64>]) -> Result<Array1<f64>> {
+fn sum_ref_l2(ref_l2_k: &[ColF]) -> Result<ColF> {
     anyhow::ensure!(!ref_l2_k.is_empty(), "No L2 columns supplied");
-    let n = ref_l2_k[0].len();
-    let mut out = Array1::<f64>::zeros(n);
+    let n = col_len(&ref_l2_k[0]);
+    let mut out = col_zeros(n);
     for col in ref_l2_k {
-        anyhow::ensure!(col.len() == n, "L2 column length mismatch");
-        out += col;
+        anyhow::ensure!(col_len(col) == n, "L2 column length mismatch");
+        for i in 0..n {
+            out[(i, 0)] += col[(i, 0)];
+        }
     }
     Ok(out)
 }
@@ -1588,37 +1718,43 @@ fn total_from_jknife(
     jknife: &JackknifeResult,
     m_vec: &[f64],
     nbar: f64,
-) -> Result<(f64, f64, Array1<f64>)> {
+) -> Result<(f64, f64, ColF)> {
     let k = m_vec.len();
     anyhow::ensure!(
-        jknife.est.len() >= k,
+        col_len(&jknife.est) >= k,
         "Jackknife estimate has {} params but K={}",
-        jknife.est.len(),
+        col_len(&jknife.est),
         k
     );
-    let coef_cov = jknife.jknife_cov.slice(s![0..k, 0..k]).to_owned() / (nbar * nbar);
+    let mut coef_cov = mat_zeros(k, k);
+    let scale = nbar * nbar;
+    for i in 0..k {
+        for j in 0..k {
+            coef_cov[(i, j)] = jknife.jknife_cov[(i, j)] / scale;
+        }
+    }
 
     let mut tot = 0.0;
     for (j, m) in m_vec.iter().enumerate().take(k) {
-        tot += m * (jknife.est[j] / nbar);
+        tot += m * (jknife.est[(j, 0)] / nbar);
     }
 
     let mut tot_cov = 0.0;
     for i in 0..k {
         for j in 0..k {
-            tot_cov += m_vec[i] * m_vec[j] * coef_cov[[i, j]];
+            tot_cov += m_vec[i] * m_vec[j] * coef_cov[(i, j)];
         }
     }
     let tot_se = tot_cov.max(0.0).sqrt();
 
     let n_blocks = jknife.delete_values.nrows();
-    let mut tot_delete = Array1::<f64>::zeros(n_blocks);
+    let mut tot_delete = col_zeros(n_blocks);
     for b in 0..n_blocks {
         let mut sum = 0.0;
         for (j, m) in m_vec.iter().enumerate().take(k) {
-            sum += m * jknife.delete_values[[b, j]];
+            sum += m * jknife.delete_values[(b, j)];
         }
-        tot_delete[b] = sum / nbar;
+        tot_delete[(b, 0)] = sum / nbar;
     }
 
     Ok((tot, tot_se, tot_delete))
@@ -1626,10 +1762,10 @@ fn total_from_jknife(
 
 #[allow(clippy::too_many_arguments)]
 fn gencov_weights(
-    ld: &Array1<f64>,
-    w_ld: &Array1<f64>,
-    n1: &Array1<f64>,
-    n2: &Array1<f64>,
+    ld: &ColF,
+    w_ld: &ColF,
+    n1: &ColF,
+    n2: &ColF,
     m_total: f64,
     h1: f64,
     h2: f64,
@@ -1637,45 +1773,46 @@ fn gencov_weights(
     intercept_gencov: f64,
     intercept_hsq1: f64,
     intercept_hsq2: f64,
-) -> Array1<f64> {
+) -> ColF {
     let h1 = h1.clamp(0.0, 1.0);
     let h2 = h2.clamp(0.0, 1.0);
     let rho_g = rho_g.clamp(-1.0, 1.0);
 
-    let mut out = Array1::<f64>::zeros(ld.len());
-    for i in 0..ld.len() {
-        let ld_i = ld[i].max(1.0);
-        let w_i = w_ld[i].max(1.0);
-        let a = n1[i] * h1 * ld_i / m_total + intercept_hsq1;
-        let b = n2[i] * h2 * ld_i / m_total + intercept_hsq2;
-        let c = (n1[i] * n2[i]).sqrt() * rho_g * ld_i / m_total + intercept_gencov;
+    let n = col_len(ld);
+    let mut out = col_zeros(n);
+    for i in 0..n {
+        let ld_i = ld[(i, 0)].max(1.0);
+        let w_i = w_ld[(i, 0)].max(1.0);
+        let a = n1[(i, 0)] * h1 * ld_i / m_total + intercept_hsq1;
+        let b = n2[(i, 0)] * h2 * ld_i / m_total + intercept_hsq2;
+        let c = (n1[(i, 0)] * n2[(i, 0)]).sqrt() * rho_g * ld_i / m_total + intercept_gencov;
         let het_w = 1.0 / (a * b + c * c);
         let oc_w = 1.0 / w_i;
-        out[i] = het_w * oc_w;
+        out[(i, 0)] = het_w * oc_w;
     }
     out
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_hsq_ldsc(
-    chi2: &Array1<f64>,
-    ref_l2_k: &[Array1<f64>],
-    w_l2: &Array1<f64>,
-    n_vec: &Array1<f64>,
+    chi2: &ColF,
+    ref_l2_k: &[ColF],
+    w_l2: &ColF,
+    n_vec: &ColF,
     m_vec: &[f64],
     n_blocks: usize,
     two_step: Option<f64>,
     fixed_intercept: Option<f64>,
 ) -> Result<HsqFit> {
-    let n = chi2.len();
+    let n = col_len(chi2);
     let k = ref_l2_k.len();
     anyhow::ensure!(k > 0, "run_hsq_ldsc: no L2 columns");
     anyhow::ensure!(
-        w_l2.len() == n && n_vec.len() == n,
+        col_len(w_l2) == n && col_len(n_vec) == n,
         "run_hsq_ldsc: length mismatch"
     );
     for col in ref_l2_k {
-        anyhow::ensure!(col.len() == n, "run_hsq_ldsc: L2 length mismatch");
+        anyhow::ensure!(col_len(col) == n, "run_hsq_ldsc: L2 length mismatch");
     }
 
     let nbar = mean(n_vec);
@@ -1686,20 +1823,27 @@ fn run_hsq_ldsc(
     let tot_agg = aggregate(chi2, &ref_l2_tot, n_vec, m_total, intercept0);
     let initial_w = ldsc_weights(&ref_l2_tot, w_l2, n_vec, m_total, tot_agg, intercept0);
 
-    let mut x_scaled = Array2::<f64>::zeros((n, k));
+    let mut x_scaled = mat_zeros(n, k);
     for (j, col) in ref_l2_k.iter().enumerate() {
         for i in 0..n {
-            x_scaled[[i, j]] = n_vec[i] * col[i] / nbar;
+            x_scaled[(i, j)] = n_vec[(i, 0)] * col[(i, 0)] / nbar;
         }
     }
 
     let (y_reg, x_reg) = if let Some(fixed) = fixed_intercept {
-        let y_adj = chi2.mapv(|c| c - fixed);
+        let mut y_adj = chi2.clone();
+        for i in 0..n {
+            y_adj[(i, 0)] -= fixed;
+        }
         (y_adj, x_scaled.clone())
     } else {
-        let mut x_i = Array2::<f64>::zeros((n, k + 1));
-        x_i.slice_mut(s![.., 0..k]).assign(&x_scaled);
-        x_i.column_mut(k).fill(1.0);
+        let mut x_i = mat_zeros(n, k + 1);
+        for i in 0..n {
+            for j in 0..k {
+                x_i[(i, j)] = x_scaled[(i, j)];
+            }
+            x_i[(i, k)] = 1.0;
+        }
         (chi2.clone(), x_i)
     };
 
@@ -1711,58 +1855,76 @@ fn run_hsq_ldsc(
     }
 
     let jknife = if let Some(twostep) = two_step {
-        let mask: Vec<bool> = chi2.iter().map(|&c| c < twostep).collect();
+        let mut mask = vec![false; n];
+        for i in 0..n {
+            mask[i] = chi2[(i, 0)] < twostep;
+        }
         let n_s1 = mask.iter().filter(|&&b| b).count();
 
-        let mut x1 = Array2::<f64>::zeros((n_s1, x_reg.ncols()));
-        let mut y1 = Array1::<f64>::zeros(n_s1);
-        let mut w1 = Array1::<f64>::zeros(n_s1);
-        let mut n1v = Array1::<f64>::zeros(n_s1);
+        let mut x1 = mat_zeros(n_s1, x_reg.ncols());
+        let mut y1 = col_zeros(n_s1);
+        let mut w1 = col_zeros(n_s1);
+        let mut n1v = col_zeros(n_s1);
         let mut idx = 0usize;
         for i in 0..n {
             if mask[i] {
-                x1.row_mut(idx).assign(&x_reg.row(i));
-                y1[idx] = y_reg[i];
-                w1[idx] = w_l2[i];
-                n1v[idx] = n_vec[i];
+                for j in 0..x_reg.ncols() {
+                    x1[(idx, j)] = x_reg[(i, j)];
+                }
+                y1[(idx, 0)] = y_reg[(i, 0)];
+                w1[(idx, 0)] = w_l2[(i, 0)];
+                n1v[(idx, 0)] = n_vec[(i, 0)];
                 idx += 1;
             }
         }
-        let initial_w1_vec: Vec<f64> = initial_w
-            .iter()
-            .zip(mask.iter())
-            .filter_map(|(&v, keep)| if *keep { Some(v) } else { None })
-            .collect();
-        let initial_w1 = Array1::from_vec(initial_w1_vec);
+        let mut initial_w1_vec = Vec::with_capacity(n_s1);
+        for i in 0..n {
+            if mask[i] {
+                initial_w1_vec.push(initial_w[(i, 0)]);
+            }
+        }
+        let initial_w1 = col_from_vec(initial_w1_vec);
 
-        let x1_col0 = x1.column(0).to_owned();
-        let update_func1 = move |coef: &Array1<f64>| {
-            let hsq = m_total * coef[0] / nbar;
-            let intercept = coef[1];
+        let mut x1_col0 = col_zeros(n_s1);
+        for i in 0..n_s1 {
+            x1_col0[(i, 0)] = x1[(i, 0)];
+        }
+        let update_func1 = move |coef: &ColF| {
+            let hsq = m_total * coef[(0, 0)] / nbar;
+            let intercept = coef[(1, 0)];
             ldsc_weights(&x1_col0, &w1, &n1v, m_total, hsq, intercept)
         };
 
         let step1 = irwls_ldsc(&x1, &y1, &initial_w1, update_func1, n_blocks, None)?;
-        let step1_int = step1.est[k];
+        let step1_int = step1.est[(k, 0)];
 
-        let y2 = y_reg.mapv(|c| c - step1_int);
+        let mut y2 = y_reg.clone();
+        for i in 0..n {
+            y2[(i, 0)] -= step1_int;
+        }
         let x2 = x_scaled.clone();
-        let update_func2 = |coef: &Array1<f64>| {
-            let hsq = m_total * coef[0] / nbar;
+        let update_func2 = |coef: &ColF| {
+            let hsq = m_total * coef[(0, 0)] / nbar;
             ldsc_weights(&ref_l2_tot, w_l2, n_vec, m_total, hsq, step1_int)
         };
 
         let seps = update_separators(&step1.separators, &mask);
         let step2 = irwls_ldsc(&x2, &y2, &initial_w, update_func2, n_blocks, Some(&seps))?;
 
-        let num = (&initial_w * &x2.column(0)).sum();
-        let denom = (&initial_w * &x2.column(0).mapv(|v| v * v)).sum();
+        let mut num = 0.0;
+        let mut denom = 0.0;
+        for i in 0..n {
+            let w = initial_w[(i, 0)];
+            let x = x2[(i, 0)];
+            num += w * x;
+            denom += w * x * x;
+        }
         let c = num / denom;
         combine_twostep(&step1, &step2, c)?
     } else {
-        let update_func = |coef: &Array1<f64>| {
-            let hsq = m_total * coef[0] / nbar;
-            let intercept = fixed_intercept.unwrap_or(coef[k]);
+        let update_func = |coef: &ColF| {
+            let hsq = m_total * coef[(0, 0)] / nbar;
+            let intercept = fixed_intercept.unwrap_or(coef[(k, 0)]);
             ldsc_weights(&ref_l2_tot, w_l2, n_vec, m_total, hsq, intercept)
         };
         irwls_ldsc(&x_reg, &y_reg, &initial_w, update_func, n_blocks, None)?
@@ -1773,12 +1935,15 @@ fn run_hsq_ldsc(
     let (intercept, intercept_se) = if let Some(fixed) = fixed_intercept {
         (fixed, f64::NAN)
     } else {
-        (jknife.est[k], jknife.jknife_se[k])
+        (jknife.est[(k, 0)], jknife.jknife_se[(k, 0)])
     };
 
     let mean_chi2 = mean(chi2);
     let lambda_gc = {
-        let mut vals = chi2.to_vec();
+        let mut vals = Vec::with_capacity(n);
+        for i in 0..n {
+            vals.push(chi2[(i, 0)]);
+        }
         vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let n = vals.len();
         let mid = if n == 0 {
@@ -1814,12 +1979,12 @@ fn run_hsq_ldsc(
 
 #[allow(clippy::too_many_arguments)]
 fn run_gencov_ldsc(
-    z1: &Array1<f64>,
-    z2: &Array1<f64>,
-    ref_l2_k: &[Array1<f64>],
-    w_l2: &Array1<f64>,
-    n1: &Array1<f64>,
-    n2: &Array1<f64>,
+    z1: &ColF,
+    z2: &ColF,
+    ref_l2_k: &[ColF],
+    w_l2: &ColF,
+    n1: &ColF,
+    n2: &ColF,
     m_vec: &[f64],
     n_blocks: usize,
     two_step: Option<f64>,
@@ -1827,24 +1992,30 @@ fn run_gencov_ldsc(
     hsq1: &HsqFit,
     hsq2: &HsqFit,
 ) -> Result<GencovFit> {
-    let n = z1.len();
+    let n = col_len(z1);
     let k = ref_l2_k.len();
     anyhow::ensure!(k > 0, "run_gencov_ldsc: no L2 columns");
     anyhow::ensure!(
-        z2.len() == n && w_l2.len() == n && n1.len() == n && n2.len() == n,
+        col_len(z2) == n && col_len(w_l2) == n && col_len(n1) == n && col_len(n2) == n,
         "run_gencov_ldsc: length mismatch"
     );
     for col in ref_l2_k {
-        anyhow::ensure!(col.len() == n, "run_gencov_ldsc: L2 length mismatch");
+        anyhow::ensure!(col_len(col) == n, "run_gencov_ldsc: L2 length mismatch");
     }
 
     let m_total: f64 = m_vec.iter().sum();
     let ref_l2_tot = sum_ref_l2(ref_l2_k)?;
-    let sqrt_n1n2 = Array1::from_iter(n1.iter().zip(n2.iter()).map(|(&a, &b)| (a * b).sqrt()));
+    let mut sqrt_n1n2 = col_zeros(n);
+    for i in 0..n {
+        sqrt_n1n2[(i, 0)] = (n1[(i, 0)] * n2[(i, 0)]).sqrt();
+    }
     let nbar = mean(&sqrt_n1n2);
 
     let intercept0 = intercept_gencov.unwrap_or(0.0);
-    let prod = z1 * z2;
+    let mut prod = col_zeros(n);
+    for i in 0..n {
+        prod[(i, 0)] = z1[(i, 0)] * z2[(i, 0)];
+    }
     let tot_agg = aggregate(&prod, &ref_l2_tot, &sqrt_n1n2, m_total, intercept0);
     let initial_w = gencov_weights(
         &ref_l2_tot,
@@ -1860,20 +2031,27 @@ fn run_gencov_ldsc(
         hsq2.intercept,
     );
 
-    let mut x_scaled = Array2::<f64>::zeros((n, k));
+    let mut x_scaled = mat_zeros(n, k);
     for (j, col) in ref_l2_k.iter().enumerate() {
         for i in 0..n {
-            x_scaled[[i, j]] = sqrt_n1n2[i] * col[i] / nbar;
+            x_scaled[(i, j)] = sqrt_n1n2[(i, 0)] * col[(i, 0)] / nbar;
         }
     }
 
     let (y_reg, x_reg) = if let Some(fixed) = intercept_gencov {
-        let y_adj = prod.mapv(|p| p - fixed);
+        let mut y_adj = prod.clone();
+        for i in 0..n {
+            y_adj[(i, 0)] -= fixed;
+        }
         (y_adj, x_scaled.clone())
     } else {
-        let mut x_i = Array2::<f64>::zeros((n, k + 1));
-        x_i.slice_mut(s![.., 0..k]).assign(&x_scaled);
-        x_i.column_mut(k).fill(1.0);
+        let mut x_i = mat_zeros(n, k + 1);
+        for i in 0..n {
+            for j in 0..k {
+                x_i[(i, j)] = x_scaled[(i, j)];
+            }
+            x_i[(i, k)] = 1.0;
+        }
         (prod.clone(), x_i)
     };
 
@@ -1885,40 +2063,47 @@ fn run_gencov_ldsc(
     }
 
     let jknife = if let Some(twostep) = two_step {
-        let mask: Vec<bool> = z1
-            .iter()
-            .zip(z2.iter())
-            .map(|(&a, &b)| a * a < twostep && b * b < twostep)
-            .collect();
+        let mut mask = vec![false; n];
+        for i in 0..n {
+            let a = z1[(i, 0)];
+            let b = z2[(i, 0)];
+            mask[i] = a * a < twostep && b * b < twostep;
+        }
         let n_s1 = mask.iter().filter(|&&b| b).count();
 
-        let mut x1 = Array2::<f64>::zeros((n_s1, x_reg.ncols()));
-        let mut y1 = Array1::<f64>::zeros(n_s1);
-        let mut w1 = Array1::<f64>::zeros(n_s1);
-        let mut n1v = Array1::<f64>::zeros(n_s1);
-        let mut n2v = Array1::<f64>::zeros(n_s1);
+        let mut x1 = mat_zeros(n_s1, x_reg.ncols());
+        let mut y1 = col_zeros(n_s1);
+        let mut w1 = col_zeros(n_s1);
+        let mut n1v = col_zeros(n_s1);
+        let mut n2v = col_zeros(n_s1);
         let mut idx = 0usize;
         for i in 0..n {
             if mask[i] {
-                x1.row_mut(idx).assign(&x_reg.row(i));
-                y1[idx] = y_reg[i];
-                w1[idx] = w_l2[i];
-                n1v[idx] = n1[i];
-                n2v[idx] = n2[i];
+                for j in 0..x_reg.ncols() {
+                    x1[(idx, j)] = x_reg[(i, j)];
+                }
+                y1[(idx, 0)] = y_reg[(i, 0)];
+                w1[(idx, 0)] = w_l2[(i, 0)];
+                n1v[(idx, 0)] = n1[(i, 0)];
+                n2v[(idx, 0)] = n2[(i, 0)];
                 idx += 1;
             }
         }
-        let initial_w1_vec: Vec<f64> = initial_w
-            .iter()
-            .zip(mask.iter())
-            .filter_map(|(&v, keep)| if *keep { Some(v) } else { None })
-            .collect();
-        let initial_w1 = Array1::from_vec(initial_w1_vec);
+        let mut initial_w1_vec = Vec::with_capacity(n_s1);
+        for i in 0..n {
+            if mask[i] {
+                initial_w1_vec.push(initial_w[(i, 0)]);
+            }
+        }
+        let initial_w1 = col_from_vec(initial_w1_vec);
 
-        let x1_col0 = x1.column(0).to_owned();
-        let update_func1 = move |coef: &Array1<f64>| {
-            let rho_g = m_total * coef[0] / nbar;
-            let intercept = coef[1];
+        let mut x1_col0 = col_zeros(n_s1);
+        for i in 0..n_s1 {
+            x1_col0[(i, 0)] = x1[(i, 0)];
+        }
+        let update_func1 = move |coef: &ColF| {
+            let rho_g = m_total * coef[(0, 0)] / nbar;
+            let intercept = coef[(1, 0)];
             gencov_weights(
                 &x1_col0,
                 &w1,
@@ -1935,12 +2120,15 @@ fn run_gencov_ldsc(
         };
 
         let step1 = irwls_ldsc(&x1, &y1, &initial_w1, update_func1, n_blocks, None)?;
-        let step1_int = step1.est[k];
+        let step1_int = step1.est[(k, 0)];
 
-        let y2 = y_reg.mapv(|p| p - step1_int);
+        let mut y2 = y_reg.clone();
+        for i in 0..n {
+            y2[(i, 0)] -= step1_int;
+        }
         let x2 = x_scaled.clone();
-        let update_func2 = |coef: &Array1<f64>| {
-            let rho_g = m_total * coef[0] / nbar;
+        let update_func2 = |coef: &ColF| {
+            let rho_g = m_total * coef[(0, 0)] / nbar;
             gencov_weights(
                 &ref_l2_tot,
                 w_l2,
@@ -1959,14 +2147,20 @@ fn run_gencov_ldsc(
         let seps = update_separators(&step1.separators, &mask);
         let step2 = irwls_ldsc(&x2, &y2, &initial_w, update_func2, n_blocks, Some(&seps))?;
 
-        let num = (&initial_w * &x2.column(0)).sum();
-        let denom = (&initial_w * &x2.column(0).mapv(|v| v * v)).sum();
+        let mut num = 0.0;
+        let mut denom = 0.0;
+        for i in 0..n {
+            let w = initial_w[(i, 0)];
+            let x = x2[(i, 0)];
+            num += w * x;
+            denom += w * x * x;
+        }
         let c = num / denom;
         combine_twostep(&step1, &step2, c)?
     } else {
-        let update_func = |coef: &Array1<f64>| {
-            let rho_g = m_total * coef[0] / nbar;
-            let intercept = intercept_gencov.unwrap_or(coef[k]);
+        let update_func = |coef: &ColF| {
+            let rho_g = m_total * coef[(0, 0)] / nbar;
+            let intercept = intercept_gencov.unwrap_or(coef[(k, 0)]);
             gencov_weights(
                 &ref_l2_tot,
                 w_l2,
@@ -1988,7 +2182,7 @@ fn run_gencov_ldsc(
     let (intercept, intercept_se) = if let Some(fixed) = intercept_gencov {
         (fixed, f64::NAN)
     } else {
-        (jknife.est[k], jknife.jknife_se[k])
+        (jknife.est[(k, 0)], jknife.jknife_se[(k, 0)])
     };
     let mean_z1z2 = mean(&prod);
 
@@ -2167,12 +2361,22 @@ To match Python, provide {} values (first ignored).",
 
         let z1_raw = extract_f64(&merged, "Z1")?;
         let z2_raw = extract_f64(&merged, "Z2")?;
-        let w_l2_raw = extract_f64(&merged, "w_l2")?.mapv(|l| l.max(0.0));
+        let mut w_l2_raw = extract_f64(&merged, "w_l2")?;
+        for i in 0..col_len(&w_l2_raw) {
+            w_l2_raw[(i, 0)] = w_l2_raw[(i, 0)].max(0.0);
+        }
         let n1_raw = extract_f64(&merged, "N1")?;
         let n2_raw = extract_f64(&merged, "N2")?;
-        let ref_l2_raw_k: Vec<Array1<f64>> = ref_l2_cols
+        let ref_l2_raw_k: Vec<ColF> = ref_l2_cols
             .iter()
-            .map(|name| extract_f64(&merged, name).map(|v| v.mapv(|l| l.max(0.0))))
+            .map(|name| {
+                extract_f64(&merged, name).map(|mut v| {
+                    for i in 0..col_len(&v) {
+                        v[(i, 0)] = v[(i, 0)].max(0.0);
+                    }
+                    v
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
 
         let (z1_raw, z2_raw, w_l2_raw, n1_raw, n2_raw, ref_l2_raw_k) = if args.no_check_alleles {
@@ -2190,7 +2394,7 @@ To match Python, provide {} values (first ignored).",
                 println!("  Removed {} SNPs with incompatible alleles", n_removed);
             }
             let z1_f = filter_by_mask(&z1_raw, &mask);
-            let z2_f = Array1::from_vec(z2_aligned);
+            let z2_f = col_from_vec(z2_aligned);
             let w_f = filter_by_mask(&w_l2_raw, &mask);
             let n1_f = filter_by_mask(&n1_raw, &mask);
             let n2_f = filter_by_mask(&n2_raw, &mask);
@@ -2201,18 +2405,19 @@ To match Python, provide {} values (first ignored).",
             (z1_f, z2_f, w_f, n1_f, n2_f, ref_f)
         };
 
-        let mut finite_mask = vec![true; z1_raw.len()];
-        for i in 0..z1_raw.len() {
-            if !z1_raw[i].is_finite()
-                || !z2_raw[i].is_finite()
-                || !w_l2_raw[i].is_finite()
-                || !n1_raw[i].is_finite()
-                || !n2_raw[i].is_finite()
+        let n_raw = col_len(&z1_raw);
+        let mut finite_mask = vec![true; n_raw];
+        for i in 0..n_raw {
+            if !z1_raw[(i, 0)].is_finite()
+                || !z2_raw[(i, 0)].is_finite()
+                || !w_l2_raw[(i, 0)].is_finite()
+                || !n1_raw[(i, 0)].is_finite()
+                || !n2_raw[(i, 0)].is_finite()
             {
                 finite_mask[i] = false;
                 continue;
             }
-            if ref_l2_raw_k.iter().any(|v| !v[i].is_finite()) {
+            if ref_l2_raw_k.iter().any(|v| !v[(i, 0)].is_finite()) {
                 finite_mask[i] = false;
             }
         }
@@ -2225,14 +2430,20 @@ To match Python, provide {} values (first ignored).",
         let w_l2_raw = filter_by_mask(&w_l2_raw, &finite_mask);
         let n1_raw = filter_by_mask(&n1_raw, &finite_mask);
         let n2_raw = filter_by_mask(&n2_raw, &finite_mask);
-        let ref_l2_raw_k: Vec<Array1<f64>> = ref_l2_raw_k
+        let ref_l2_raw_k: Vec<ColF> = ref_l2_raw_k
             .into_iter()
             .map(|v| filter_by_mask(&v, &finite_mask))
             .collect();
 
-        let prod_raw = &z1_raw * &z2_raw;
+        let mut prod_raw = col_zeros(col_len(&z1_raw));
+        for i in 0..col_len(&z1_raw) {
+            prod_raw[(i, 0)] = z1_raw[(i, 0)] * z2_raw[(i, 0)];
+        }
         let (z1, z2, prod, w_l2, n1, n2, ref_l2_k) = if let Some(chisq_max) = args.chisq_max {
-            let mask: Vec<bool> = prod_raw.iter().map(|&p| p.abs() < chisq_max).collect();
+            let mut mask = Vec::with_capacity(col_len(&prod_raw));
+            for i in 0..col_len(&prod_raw) {
+                mask.push(prod_raw[(i, 0)].abs() < chisq_max);
+            }
             let n_removed = mask.iter().filter(|&&b| !b).count();
             if n_removed > 0 {
                 println!(
@@ -2263,7 +2474,7 @@ To match Python, provide {} values (first ignored).",
                 ref_l2_raw_k,
             )
         };
-        let n_obs_filtered = prod.len();
+        let n_obs_filtered = col_len(&prod);
         if n_obs_filtered == 0 {
             println!("  No SNPs remaining after filtering — skipping pair");
             continue;
@@ -2305,25 +2516,21 @@ To match Python, provide {} values (first ignored).",
         let h2_int2 = intercept_h2[trait_idx];
         let gencov_int = intercept_gencov[trait_idx];
 
+        let mut z1_sq = col_zeros(col_len(&z1));
+        for i in 0..col_len(&z1) {
+            let v = z1[(i, 0)];
+            z1_sq[(i, 0)] = (v * v).max(0.0);
+        }
         let hsq1 = run_hsq_ldsc(
-            &z1.mapv(|z| (z * z).max(0.0)),
-            &ref_l2_k,
-            &w_l2,
-            &n1,
-            &m_vec,
-            n_blocks,
-            two_step,
-            h2_int1,
+            &z1_sq, &ref_l2_k, &w_l2, &n1, &m_vec, n_blocks, two_step, h2_int1,
         )?;
+        let mut z2_sq = col_zeros(col_len(&z2));
+        for i in 0..col_len(&z2) {
+            let v = z2[(i, 0)];
+            z2_sq[(i, 0)] = (v * v).max(0.0);
+        }
         let hsq2 = run_hsq_ldsc(
-            &z2.mapv(|z| (z * z).max(0.0)),
-            &ref_l2_k,
-            &w_l2,
-            &n2,
-            &m_vec,
-            n_blocks,
-            two_step,
-            h2_int2,
+            &z2_sq, &ref_l2_k, &w_l2, &n2, &m_vec, n_blocks, two_step, h2_int2,
         )?;
 
         let gencov = run_gencov_ldsc(
@@ -2333,27 +2540,29 @@ To match Python, provide {} values (first ignored).",
 
         let (rg_ratio, rg_se) = if hsq1.tot > 0.0 && hsq2.tot > 0.0 {
             let rg_ratio = gencov.tot / (hsq1.tot * hsq2.tot).sqrt();
-            let denom_delete: Vec<f64> = hsq1
-                .tot_delete_values
-                .iter()
-                .zip(hsq2.tot_delete_values.iter())
-                .map(|(&a, &b)| {
-                    let prod = a * b;
-                    if prod.is_finite() && prod >= 0.0 {
-                        prod.sqrt()
-                    } else {
-                        f64::NAN
-                    }
-                })
-                .collect();
-            let numer_delete =
-                Array2::from_shape_vec((n_blocks, 1), gencov.tot_delete_values.to_vec())
-                    .context("building rg numer delete values")?;
-            let denom_delete = Array2::from_shape_vec((n_blocks, 1), denom_delete)
-                .context("building rg denom delete values")?;
-            let est = Array1::from_vec(vec![rg_ratio]);
-            let (_cov, se) = ratio_jackknife(&est, &numer_delete, &denom_delete);
-            (rg_ratio, se[0])
+            let mut denom_delete: Vec<f64> = Vec::with_capacity(n_blocks);
+            for i in 0..n_blocks {
+                let a = hsq1.tot_delete_values[(i, 0)];
+                let b = hsq2.tot_delete_values[(i, 0)];
+                let prod = a * b;
+                let v = if prod.is_finite() && prod >= 0.0 {
+                    prod.sqrt()
+                } else {
+                    f64::NAN
+                };
+                denom_delete.push(v);
+            }
+            let mut numer_delete = mat_zeros(n_blocks, 1);
+            for b in 0..n_blocks {
+                numer_delete[(b, 0)] = gencov.tot_delete_values[(b, 0)];
+            }
+            let mut denom_delete_mat = mat_zeros(n_blocks, 1);
+            for b in 0..n_blocks {
+                denom_delete_mat[(b, 0)] = denom_delete[b];
+            }
+            let est = col_from_vec(vec![rg_ratio]);
+            let (_cov, se) = ratio_jackknife(&est, &numer_delete, &denom_delete_mat);
+            (rg_ratio, se[(0, 0)])
         } else {
             (f64::NAN, f64::NAN)
         };
@@ -2415,7 +2624,7 @@ fn print_jackknife_diagnostics(
         println!("\nJackknife covariance matrix ({n}×{n}):", n = cov.nrows());
         for i in 0..cov.nrows() {
             let row: Vec<String> = (0..cov.ncols())
-                .map(|j| format!("{:.6e}", cov[[i, j]]))
+                .map(|j| format!("{:.6e}", cov[(i, j)]))
                 .collect();
             println!("  {}", row.join("  "));
         }
@@ -2428,7 +2637,7 @@ fn print_jackknife_diagnostics(
         );
         for k in 0..dv.nrows() {
             let row: Vec<String> = (0..dv.ncols())
-                .map(|j| format!("{:.6}", dv[[k, j]]))
+                .map(|j| format!("{:.6}", dv[(k, j)]))
                 .collect();
             println!("  Block {:3}: {}", k, row.join("  "));
         }
@@ -2436,12 +2645,12 @@ fn print_jackknife_diagnostics(
 }
 
 // ---------------------------------------------------------------------------
-// Polars → ndarray helper
+// Polars → column helper
 // ---------------------------------------------------------------------------
 
-/// Extract a column from a Polars DataFrame as `Array1<f64>`.
+/// Extract a column from a Polars DataFrame as `ColF`.
 /// Missing values (null) are replaced with NaN.
-fn extract_f64(df: &DataFrame, name: &str) -> Result<Array1<f64>> {
+fn extract_f64(df: &DataFrame, name: &str) -> Result<ColF> {
     let series = df
         .column(name)
         .with_context(|| format!("column '{}' not found in DataFrame", name))?;
@@ -2452,7 +2661,7 @@ fn extract_f64(df: &DataFrame, name: &str) -> Result<Array1<f64>> {
         .f64()
         .with_context(|| format!("column '{}' as f64 chunked array", name))?;
     let vec: Vec<f64> = ca.into_iter().map(|v| v.unwrap_or(f64::NAN)).collect();
-    Ok(Array1::from_vec(vec))
+    Ok(col_from_vec(vec))
 }
 
 // ---------------------------------------------------------------------------
@@ -2637,7 +2846,7 @@ mod tests {
             "A2_2" => &["G", "A"],
         ]
         .unwrap();
-        let z2 = Array1::from_vec(vec![1.0, 2.0]);
+        let z2 = col_from_vec(vec![1.0, 2.0]);
         let (mask, z2_aligned, removed) = align_rg_alleles(&df, &z2).unwrap();
         assert_eq!(removed, 0);
         assert_eq!(mask, vec![true, true]);

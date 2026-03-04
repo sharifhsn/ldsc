@@ -14,24 +14,11 @@ categories    = ["command-line-utilities", "science"]
 exclude       = ["data/*", "*.bed", "*.bim", "*.fam", "settings*.json", "test_rust.sh"]
 
 [dependencies]
-# BED file reading — mmap-based, handles 100+ GB files without loading into RAM.
-# Uses memmap2 internally; only touched pages are paged in by the OS.
-bed-reader = { version = "1", default-features = false }
-
 # Data munging — replaces pandas in munge_sumstats.py.
 # decompress feature required for transparent .gz decompression in LazyCsvReader.
 polars = { version = "0.53", features = ["lazy", "csv", "parquet", "decompress", "strings"] }
 
-# Dense matrix algebra — replaces numpy arrays in irwls.py / jackknife.py.
-# Pin to 0.16: bed-reader 1.0.6 requires ndarray ^0.16.1 and
-# ndarray-linalg 0.17 requires ndarray ^0.16.0 — both satisfied by "0.16".
-ndarray = { version = "0.16", features = ["rayon", "blas"] }
-ndarray-linalg = { version = "0.17", default-features = false }
-
-# BLAS backend selection for ndarray/ndarray-linalg. We keep this optional and
-# drive linkage through the feature flags below so CI can opt into system BLAS.
-blas-src = { version = "0.10", default-features = false, features = ["openblas"], optional = true }
-openblas-src = { version = "0.10", default-features = false, features = ["cblas", "lapacke"], optional = true }
+faer = "0.24.0"
 
 # Data-parallelism — parallelises block jackknife (replaces sequential for-loop + GIL)
 rayon = "1"
@@ -58,35 +45,11 @@ bzip2-rs = "0.1.2"
 
 # Temp files for on-the-fly .bz2 decompression
 tempfile = "3"
-
-[build-dependencies]
-vcpkg = "0.2"
-
 [profile.release]
 opt-level     = 3
 lto           = "thin"
 codegen-units = 1
 
 [features]
-# Default: use system OpenBLAS (via pkg-config).
-default = ["blas-openblas-system"]
-
-# Static OpenBLAS (build from source via openblas-src).
-blas-openblas-static = [
-  "blas-src",
-  "openblas-src",
-  "openblas-src/static",
-  "ndarray-linalg/blas",
-  "ndarray-linalg/openblas-static",
-]
-
-# System OpenBLAS (use pkg-config, no source build). Intended for CI or HPC.
-blas-openblas-system = [
-  "blas-src",
-  "openblas-src",
-  "openblas-src/system",
-  "ndarray-linalg/blas",
-  "ndarray-linalg/openblas-system",
-]
 
 [dev-dependencies]

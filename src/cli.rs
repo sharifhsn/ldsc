@@ -1,21 +1,11 @@
 /// CLI argument definitions using clap derive macros.
 use clap::{Args, Parser, Subcommand};
 
-#[cfg(feature = "blas-openblas-static")]
-const CLI_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (openblas-static)");
-#[cfg(feature = "blas-openblas-system")]
-const CLI_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (openblas-system)");
-#[cfg(not(any(feature = "blas-openblas-static", feature = "blas-openblas-system")))]
 const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser)]
 #[command(name = "ldsc", about = "LD Score Regression (Rust port)", version = CLI_VERSION)]
 pub struct Cli {
-    /// Number of OpenBLAS threads (global; default 4).
-    /// 4 is optimal for 1000G-scale data (n~2500); increase for biobank-scale data.
-    #[arg(long, default_value_t = 4, global = true)]
-    pub blas_threads: usize,
-
     /// Number of Rayon threads (global). Defaults to Rayon’s internal heuristic.
     #[arg(long, global = true)]
     pub rayon_threads: Option<usize>,
@@ -274,9 +264,9 @@ pub struct L2Args {
     #[arg(long, default_value_t = false)]
     pub no_print_annot: bool,
 
-    /// Number of SNPs to process per BLAS chunk (default 50).
+    /// Number of SNPs to process per BLAS chunk (default 200).
     /// Larger values change the window approximation slightly.
-    #[arg(long, default_value_t = 50)]
+    #[arg(long, default_value_t = 200)]
     pub chunk_size: usize,
 
     /// Allow whole-chromosome LD windows without warning.

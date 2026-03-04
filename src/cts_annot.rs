@@ -1,6 +1,6 @@
+use crate::la::MatF;
 /// Continuous-annotation binning into annot files (Python --cts-bin).
 use anyhow::{Context, Result};
-use ndarray::Array2;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -22,8 +22,12 @@ pub fn run(args: CtsAnnotArgs) -> Result<()> {
     println!("Read {} SNPs from '{}'", snps.len(), args.bimfile);
     let snp_ids: Vec<String> = snps.iter().map(|s| s.snp.clone()).collect();
 
-    let (matrix, col_names) =
-        build_cts_matrix(&snp_ids, &args.cts_bin, &args.cts_breaks, args.cts_names.as_deref())?;
+    let (matrix, col_names) = build_cts_matrix(
+        &snp_ids,
+        &args.cts_bin,
+        &args.cts_breaks,
+        args.cts_names.as_deref(),
+    )?;
 
     let writer = open_writer(&args.annot_file)?;
     let mut w = BufWriter::new(writer);
@@ -31,9 +35,8 @@ pub fn run(args: CtsAnnotArgs) -> Result<()> {
 
     for (row_idx, snp) in snps.iter().enumerate() {
         write!(w, "{}\t{}\t{}\t{}", snp.chr, snp.bp, snp.snp, snp.cm)?;
-        let row = matrix.row(row_idx);
-        for v in row.iter() {
-            write!(w, "\t{}", *v as u8)?;
+        for j in 0..matrix.ncols() {
+            write!(w, "\t{}", matrix[(row_idx, j)] as u8)?;
         }
         writeln!(w)?;
     }
@@ -52,7 +55,7 @@ pub(crate) fn build_cts_matrix(
     cts_bin: &str,
     cts_breaks: &str,
     cts_names: Option<&str>,
-) -> Result<(Array2<f64>, Vec<String>)> {
+) -> Result<(MatF, Vec<String>)> {
     let cts_files = split_paths(cts_bin);
     anyhow::ensure!(
         !cts_files.is_empty(),
@@ -82,17 +85,28 @@ pub(crate) fn build_cts_matrix(
         combo_map.insert(combo.clone(), idx);
     }
 
-    let mut matrix = Array2::<f64>::zeros((snp_ids.len(), col_names.len()));
+    let mut matrix = MatF::zeros(snp_ids.len(), col_names.len());
     for row_idx in 0..snp_ids.len() {
         let combo: Vec<usize> = bin_indices.iter().map(|v| v[row_idx]).collect();
         let col_idx = combo_map.get(&combo).context("missing bin combination")?;
-        matrix[[row_idx, *col_idx]] = 1.0;
+        matrix[(row_idx, *col_idx)] = 1.0;
     }
 
-    if matrix
-        .axis_iter(ndarray::Axis(0))
-        .any(|row| row.iter().all(|v| *v == 0.0))
-    {
+    let mut any_missing = false;
+    for i in 0..matrix.nrows() {
+        let mut all_zero = true;
+        for j in 0..matrix.ncols() {
+            if matrix[(i, j)] != 0.0 {
+                all_zero = false;
+                break;
+            }
+        }
+        if all_zero {
+            any_missing = true;
+            break;
+        }
+    }
+    if any_missing {
         anyhow::bail!("Some SNPs have no annotation in --cts-bin. This is a bug!");
     }
 

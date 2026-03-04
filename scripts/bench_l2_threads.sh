@@ -42,7 +42,7 @@ run_timed() {
 
 for t in $THREADS_LIST; do
   OUT_PREFIX="$OUT_DIR/rust_l2_t${t}"
-  CMD=("$RUST_BIN" --blas-threads "$t" --rayon-threads "$t" l2 --bfile "$BFILE" --out "$OUT_PREFIX" --ld-wind-cm "$LD_WIND_CM")
+  CMD=("$RUST_BIN" --rayon-threads "$t" l2 --bfile "$BFILE" --out "$OUT_PREFIX" --ld-wind-cm "$LD_WIND_CM")
   if [[ -n "$EXTRACT" ]]; then
     CMD+=(--extract "$EXTRACT")
   fi
