@@ -190,6 +190,19 @@ pub fn matmul_tn_to(
     matmul(dst, accum, lhs.transpose(), rhs, alpha, par);
 }
 
+#[cfg(feature = "fast-f32")]
+#[inline]
+pub fn matmul_tn_to_f32(
+    dst: MatMut<'_, f32>,
+    lhs: MatRef<'_, f32>,
+    rhs: MatRef<'_, f32>,
+    alpha: f32,
+    accum: Accum,
+    par: Par,
+) {
+    matmul(dst, accum, lhs.transpose(), rhs, alpha, par);
+}
+
 #[inline]
 pub fn matmul_nt_to(
     dst: MatMut<'_, f64>,
@@ -213,12 +226,36 @@ pub fn mat_slice<'a>(
     mat.submatrix(rows.start, cols.start, nrows, ncols)
 }
 
+#[cfg(feature = "fast-f32")]
+#[inline]
+pub fn mat_slice_f32<'a>(
+    mat: MatRef<'a, f32>,
+    rows: std::ops::Range<usize>,
+    cols: std::ops::Range<usize>,
+) -> MatRef<'a, f32> {
+    let nrows = rows.end.saturating_sub(rows.start);
+    let ncols = cols.end.saturating_sub(cols.start);
+    mat.submatrix(rows.start, cols.start, nrows, ncols)
+}
+
 #[inline]
 pub fn mat_slice_mut<'a>(
     mat: MatMut<'a, f64>,
     rows: std::ops::Range<usize>,
     cols: std::ops::Range<usize>,
 ) -> MatMut<'a, f64> {
+    let nrows = rows.end.saturating_sub(rows.start);
+    let ncols = cols.end.saturating_sub(cols.start);
+    mat.submatrix_mut(rows.start, cols.start, nrows, ncols)
+}
+
+#[cfg(feature = "fast-f32")]
+#[inline]
+pub fn mat_slice_mut_f32<'a>(
+    mat: MatMut<'a, f32>,
+    rows: std::ops::Range<usize>,
+    cols: std::ops::Range<usize>,
+) -> MatMut<'a, f32> {
     let nrows = rows.end.saturating_sub(rows.start);
     let ncols = cols.end.saturating_sub(cols.start);
     mat.submatrix_mut(rows.start, cols.start, nrows, ncols)

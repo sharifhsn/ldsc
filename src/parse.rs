@@ -729,11 +729,11 @@ mod tests {
             names,
             vec!["C1".to_string(), "C2".to_string(), "C3".to_string()]
         );
-        assert!((overlap[[0, 0]] - 1.0).abs() < 1e-6);
-        assert!((overlap[[1, 1]] - 2.0).abs() < 1e-6);
-        assert!((overlap[[2, 2]] - 2.0).abs() < 1e-6);
-        assert!((overlap[[1, 2]] - 2.0).abs() < 1e-6);
-        assert!((overlap[[2, 1]] - 2.0).abs() < 1e-6);
+        assert!((overlap[(0, 0)] - 1.0).abs() < 1e-6);
+        assert!((overlap[(1, 1)] - 2.0).abs() < 1e-6);
+        assert!((overlap[(2, 2)] - 2.0).abs() < 1e-6);
+        assert!((overlap[(1, 2)] - 2.0).abs() < 1e-6);
+        assert!((overlap[(2, 1)] - 2.0).abs() < 1e-6);
     }
 
     #[test]
@@ -769,11 +769,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(m_tot, 2);
-        assert!((overlap[[0, 0]] - 1.0).abs() < 1e-6);
-        assert!((overlap[[1, 1]] - 1.0).abs() < 1e-6);
-        assert!((overlap[[2, 2]] - 1.0).abs() < 1e-6);
-        assert!((overlap[[1, 2]] - 1.0).abs() < 1e-6);
-        assert!((overlap[[2, 1]] - 1.0).abs() < 1e-6);
+        assert!((overlap[(0, 0)] - 1.0).abs() < 1e-6);
+        assert!((overlap[(1, 1)] - 1.0).abs() < 1e-6);
+        assert!((overlap[(2, 2)] - 1.0).abs() < 1e-6);
+        assert!((overlap[(1, 2)] - 1.0).abs() < 1e-6);
+        assert!((overlap[(2, 1)] - 1.0).abs() < 1e-6);
     }
 
     /// read_m_vec on two-column (partitioned) M files returns Vec of length 2

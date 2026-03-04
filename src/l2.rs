@@ -3,6 +3,8 @@ use crate::la::{
     MatF, MatF32, mat_add_in_place, mat_copy_from, mat_slice, mat_slice_mut, matmul_tn_to,
     matmul_to,
 };
+#[cfg(feature = "fast-f32")]
+use crate::la::{mat_slice_f32, mat_slice_mut_f32, matmul_tn_to_f32};
 /// LD score computation.
 ///
 /// Memory: .bed files are read via the internal BED reader; peak RAM is
@@ -16,15 +18,102 @@ use crate::la::{
 /// yields one column per annotation; `.M`/`.M_5_50` files are tab-separated.
 use anyhow::{Context, Result};
 use faer::{Accum, Par};
+use faer::{MatMut, MatRef};
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write as IoWrite};
+use std::io::{BufRead, BufReader, Write as IoWrite};
 use std::time::Instant;
 use tracing::trace;
 
 use crate::cli::L2Args;
 use crate::cts_annot;
 use crate::parse;
+
+#[cfg(feature = "fast-f32")]
+type MatG = MatF32;
+#[cfg(not(feature = "fast-f32"))]
+type MatG = MatF;
+
+#[cfg(feature = "fast-f32")]
+type MatRefG<'a> = MatRef<'a, f32>;
+#[cfg(not(feature = "fast-f32"))]
+type MatRefG<'a> = MatRef<'a, f64>;
+
+#[cfg(feature = "fast-f32")]
+type MatMutG<'a> = MatMut<'a, f32>;
+#[cfg(not(feature = "fast-f32"))]
+type MatMutG<'a> = MatMut<'a, f64>;
+
+#[cfg(feature = "fast-f32")]
+const ONE_G: f32 = 1.0;
+#[cfg(not(feature = "fast-f32"))]
+const ONE_G: f64 = 1.0;
+
+#[cfg(feature = "fast-f32")]
+#[inline]
+fn mat_slice_g(
+    mat: MatRefG<'_>,
+    rows: std::ops::Range<usize>,
+    cols: std::ops::Range<usize>,
+) -> MatRefG<'_> {
+    mat_slice_f32(mat, rows, cols)
+}
+
+#[cfg(not(feature = "fast-f32"))]
+#[inline]
+fn mat_slice_g(
+    mat: MatRefG<'_>,
+    rows: std::ops::Range<usize>,
+    cols: std::ops::Range<usize>,
+) -> MatRefG<'_> {
+    mat_slice(mat, rows, cols)
+}
+
+#[cfg(feature = "fast-f32")]
+#[inline]
+fn mat_slice_mut_g(
+    mat: MatMutG<'_>,
+    rows: std::ops::Range<usize>,
+    cols: std::ops::Range<usize>,
+) -> MatMutG<'_> {
+    mat_slice_mut_f32(mat, rows, cols)
+}
+
+#[cfg(not(feature = "fast-f32"))]
+#[inline]
+fn mat_slice_mut_g(
+    mat: MatMutG<'_>,
+    rows: std::ops::Range<usize>,
+    cols: std::ops::Range<usize>,
+) -> MatMutG<'_> {
+    mat_slice_mut(mat, rows, cols)
+}
+
+#[cfg(feature = "fast-f32")]
+#[inline]
+fn matmul_tn_to_g(
+    dst: MatMutG<'_>,
+    lhs: MatRefG<'_>,
+    rhs: MatRefG<'_>,
+    alpha: f32,
+    accum: Accum,
+    par: Par,
+) {
+    matmul_tn_to_f32(dst, lhs, rhs, alpha, accum, par);
+}
+
+#[cfg(not(feature = "fast-f32"))]
+#[inline]
+fn matmul_tn_to_g(
+    dst: MatMutG<'_>,
+    lhs: MatRefG<'_>,
+    rhs: MatRefG<'_>,
+    alpha: f64,
+    accum: Accum,
+    par: Par,
+) {
+    matmul_tn_to(dst, lhs, rhs, alpha, accum, par);
+}
 
 // ---------------------------------------------------------------------------
 // BIM / FAM parsing
@@ -168,6 +257,12 @@ fn get_block_lefts_f64(coords: &[f64], max_dist: f64) -> Vec<usize> {
     block_left
 }
 
+/// Fixed-SNP window: block_left[i] = max(0, i - half_window).
+#[cfg(test)]
+fn get_block_lefts_snp(m: usize, half_window: usize) -> Vec<usize> {
+    (0..m).map(|i| i.saturating_sub(half_window)).collect()
+}
+
 /// Compute block_left per chromosome to avoid cross-chromosome LD windows.
 /// Returns (block_left, any_full_chr_window).
 fn get_block_lefts_by_chr(all_snps: &[BimRecord], mode: WindowMode) -> (Vec<usize>, bool) {
@@ -260,6 +355,41 @@ fn normalize_col_f64(col: &mut [f64], n: usize) -> f64 {
     maf
 }
 
+#[cfg(feature = "fast-f32")]
+fn normalize_col_f32(col: &mut [f32], n: usize) -> f32 {
+    let (sum, count) = col.iter().fold((0f32, 0usize), |(s, c), &v| {
+        if v.is_nan() { (s, c) } else { (s + v, c + 1) }
+    });
+    let avg = if count > 0 { sum / count as f32 } else { 0.0 };
+    let mut freq = avg / 2.0;
+    if freq < 0.0 {
+        freq = 0.0;
+    } else if freq > 1.0 {
+        freq = 1.0;
+    }
+    let maf = freq.min(1.0 - freq);
+
+    for v in col.iter_mut() {
+        if v.is_nan() {
+            *v = avg;
+        } else {
+            *v -= avg;
+        }
+    }
+
+    let mut var = 0.0f32;
+    for &v in col.iter() {
+        var += v * v;
+    }
+    var /= n as f32;
+    let std = var.sqrt();
+    if std > 0.0 {
+        let inv_std = 1.0 / std;
+        col.iter_mut().for_each(|v| *v *= inv_std);
+    }
+    maf
+}
+
 // ---------------------------------------------------------------------------
 // LD score computation
 // ---------------------------------------------------------------------------
@@ -329,14 +459,17 @@ fn compute_ldscore_global(
     if chunk_c > 0 {
         ring_size = ring_size.div_ceil(chunk_c) * chunk_c;
     }
-    let mut ring_buf = MatF::zeros(n_indiv, ring_size);
+    let mut ring_buf = MatG::zeros(n_indiv, ring_size);
     let mut ring_next: usize = 0;
     let mut window: VecDeque<(usize, usize)> = VecDeque::new(); // (snp_idx, ring_slot)
 
-    let mut b_mat = MatF::zeros(n_indiv, chunk_c);
+    let mut b_mat = MatG::zeros(n_indiv, chunk_c);
+    #[cfg(feature = "fast-f32")]
+    let mut col_buf_f32 = vec![0.0f32; n_indiv];
+    #[cfg(not(feature = "fast-f32"))]
     let mut col_buf_f64 = vec![0.0f64; n_indiv];
-    let mut a_buf = MatF::zeros(n_indiv, max_window_size.max(1));
-    let mut ab_buf = MatF::zeros(max_window_size.max(1), chunk_c);
+    let mut a_buf = MatG::zeros(n_indiv, max_window_size.max(1));
+    let mut ab_buf = MatG::zeros(max_window_size.max(1), chunk_c);
 
     let mut pq_per_snp: Option<Vec<f64>> = pq_exp.map(|_| vec![1.0f64; m]);
     let mut pq_chunk: Vec<f64> = Vec::with_capacity(chunk_c);
@@ -403,22 +536,41 @@ fn compute_ldscore_global(
             {
                 let t = Instant::now();
                 for j in 0..c {
-                    for i in 0..n_indiv {
-                        col_buf_f64[i] = raw[(i, j)] as f64;
+                    #[cfg(feature = "fast-f32")]
+                    {
+                        for i in 0..n_indiv {
+                            col_buf_f32[i] = raw[(i, j)];
+                        }
+                        let snp_maf = normalize_col_f32(&mut col_buf_f32, n_indiv);
+                        maf_per_snp[chunk_start + j] = snp_maf as f64;
+                        if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
+                            let maf_f64 = snp_maf as f64;
+                            let pq = (maf_f64 * (1.0 - maf_f64)).powf(exp);
+                            pq_vec[chunk_start + j] = pq;
+                        }
+                        for i in 0..n_indiv {
+                            b_mat[(i, j)] = col_buf_f32[i];
+                        }
                     }
-                    let snp_maf = normalize_col_f64(&mut col_buf_f64, n_indiv);
-                    maf_per_snp[chunk_start + j] = snp_maf;
-                    if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
-                        let pq = (snp_maf * (1.0 - snp_maf)).powf(exp);
-                        pq_vec[chunk_start + j] = pq;
-                    }
-                    for i in 0..n_indiv {
-                        b_mat[(i, j)] = col_buf_f64[i];
+                    #[cfg(not(feature = "fast-f32"))]
+                    {
+                        for i in 0..n_indiv {
+                            col_buf_f64[i] = raw[(i, j)] as f64;
+                        }
+                        let snp_maf = normalize_col_f64(&mut col_buf_f64, n_indiv);
+                        maf_per_snp[chunk_start + j] = snp_maf;
+                        if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
+                            let pq = (snp_maf * (1.0 - snp_maf)).powf(exp);
+                            pq_vec[chunk_start + j] = pq;
+                        }
+                        for i in 0..n_indiv {
+                            b_mat[(i, j)] = col_buf_f64[i];
+                        }
                     }
                 }
                 t_norm += t.elapsed();
             }
-            let b_slice = mat_slice(b_mat.as_ref(), 0..n_indiv, 0..c);
+            let b_slice = mat_slice_g(b_mat.as_ref(), 0..n_indiv, 0..c);
 
             pq_chunk.clear();
             if let Some(ref pq_vec) = pq_per_snp {
@@ -430,13 +582,13 @@ fn compute_ldscore_global(
             }
 
             // B×B
-            let mut bb = MatF::zeros(c, c);
+            let mut bb = MatG::zeros(c, c);
             let t = Instant::now();
-            matmul_tn_to(
+            matmul_tn_to_g(
                 bb.as_mut(),
                 b_slice,
                 b_slice,
-                1.0,
+                ONE_G,
                 Accum::Replace,
                 Par::rayon(0),
             );
@@ -452,7 +604,7 @@ fn compute_ldscore_global(
                 for k in 0..j {
                     let k_g = chunk_start + k;
                     let pq_k = pq_chunk[k];
-                    let r2u = r2_unbiased(bb[(k, j)] / n, n_indiv);
+                    let r2u = r2_unbiased(bb[(k, j)] as f64 / n, n_indiv);
                     l2_scalar[j_g] += r2u * pq_k;
                     l2_scalar[k_g] += r2u * pq_j;
                     if trace_idx == Some(j_g) {
@@ -488,28 +640,28 @@ fn compute_ldscore_global(
                 if contiguous {
                     ab_contig_calls += 1;
                     let a_view =
-                        mat_slice(ring_buf.as_ref(), 0..n_indiv, first_slot..(first_slot + w));
-                    matmul_tn_to(
-                        mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
+                        mat_slice_g(ring_buf.as_ref(), 0..n_indiv, first_slot..(first_slot + w));
+                    matmul_tn_to_g(
+                        mat_slice_mut_g(ab_buf.as_mut(), 0..w, 0..c),
                         a_view,
                         b_slice,
-                        1.0,
+                        ONE_G,
                         Accum::Replace,
                         Par::rayon(0),
                     );
                 } else {
                     ab_wrap_calls += 1;
-                    let a_view = mat_slice(a_buf.as_ref(), 0..n_indiv, 0..w);
-                    matmul_tn_to(
-                        mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
+                    let a_view = mat_slice_g(a_buf.as_ref(), 0..n_indiv, 0..w);
+                    matmul_tn_to_g(
+                        mat_slice_mut_g(ab_buf.as_mut(), 0..w, 0..c),
                         a_view,
                         b_slice,
-                        1.0,
+                        ONE_G,
                         Accum::Replace,
                         Par::rayon(0),
                     );
                 }
-                let ab_elapsed = t.elapsed();
+                ab_elapsed = t.elapsed();
                 if contiguous {
                     t_ab_contig += ab_elapsed;
                 } else {
@@ -522,7 +674,7 @@ fn compute_ldscore_global(
                 ab_max_w = ab_max_w.max(w);
                 ab_max_c = ab_max_c.max(c);
                 let t = Instant::now();
-                let ab_view = mat_slice(ab_buf.as_ref(), 0..w, 0..c);
+                let ab_view = mat_slice_g(ab_buf.as_ref(), 0..w, 0..c);
                 let pq_vec_opt = pq_per_snp.as_ref();
                 for (wi, (k_g, _)) in window.iter().enumerate() {
                     let pq_k = if let Some(pq_vec) = pq_vec_opt {
@@ -533,7 +685,7 @@ fn compute_ldscore_global(
                     for j in 0..c {
                         let j_g = chunk_start + j;
                         let pq_j = pq_chunk[j];
-                        let r2u = r2_unbiased(ab_view[(wi, j)] / n, n_indiv);
+                        let r2u = r2_unbiased(ab_view[(wi, j)] as f64 / n, n_indiv);
                         l2_scalar[j_g] += r2u * pq_k;
                         l2_scalar[*k_g] += r2u * pq_j;
                         if trace_idx == Some(j_g) {
@@ -669,22 +821,41 @@ fn compute_ldscore_global(
         {
             let t = Instant::now();
             for j in 0..c {
-                for i in 0..n_indiv {
-                    col_buf_f64[i] = raw[(i, j)] as f64;
+                #[cfg(feature = "fast-f32")]
+                {
+                    for i in 0..n_indiv {
+                        col_buf_f32[i] = raw[(i, j)];
+                    }
+                    let snp_maf = normalize_col_f32(&mut col_buf_f32, n_indiv);
+                    maf_per_snp[chunk_start + j] = snp_maf as f64;
+                    if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
+                        let maf_f64 = snp_maf as f64;
+                        let pq = (maf_f64 * (1.0 - maf_f64)).powf(exp);
+                        pq_vec[chunk_start + j] = pq;
+                    }
+                    for i in 0..n_indiv {
+                        b_mat[(i, j)] = col_buf_f32[i];
+                    }
                 }
-                let snp_maf = normalize_col_f64(&mut col_buf_f64, n_indiv);
-                maf_per_snp[chunk_start + j] = snp_maf;
-                if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
-                    let pq = (snp_maf * (1.0 - snp_maf)).powf(exp);
-                    pq_vec[chunk_start + j] = pq;
-                }
-                for i in 0..n_indiv {
-                    b_mat[(i, j)] = col_buf_f64[i];
+                #[cfg(not(feature = "fast-f32"))]
+                {
+                    for i in 0..n_indiv {
+                        col_buf_f64[i] = raw[(i, j)] as f64;
+                    }
+                    let snp_maf = normalize_col_f64(&mut col_buf_f64, n_indiv);
+                    maf_per_snp[chunk_start + j] = snp_maf;
+                    if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
+                        let pq = (snp_maf * (1.0 - snp_maf)).powf(exp);
+                        pq_vec[chunk_start + j] = pq;
+                    }
+                    for i in 0..n_indiv {
+                        b_mat[(i, j)] = col_buf_f64[i];
+                    }
                 }
             }
             t_norm += t.elapsed();
         }
-        let b_slice = mat_slice(b_mat.as_ref(), 0..n_indiv, 0..c);
+        let b_slice = mat_slice_g(b_mat.as_ref(), 0..n_indiv, 0..c);
 
         let annot_chunk = mat_slice(annot.as_ref(), chunk_start..chunk_end, 0..n_annot);
         let (annot_chunk_eff, chunk_all_zero) = if let Some(ref pq_vec) = pq_per_snp {
@@ -727,13 +898,13 @@ fn compute_ldscore_global(
 
         // B×B
         if !chunk_all_zero {
-            let mut bb = MatF::zeros(c, c);
+            let mut bb = MatG::zeros(c, c);
             let t = Instant::now();
-            matmul_tn_to(
+            matmul_tn_to_g(
                 bb.as_mut(),
                 b_slice,
                 b_slice,
-                1.0,
+                ONE_G,
                 Accum::Replace,
                 Par::rayon(0),
             );
@@ -747,7 +918,7 @@ fn compute_ldscore_global(
             for j in 0..c {
                 r2u_bb[(j, j)] = 1.0; // diagonal: r(j,j)=1 → r2u=1
                 for k in 0..j {
-                    let r2u = r2_unbiased(bb[(k, j)] / n, n_indiv);
+                    let r2u = r2_unbiased(bb[(k, j)] as f64 / n, n_indiv);
                     r2u_bb[(j, k)] = r2u;
                     r2u_bb[(k, j)] = r2u;
                 }
@@ -857,28 +1028,28 @@ fn compute_ldscore_global(
                 if contiguous {
                     ab_contig_calls += 1;
                     let a_view =
-                        mat_slice(ring_buf.as_ref(), 0..n_indiv, first_slot..(first_slot + w));
-                    matmul_tn_to(
-                        mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
+                        mat_slice_g(ring_buf.as_ref(), 0..n_indiv, first_slot..(first_slot + w));
+                    matmul_tn_to_g(
+                        mat_slice_mut_g(ab_buf.as_mut(), 0..w, 0..c),
                         a_view,
                         b_slice,
-                        1.0,
+                        ONE_G,
                         Accum::Replace,
                         Par::rayon(0),
                     );
                 } else {
                     ab_wrap_calls += 1;
-                    let a_view = mat_slice(a_buf.as_ref(), 0..n_indiv, 0..w);
-                    matmul_tn_to(
-                        mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
+                    let a_view = mat_slice_g(a_buf.as_ref(), 0..n_indiv, 0..w);
+                    matmul_tn_to_g(
+                        mat_slice_mut_g(ab_buf.as_mut(), 0..w, 0..c),
                         a_view,
                         b_slice,
-                        1.0,
+                        ONE_G,
                         Accum::Replace,
                         Par::rayon(0),
                     );
                 }
-                ab_elapsed = t.elapsed();
+                let ab_elapsed = t.elapsed();
                 if contiguous {
                     t_ab_contig += ab_elapsed;
                 } else {
@@ -893,10 +1064,10 @@ fn compute_ldscore_global(
                 did_ab = true;
 
                 let t = Instant::now();
-                let ab_view = mat_slice(ab_buf.as_ref(), 0..w, 0..c);
+                let ab_view = mat_slice_g(ab_buf.as_ref(), 0..w, 0..c);
                 for wi in 0..w {
                     for j in 0..c {
-                        r2u_ab[(wi, j)] = r2_unbiased(ab_view[(wi, j)] / n, n_indiv);
+                        r2u_ab[(wi, j)] = r2_unbiased(ab_view[(wi, j)] as f64 / n, n_indiv);
                     }
                 }
                 r2u_elapsed = t.elapsed();
@@ -989,6 +1160,7 @@ fn compute_ldscore_global(
                     annot_right_elapsed.as_secs_f64() * 1000.0
                 );
             }
+
         }
 
         for j in 0..c {
@@ -1099,7 +1271,6 @@ fn compute_snp_stats(
     let full_bytes = n_indiv / 4;
     let rem = n_indiv % 4;
     let bytes_per_snp = bed.bytes_per_snp();
-    let mut file = bed.open_reader()?;
     let mut buf = vec![0u8; bytes_per_snp];
     let mut block_buf: Vec<u8> = Vec::new();
     let chunk_c = chunk_c.max(1);
@@ -1184,10 +1355,7 @@ fn compute_snp_stats(
             let start_sid = chunk_bed[0];
             let total_bytes = c * bytes_per_snp;
             block_buf.resize(total_bytes, 0u8);
-            let offset = bed.snp_offset(start_sid);
-            file.seek(SeekFrom::Start(offset))
-                .with_context(|| format!("seeking BED offset {}", offset))?;
-            file.read_exact(&mut block_buf)
+            bed.read_snp_block(start_sid, c, &mut block_buf)
                 .with_context(|| format!("reading BED block [{},{})", chunk_start, chunk_end))?;
             for j in 0..c {
                 let start = j * bytes_per_snp;
@@ -1209,10 +1377,7 @@ fn compute_snp_stats(
             }
         } else {
             for (j, &sid) in chunk_bed.iter().enumerate() {
-                let offset = bed.snp_offset(sid);
-                file.seek(SeekFrom::Start(offset))
-                    .with_context(|| format!("seeking BED offset {}", offset))?;
-                file.read_exact(&mut buf)
+                bed.read_snp_bytes(sid, &mut buf)
                     .with_context(|| format!("reading BED SNP {}", sid))?;
                 let (sum, count, het) =
                     compute_stats(&buf, keep_locs.as_ref(), &lut, full_bytes, rem);
@@ -1592,7 +1757,9 @@ pub fn run(args: L2Args) -> Result<()> {
     // Pre-filter SNPs with all-het/missing genotypes (Python behavior).
     let mut maf_prefilter: Option<Vec<f64>> = None;
     if maf_pre {
-        let mut bed = Bed::new(bed_path.as_str()).context("opening BED file for SNP prefilter")?;
+        let mut bed = Bed::builder(bed_path.as_str())
+            .build()
+            .context("opening BED file for SNP prefilter")?;
         let t_stats = Instant::now();
         let (maf_all, het_miss_ok) = compute_snp_stats(
             &all_snps,
@@ -1681,7 +1848,9 @@ pub fn run(args: L2Args) -> Result<()> {
 
     let chunk_c = args.chunk_size;
 
-    let mut bed = Bed::new(bed_path.as_str()).context("opening BED file")?;
+    let mut bed = Bed::builder(bed_path.as_str())
+        .build()
+        .context("opening BED file")?;
     let t_l2 = Instant::now();
     let (l2, maf_per_snp) = compute_ldscore_global(
         &all_snps,
@@ -2110,7 +2279,7 @@ mod tests {
             out: out.clone(),
             ld_wind_cm: Some(1.0),
             ld_wind_kb: None,
-            ld_wind_snp: Some(1),
+            ld_wind_snp: None,
             annot: None,
             cts_bin: None,
             cts_breaks: None,
@@ -2146,7 +2315,7 @@ mod tests {
             out: out.clone(),
             ld_wind_cm: Some(1.0),
             ld_wind_kb: None,
-            ld_wind_snp: Some(1),
+            ld_wind_snp: None,
             annot: None,
             cts_bin: None,
             cts_breaks: None,
