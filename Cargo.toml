@@ -11,7 +11,17 @@ documentation = "https://github.com/sharifhsn/ldsc#readme"
 readme        = "README.md"
 keywords      = ["genomics", "gwas", "statistics", "bioinformatics", "ldsc"]
 categories    = ["command-line-utilities", "science"]
-exclude       = ["data/*", "*.bed", "*.bim", "*.fam", "settings*.json", "test_rust.sh"]
+exclude       = [
+  "data/*",
+  "*.bed",
+  "*.bim",
+  "*.fam",
+  "settings*.json",
+  "test_rust.sh",
+  "ldsc.wiki/*",
+  "ldsc_py/*",
+  "bed-reader/*",
+]
 
 [dependencies]
 # Data munging — replaces pandas in munge_sumstats.py.
