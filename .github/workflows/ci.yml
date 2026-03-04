@@ -24,7 +24,8 @@ jobs:
       # Caches ~/.cargo/registry, ~/.cargo/git, and target/.
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
-        cache-on-failure: true
+        with:
+          cache-on-failure: true
 
       - name: cargo check
         run: cargo check --release
