@@ -6,6 +6,23 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- (none)
+
+## [0.2.0] — 2026-03-04
+
+### Added
+- Internal SNP-major BED reader to remove the external bed-reader dependency.
+- `faer`-based linear algebra helpers (`src/la.rs`) to standardize matrix operations.
+- L2 parity/perf tooling scripts for quick validation and benchmarking.
+
+### Changed
+- Replaced the ndarray/OpenBLAS backend with `faer`; removed BLAS build dependencies and `--blas-threads`.
+- L2 defaults and hot-path optimizations (ring alignment, faster MAF prefilter, tuned chunk size).
+
+### Removed
+- OpenBLAS/vcpkg build plumbing (`build.rs`, vcpkg manifests).
+
 ## [0.1.3] — 2026-02-23
 
 ### Added
@@ -36,6 +53,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Statically linked OpenBLAS (no runtime library needed)
 - 40 unit tests; integration smoke test for l2
 
-[Unreleased]: https://github.com/sharifhsn/ldsc/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/sharifhsn/ldsc/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/sharifhsn/ldsc/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/sharifhsn/ldsc/releases/tag/v0.1.3
 [0.1.0]: https://github.com/sharifhsn/ldsc/releases/tag/v0.1.0
