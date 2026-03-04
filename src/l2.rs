@@ -604,7 +604,7 @@ fn compute_ldscore_global(
                 for k in 0..j {
                     let k_g = chunk_start + k;
                     let pq_k = pq_chunk[k];
-                    let r2u = r2_unbiased(bb[(k, j)] as f64 / n, n_indiv);
+                    let r2u = r2_unbiased(bb[(k, j)] / n, n_indiv);
                     l2_scalar[j_g] += r2u * pq_k;
                     l2_scalar[k_g] += r2u * pq_j;
                     if trace_idx == Some(j_g) {
@@ -918,7 +918,7 @@ fn compute_ldscore_global(
             for j in 0..c {
                 r2u_bb[(j, j)] = 1.0; // diagonal: r(j,j)=1 → r2u=1
                 for k in 0..j {
-                    let r2u = r2_unbiased(bb[(k, j)] as f64 / n, n_indiv);
+                    let r2u = r2_unbiased(bb[(k, j)] / n, n_indiv);
                     r2u_bb[(j, k)] = r2u;
                     r2u_bb[(k, j)] = r2u;
                 }
@@ -1049,7 +1049,7 @@ fn compute_ldscore_global(
                         Par::rayon(0),
                     );
                 }
-                let ab_elapsed = t.elapsed();
+                ab_elapsed = t.elapsed();
                 if contiguous {
                     t_ab_contig += ab_elapsed;
                 } else {
