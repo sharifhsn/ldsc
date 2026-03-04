@@ -132,4 +132,4 @@ Notes:
 ## Next Ideas (not implemented)
 - Optimize `r2u` loop (vectorized/in-place transform to reduce passes).
 - Explore ring buffer layout to avoid extra copies and minimize `r2u` cache misses.
-- Consider multi-threading only in `r2u` if BLAS is single-threaded.
+- Consider multi-threading only in `r2u` if matmul is forced single-threaded.

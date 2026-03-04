@@ -2,8 +2,8 @@
 
 ## Context
 This repository already achieves major speedups on CPU by combining:
-- A ring-buffer genotype store with a single DGEMM per chunk (`AᵀB`, `BᵀB`).
-- Tuned BLAS thread counts to avoid oversubscription on small windows.
+- A ring-buffer genotype store with a single matmul per chunk (`AᵀB`, `BᵀB`).
+- Tuned Rayon thread counts to avoid oversubscription on small windows.
 - A global sequential LD pass to preserve cross-chromosome boundary effects.
 - Parallel block jackknife for h2/rg variance estimation.
 
@@ -31,7 +31,7 @@ GPU acceleration is most promising for **large-n** datasets (biobank-scale) wher
 ### WGPU/Vulkan (not recommended)
 - WGPU lacks a mature BLAS stack and reliable f64 support across devices.
 - Compute shaders would require custom GEMM kernels and extensive tuning.
-- Expected performance gains are unlikely to exceed OpenBLAS for typical LDSC sizes.
+- Expected performance gains are unlikely to exceed optimized CPU matmul for typical LDSC sizes.
 
 ## Precision
 - Default to `f32` for GPU path; allow optional `f64` if hardware supports it.

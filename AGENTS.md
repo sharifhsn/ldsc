@@ -41,12 +41,10 @@
   - For CLI behavior changes, include example invocations and expected output files.
 
 ## Configuration Notes
-- Default BLAS: static OpenBLAS build (`blas-openblas-static`).
-- CI uses system OpenBLAS: `--no-default-features --features blas-openblas-system` (see `.github/workflows/ci.yml`).
-- Runtime tuning flags (lower priority; not heavily battle-tested): `--blas-threads`, `--rayon-threads`, `--polars-threads`.
-- `ldsc --version` prints the compiled BLAS backend.
-- Building requires Rust >= 1.85 and a C/Fortran toolchain for static OpenBLAS; system BLAS needs `libopenblas-dev` + `pkg-config`.
+- Runtime tuning flags (lower priority; not heavily battle-tested): `--rayon-threads`, `--polars-threads`.
+- `ldsc --version` prints the crate version (no BLAS backend suffix).
+- Building requires Rust >= 1.85; no external BLAS/LAPACK toolchain is required.
 - Large datasets are not stored in Git; keep local-only files under `data/`.
 
 ## CI Notes
-- CI workflow: `.github/workflows/ci.yml`. On failure it dumps OpenBLAS build logs.
+- CI workflow: `.github/workflows/ci.yml`.

@@ -29,20 +29,20 @@ matrices (`bb`, `ab`, `r2u_*`).
 - Many small chunks can create allocation overhead and cache churn.
 
 **Why it might not:**
-- BLAS `dot` calls usually dominate for non-trivial sizes.
+- `faer` matmul calls usually dominate for non-trivial sizes.
 - `.bed` I/O can be more expensive than allocation.
 
 **Expectation:** Likely a small (single-digit %) win unless chunk sizes are tiny
 and compute is very light.
 
-## 3) BLAS Backend and Thread Tuning (No Code Changes)
-**Current behavior:** BLAS is used for heavy GEMM. OpenBLAS thread count is set
-from CLI.
+## 3) Matmul Thread Tuning (No Code Changes)
+**Current behavior:** `faer` handles heavy GEMM. Rayon thread count is controlled
+via CLI.
 
 **Why it might help:**
-- System-tuned BLAS on HPC can be faster than a generic static build.
 - A heuristic for thread count based on `n_indiv` and window size can reduce
   oversubscription overhead.
+- Small matrices can benefit from forcing sequential matmul.
 
 **Expectation:** Can be material for some systems, but depends on hardware.
 
@@ -55,4 +55,4 @@ Do not implement the above without profiling that shows:
 Measure:
 - Total time in `jackknife()` vs `ldscore()`.
 - Within jackknife: time in IRWLS vs time copying/allocating arrays.
-- Within `ldscore`: BLAS time vs allocation + bed I/O.
+- Within `ldscore`: matmul time vs allocation + bed I/O.

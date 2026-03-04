@@ -35,13 +35,13 @@ The Rust port uses a streaming, lazy pipeline for munging (Polars LazyFrame), av
 The biggest speedups come from the LD score calculation design:
 - Memory‑map `.bed` instead of loading everything.
 - Use a ring buffer for a sliding SNP window.
-- Replace nested loops with large, contiguous BLAS `AᵀB` / `BᵀB` operations.
+- Replace nested loops with large, contiguous matmul `AᵀB` / `BᵀB` operations.
 
 **R → Rust takeaway**
 - Most R implementations do LD window computations with nested loops or per‑SNP subsetting. That is the slow path.
 - In Rust, build a dedicated LD engine:
   - Memory‑map genotype data.
-  - Chunk SNPs (fixed chunk size), compute with DGEMM.
+  - Chunk SNPs (fixed chunk size), compute with matmul.
   - Keep the window buffer contiguous and reuse memory.
 - This is where the rewrite pays off most.
 
@@ -50,12 +50,11 @@ The biggest speedups come from the LD score calculation design:
 ---
 
 ## 4. Explicit Threading Control Is Mandatory
-Rust CLI exposes OpenBLAS, Rayon, and Polars thread counts. This avoids oversubscription and allows performance tuning.
+Rust CLI exposes Rayon and Polars thread counts. This avoids oversubscription and allows performance tuning.
 
 **R → Rust takeaway**
-- R workflows often run in environments where BLAS or parallel backends are already tuned; a Rust rewrite must expose control so users can match those settings.
+- R workflows often run in environments where linear-algebra or parallel backends are already tuned; a Rust rewrite must expose control so users can match those settings.
 - Provide CLI flags for:
-  - BLAS threads
   - General parallelism threads
   - Dataframe/IO threads
 
@@ -63,12 +62,12 @@ Rust CLI exposes OpenBLAS, Rayon, and Polars thread counts. This avoids oversubs
 
 ---
 
-## 5. Use BLAS, Not Hand‑Written Loops
-This repo intentionally structures computations so that heavy work is done by BLAS (OpenBLAS). This yields consistent, hardware‑optimized performance.
+## 5. Use Optimized Linear Algebra, Not Hand‑Written Loops
+This repo structures computations so that heavy work is done by `faer`’s optimized matmul/SVD kernels. This yields consistent, hardware‑optimized performance.
 
 **R → Rust takeaway**
-- If your R code relies on vectorized operations, a Rust rewrite should still prefer BLAS (ndarray + ndarray‑linalg) for matrix ops.
-- Avoid re‑implementing linear algebra in pure Rust loops.
+- If your R code relies on vectorized operations, a Rust rewrite should still prefer a high‑performance linear algebra library (here: `faer`) for matrix ops.
+- Avoid re‑implementing linear algebra in pure Rust loops unless profiling demands it.
 
 **Reference**: `/Users/sharif/Code/ldsc/src/l2.rs`, `/Users/sharif/Code/ldsc/src/irwls.rs`
 
@@ -155,11 +154,11 @@ The Rust implementation uses normalized column naming and fixed output schema, m
 
 ---
 
-## 13. Make Thread and BLAS Choices Explicit in Output
+## 13. Make Thread and Linear Algebra Choices Explicit in Output
 The Rust CLI prints warnings for conditions that are common causes of mistakes (e.g., window spans entire chromosome) and logs key runtime decisions.
 
 **R → Rust takeaway**
-- Log thread counts, BLAS backend, and key runtime choices. This matters for reproducibility across HPC and local runs.
+- Log thread counts and key runtime choices. This matters for reproducibility across HPC and local runs.
 - Add explicit warnings for pathological settings.
 
 **Reference**: `/Users/sharif/Code/ldsc/src/l2.rs`, `/Users/sharif/Code/ldsc/src/main.rs`
@@ -192,7 +191,7 @@ This is the shortest path that mirrors the success of this repo:
 
 1. **Inventory and parity doc**: enumerate every R flag and default; create a parity table. 
 2. **Streaming munging**: implement a Rust sumstats pipeline with schema normalization and filtering. 
-3. **LD score engine**: implement memory‑mapped, chunked LD computation with BLAS. 
+3. **LD score engine**: implement memory‑mapped, chunked LD computation with optimized matmul. 
 4. **Regression + jackknife**: port IRWLS and jackknife with diagnostics. 
 5. **Validation harness**: run R and Rust on the same dataset; compare results. 
 6. **Thread control and logging**: expose CLI flags; log decisions. 
@@ -202,7 +201,7 @@ This is the shortest path that mirrors the success of this repo:
 
 ## 17. Final Practical Takeaways
 - Performance wins come from **algorithm structure**, not micro‑optimizations.
-- **Memory layout and BLAS use** are the core of LD computation speedups.
+- **Memory layout and matmul use** are the core of LD computation speedups.
 - **Streaming IO** is essential for sumstats at biobank scale.
 - **Validation and parity** determine trust in the rewrite.
 - A rewrite is successful only if it **preserves outputs and user workflows** while unlocking scale.
