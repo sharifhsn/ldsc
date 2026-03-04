@@ -1160,7 +1160,6 @@ fn compute_ldscore_global(
                     annot_right_elapsed.as_secs_f64() * 1000.0
                 );
             }
-
         }
 
         for j in 0..c {
