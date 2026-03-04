@@ -15,6 +15,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Internal SNP-major BED reader to remove the external bed-reader dependency.
 - `faer`-based linear algebra helpers (`src/la.rs`) to standardize matrix operations.
 - L2 parity/perf tooling scripts for quick validation and benchmarking.
+- Experimental `fast-f32` feature for L2 matmuls (f32 compute, f64 accumulation; not parity-safe).
 
 ### Changed
 - Replaced the ndarray/OpenBLAS backend with `faer`; removed BLAS build dependencies and `--blas-threads`.
