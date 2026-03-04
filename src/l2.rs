@@ -661,7 +661,7 @@ fn compute_ldscore_global(
                         Par::rayon(0),
                     );
                 }
-                ab_elapsed = t.elapsed();
+                let ab_elapsed = t.elapsed();
                 if contiguous {
                     t_ab_contig += ab_elapsed;
                 } else {
