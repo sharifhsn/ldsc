@@ -6,7 +6,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  OPENBLAS_TARGET: "SSE_GENERIC"
 
 permissions:
   contents: write
@@ -43,40 +42,15 @@ jobs:
 
       - name: Setup vcpkg (Windows)
         if: startsWith(matrix.os, 'windows')
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: "7ab2f5d542e36af36d14decc06a59a26a939f818"
-
-      - name: Install OpenBLAS (Windows)
-        if: startsWith(matrix.os, 'windows')
-        shell: pwsh
-        working-directory: ${{ github.workspace }}\\vcpkg
-        env:
-          VCPKG_DEFAULT_TRIPLET: x64-windows
-        run: .\\vcpkg.exe install openblas:x64-windows clapack:x64-windows --classic --disable-metrics
-
-      - name: Install build dependencies (Linux)
-        if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y cmake gfortran pkg-config libopenblas-dev
-
-      - name: Install build dependencies (macOS)
-        if: startsWith(matrix.os, 'macos')
-        run: brew install cmake gcc openblas pkg-config
+        run: echo "No external BLAS dependencies required."
 
       - name: Build (Linux/macOS)
         if: "!startsWith(matrix.os, 'windows')"
-        env:
-          PKG_CONFIG_PATH: /opt/homebrew/opt/openblas/lib/pkgconfig:/usr/local/opt/openblas/lib/pkgconfig
-        run: cargo build --release --locked --target ${{ matrix.target }} --no-default-features --features blas-openblas-system
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Build (Windows)
         if: startsWith(matrix.os, 'windows')
-        env:
-          VCPKG_DEFAULT_TRIPLET: x64-windows
-          VCPKG_ROOT: ${{ github.workspace }}\\vcpkg
-          VCPKGRS_DYNAMIC: "1"
-          VCPKGRS_TRIPLET: x64-windows
-        run: cargo build --release --locked --target ${{ matrix.target }} --no-default-features --features blas-openblas-system
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package (Linux/macOS)
         if: "!startsWith(matrix.os, 'windows')"
@@ -94,7 +68,6 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target\${{ matrix.target }}\release\ldsc.exe dist\
           Copy-Item -Path LICENSE,README.md -Destination dist\
-          Copy-Item vcpkg\installed\x64-windows\bin\*.dll dist\
           Compress-Archive -Path dist\* -DestinationPath "dist\${{ matrix.artifact }}.${{ matrix.archive_ext }}"
           (Get-FileHash "dist\${{ matrix.artifact }}.${{ matrix.archive_ext }}" -Algorithm SHA256).Hash.ToLower() + "  ${{ matrix.artifact }}.${{ matrix.archive_ext }}" | Out-File -Encoding ASCII "dist\${{ matrix.artifact }}.${{ matrix.archive_ext }}.sha256"
 
