@@ -16,7 +16,6 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use crate::cli::MakeAnnotArgs;
 use crate::parse::{BimRecord, parse_bim};
 
-
 pub fn run(args: MakeAnnotArgs) -> Result<()> {
     let snps =
         parse_bim(&args.bimfile).with_context(|| format!("reading BIM '{}'", args.bimfile))?;
@@ -52,7 +51,6 @@ pub fn run(args: MakeAnnotArgs) -> Result<()> {
     );
     Ok(())
 }
-
 
 /// Annotate SNPs using a UCSC BED file.
 fn annotate_from_bed(
@@ -181,7 +179,6 @@ fn is_in_intervals(intervals: &[(u32, u32)], bp: u32) -> bool {
     }
 }
 
-
 /// Annotate SNPs using a gene set (list of gene symbols) and a coordinate file.
 fn annotate_from_gene_set(
     snps: &[BimRecord],
@@ -261,7 +258,6 @@ fn annotate_from_gene_set(
     Ok(snps.iter().map(|s| annotate_snp(s, &intervals)).collect())
 }
 
-
 fn derive_annot_name(args: &MakeAnnotArgs) -> String {
     let source = args
         .bed_file
@@ -316,5 +312,3 @@ fn write_rows(
     }
     Ok(())
 }
-
-

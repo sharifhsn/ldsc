@@ -116,7 +116,6 @@ impl Bed {
             .with_context(|| format!("reading BED block start {} count {}", sid_start, count))?;
         Ok(())
     }
-
 }
 
 impl BedBuilder {
@@ -218,7 +217,6 @@ impl ReadOptionsBuilder {
             missing_value: f32::NAN,
         }
     }
-
 }
 
 impl<T: BedVal> ReadOptionsTyped<T> {
@@ -390,4 +388,3 @@ impl BedVal for i8 {
         v as i8
     }
 }
-

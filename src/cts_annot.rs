@@ -321,4 +321,3 @@ fn open_writer(path: &str) -> Result<Box<dyn Write>> {
         Ok(Box::new(file))
     }
 }
-

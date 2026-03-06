@@ -119,7 +119,6 @@ pub(crate) fn resolve_text_path(path: &str) -> Result<PathBuf> {
     normalize_whitespace_to_tsv(path, false)
 }
 
-
 /// Scan a TSV text file (`.sumstats`, `.ldscore`, etc.) as a Polars LazyFrame.
 /// Handles `.gz` and `.bz2` decompression transparently.
 pub fn scan_tsv(path: &str) -> Result<LazyFrame> {
@@ -272,7 +271,6 @@ pub fn concat_chrs_any(prefix: &str, suffixes: &[&str]) -> Result<LazyFrame> {
     );
 }
 
-
 /// Read annotation file into dense `Mat<f64>`. Skips first 4 cols unless `thin`.
 pub fn read_annot(prefix: &str, thin: bool) -> Result<(MatF, Vec<String>)> {
     let path = resolve_annot_path(prefix)?;
@@ -350,7 +348,6 @@ pub fn read_annot_path(path: &str, thin: bool) -> Result<(MatF, Vec<String>)> {
 
     Ok((matrix, col_names))
 }
-
 
 fn get_present_chrs_any(prefix: &str, suffixes: &[&str]) -> Vec<u8> {
     use std::collections::BTreeSet;
@@ -623,7 +620,6 @@ pub fn read_overlap_matrix(
     Ok((overlap, m_tot, col_names))
 }
 
-
 /// Per-SNP metadata from a PLINK .bim file.
 /// Columns: CHR  SNP  CM  BP  A1  A2  (tab-separated, no header).
 #[derive(Debug, Clone)]
@@ -663,5 +659,3 @@ pub fn parse_bim(path: &str) -> Result<Vec<BimRecord>> {
 
     Ok(records)
 }
-
-

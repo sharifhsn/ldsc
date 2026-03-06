@@ -39,7 +39,6 @@ pub enum Command {
     CtsAnnot(CtsAnnotArgs),
 }
 
-
 #[derive(Args)]
 pub struct MungeArgs {
     /// Input summary statistics file (TSV/CSV, optionally .gz or .bz2)
@@ -167,7 +166,6 @@ pub struct MungeArgs {
     pub nstudy_min: Option<u64>,
 }
 
-
 #[derive(Args)]
 pub struct L2Args {
     /// PLINK binary file prefix
@@ -282,7 +280,6 @@ pub struct L2Args {
     #[arg(long)]
     pub fast_f32: bool,
 }
-
 
 #[derive(Args)]
 pub struct H2Args {
@@ -407,7 +404,6 @@ pub struct H2Args {
     pub invert_anyway: bool,
 }
 
-
 #[derive(Args)]
 pub struct RgArgs {
     /// Comma-separated list of .sumstats(.gz|.bz2) files
@@ -504,7 +500,6 @@ pub struct RgArgs {
     pub invert_anyway: bool,
 }
 
-
 #[derive(Args)]
 pub struct MakeAnnotArgs {
     /// PLINK .bim file listing the SNPs to annotate
@@ -540,7 +535,6 @@ pub struct MakeAnnotArgs {
     #[arg(long)]
     pub nomerge: bool,
 }
-
 
 #[derive(Args)]
 pub struct CtsAnnotArgs {

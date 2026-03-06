@@ -9,4 +9,3 @@ pub struct IrwlsResult {
     pub jknife_cov: Option<MatF>,
     pub delete_values: Option<MatF>,
 }
-

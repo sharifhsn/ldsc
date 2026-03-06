@@ -21,7 +21,6 @@ use crate::parse;
 
 const MIN_SNPS_WARN: usize = 200_000;
 
-
 /// Load a scalar (single L2 column) LD score file, aliasing the L2 column.
 /// Used for weight LD scores (always scalar). Comma-separated lists are not allowed.
 fn load_ld(single: Option<&str>, chr_prefix: Option<&str>, alias: &str) -> Result<LazyFrame> {
@@ -200,7 +199,6 @@ fn load_ld_ref_multi_paths(paths: &[String], chr_split: bool) -> Result<LazyFram
     Ok(base.lazy())
 }
 
-
 fn resolve_m(
     m_snps_override: Option<f64>,
     ref_ld_chr: Option<&str>,
@@ -234,7 +232,6 @@ fn resolve_m(
     }
     n_obs as f64
 }
-
 
 /// Resolve per-annotation M values: .M files → --m-snps → n_obs fallback.
 fn resolve_m_vec(
@@ -305,7 +302,6 @@ fn resolve_m_vec(
     vec![total / k as f64; k]
 }
 
-
 fn column_is_zero_variance(values: &ColF) -> bool {
     let mut count = 0usize;
     let mut first: Option<f64> = None;
@@ -365,7 +361,6 @@ fn drop_zero_variance_ld(ref_ld: &DataFrame) -> Result<(DataFrame, Vec<usize>, u
     let df = ref_ld.select(&keep_cols)?;
     Ok((df, keep_idx, total))
 }
-
 
 fn filter_by_mask(v: &ColF, mask: &[bool]) -> ColF {
     let mut out = Vec::new();
@@ -478,7 +473,6 @@ fn align_rg_alleles(merged: &DataFrame, z2: &ColF) -> Result<(Vec<bool>, Vec<f64
 
     Ok((mask, z2_aligned, removed))
 }
-
 
 pub fn run_h2(args: H2Args) -> Result<()> {
     if args.return_silly_things {
@@ -1083,7 +1077,6 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
     Ok(())
 }
 
-
 struct PartitionedFit {
     est: ColF,
     jknife_cov: MatF,
@@ -1557,7 +1550,6 @@ fn run_h2_partitioned(
 
     Ok(fit)
 }
-
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -2387,7 +2379,6 @@ To match Python, provide {} values (first ignored).",
             (f64::NAN, f64::NAN)
         };
 
-
         println!(
             "  gencov = {:.4} ({:.4})  (intercept: {:.4} ± {:.4})",
             gencov.tot, gencov.tot_se, gencov.intercept, gencov.intercept_se
@@ -2431,7 +2422,6 @@ To match Python, provide {} values (first ignored).",
     Ok(())
 }
 
-
 fn print_jackknife_diagnostics(
     result: &crate::irwls::IrwlsResult,
     print_cov: bool,
@@ -2461,7 +2451,6 @@ fn print_jackknife_diagnostics(
     }
 }
 
-
 /// Extract a column from a Polars DataFrame as `ColF`.
 /// Missing values (null) are replaced with NaN.
 fn extract_f64(df: &DataFrame, name: &str) -> Result<ColF> {
@@ -2478,7 +2467,6 @@ fn extract_f64(df: &DataFrame, name: &str) -> Result<ColF> {
     Ok(col_from_vec(vec))
 }
 
-
 /// Compute the conversion factor for one trait (sample → liability scale).
 fn liability_conversion_factor(samp_prev: f64, pop_prev: f64) -> f64 {
     let normal = Normal::new(0.0, 1.0).expect("Normal(0,1)");
@@ -2488,4 +2476,3 @@ fn liability_conversion_factor(samp_prev: f64, pop_prev: f64) -> f64 {
     let p = samp_prev;
     k * k * (1.0 - k) * (1.0 - k) / (p * (1.0 - p) * z * z)
 }
-

@@ -60,20 +60,10 @@ impl GpuContext {
 
         // A is column-major (k × m): element (i,j) at offset j*k + i.
         // For A^T (m × k): element (j,i) maps to j*k + i, so shape [m,k], strides [k,1].
-        let a_tensor = TensorHandle::<R>::new(
-            a_handle,
-            vec![m, k],
-            vec![k, 1],
-            f32_storage,
-        );
+        let a_tensor = TensorHandle::<R>::new(a_handle, vec![m, k], vec![k, 1], f32_storage);
 
         // B is column-major (k × n): element (i,j) at offset j*k + i, strides [1, k].
-        let b_tensor = TensorHandle::<R>::new(
-            b_handle,
-            vec![k, n],
-            vec![1, k],
-            f32_storage,
-        );
+        let b_tensor = TensorHandle::<R>::new(b_handle, vec![k, n], vec![1, k], f32_storage);
 
         // Output: (m × n) — may be pitched/padded by the runtime
         let out_tensor = TensorHandle::<R>::empty(&self.client, vec![m, n], f32_storage);
@@ -126,12 +116,8 @@ impl GpuContext {
 
             // Re-upload B each tile (handle is consumed by read_one)
             let b_handle = self.client.create_from_slice(f32::as_bytes(b_data));
-            let b_tensor = TensorHandle::<R>::new(
-                b_handle,
-                vec![n_rows, n],
-                vec![1, n_rows],
-                f32_storage,
-            );
+            let b_tensor =
+                TensorHandle::<R>::new(b_handle, vec![n_rows, n], vec![1, n_rows], f32_storage);
 
             let a_handle = self.client.create_from_slice(f32::as_bytes(&tile_data));
             let a_tensor = TensorHandle::<R>::new(

@@ -14,8 +14,7 @@ pub fn jackknife_se_cov(est: &ColF, delete_values: &MatF, n_blocks: usize) -> (C
     let mut pseudo = MatF::zeros(n_b, p);
     for k in 0..n_b {
         for j in 0..p {
-            pseudo[(k, j)] =
-                est[(j, 0)] * n_b as f64 - delete_values[(k, j)] * (n_b as f64 - 1.0);
+            pseudo[(k, j)] = est[(j, 0)] * n_b as f64 - delete_values[(k, j)] * (n_b as f64 - 1.0);
         }
     }
 
@@ -58,5 +57,3 @@ pub fn jackknife_se_cov(est: &ColF, delete_values: &MatF, n_blocks: usize) -> (C
 
     (se, cov)
 }
-
-

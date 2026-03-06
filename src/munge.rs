@@ -21,7 +21,6 @@ fn has_col(cols: &[String], name: &str) -> bool {
     cols.iter().any(|c| c == name)
 }
 
-
 /// (uppercase_synonym, canonical_name) pairs.
 const CNAME_MAP: &[(&str, &str)] = &[
     // SNP identifier
@@ -91,7 +90,6 @@ fn cname_lookup(upper: &str) -> Option<&'static str> {
     CNAME_MAP.iter().find(|(k, _)| *k == upper).map(|(_, v)| *v)
 }
 
-
 pub fn run(args: MungeArgs) -> Result<()> {
     let mut args = args;
     if args.no_alleles && args.merge_alleles.is_some() {
@@ -159,7 +157,6 @@ pub fn run(args: MungeArgs) -> Result<()> {
     Ok(())
 }
 
-
 /// Drop user-specified columns before any other processing.
 ///
 /// `ignore_csv` is a comma-separated list of column names to drop.
@@ -195,7 +192,6 @@ fn drop_columns(lf: LazyFrame, drop_cols: &[String]) -> Result<LazyFrame> {
         .collect();
     Ok(lf.select(keep_cols))
 }
-
 
 fn apply_daner_overrides(lf: LazyFrame, args: &mut MungeArgs) -> Result<LazyFrame> {
     if !args.daner && !args.daner_n {
@@ -266,7 +262,6 @@ fn apply_daner_overrides(lf: LazyFrame, args: &mut MungeArgs) -> Result<LazyFram
     Ok(lf)
 }
 
-
 /// Apply explicit column-name overrides before the synonym map runs.
 ///
 /// Each `--xxx-col` flag maps a user-specified column name (case-insensitive)
@@ -312,7 +307,6 @@ fn apply_col_overrides(lf: LazyFrame, args: &MungeArgs) -> Result<LazyFrame> {
     Ok(lf.rename(old_names, new_names, false))
 }
 
-
 /// Rename input columns to their canonical names using CNAME_MAP, case-insensitively.
 fn normalize_columns(lf: LazyFrame) -> Result<LazyFrame> {
     let existing = column_names(&lf)?;
@@ -322,7 +316,9 @@ fn normalize_columns(lf: LazyFrame) -> Result<LazyFrame> {
 
     for name in &existing {
         let upper = name.to_uppercase();
-        if let Some(canonical) = cname_lookup(&upper) && *name != canonical {
+        if let Some(canonical) = cname_lookup(&upper)
+            && *name != canonical
+        {
             old_names.push(name.to_string());
             new_names.push(canonical.to_string());
         }
@@ -333,7 +329,6 @@ fn normalize_columns(lf: LazyFrame) -> Result<LazyFrame> {
     }
     Ok(lf.rename(old_names, new_names, false))
 }
-
 
 /// Apply --n / --n-cas / --n-con overrides.
 ///
@@ -360,7 +355,6 @@ fn apply_n_override(lf: LazyFrame, args: &MungeArgs) -> Result<LazyFrame> {
     }
     Ok(lf)
 }
-
 
 /// Derive Z-score using one of four strategies (in priority order):
 ///   1. Z column already present → no-op.
@@ -496,7 +490,6 @@ fn p_and_sign_to_z(df: &DataFrame, sign_col: &str, null_val: f64) -> Result<Seri
 
     Ok(Series::new("Z".into(), z_vals))
 }
-
 
 /// Apply MAF/N/INFO filters, optionally remove strand-ambiguous SNPs.
 /// When `no_alleles` is true the strand-ambiguity check is skipped.
@@ -681,7 +674,6 @@ fn apply_merge_alleles(lf: LazyFrame, allele_path: &str) -> Result<LazyFrame> {
     Ok(merged.select(keep))
 }
 
-
 /// Compute the mean of multiple INFO columns and store the result as "INFO".
 ///
 /// Useful when a summary-stats file provides per-population imputation scores
@@ -731,7 +723,6 @@ fn apply_info_list(lf: LazyFrame, info_list: Option<&str>) -> Result<LazyFrame> 
     Ok(lf.with_column((sum_expr / lit(n)).alias("INFO")))
 }
 
-
 /// Filter SNPs by the minimum number of studies they appear in.
 ///
 /// `nstudy` names the column holding the per-SNP study count;
@@ -769,7 +760,6 @@ fn apply_nstudy_filter(
     Ok(lf)
 }
 
-
 /// Write a DataFrame as a gzip-compressed tab-separated file.
 fn write_sumstats_gz(path: &str, df: &mut DataFrame) -> Result<()> {
     use flate2::Compression;
@@ -785,5 +775,3 @@ fn write_sumstats_gz(path: &str, df: &mut DataFrame) -> Result<()> {
         .with_context(|| format!("writing '{}'", path))?;
     Ok(())
 }
-
-

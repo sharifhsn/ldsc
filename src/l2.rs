@@ -1,18 +1,18 @@
 use crate::bed::{Bed, ReadOptions};
-use crate::la::{
-    MatF, MatF32, mat_add_in_place, mat_copy_from, mat_slice, mat_slice_mut, mat_slice_f32,
-    mat_slice_mut_f32, matmul_tn_to, matmul_tn_to_f32, matmul_to,
-};
+use crate::cli::L2Args;
+use crate::cts_annot;
 #[cfg(feature = "gpu")]
 use crate::gpu::GpuContext;
+use crate::la::{
+    MatF, MatF32, mat_add_in_place, mat_copy_from, mat_slice, mat_slice_f32, mat_slice_mut,
+    mat_slice_mut_f32, matmul_tn_to, matmul_tn_to_f32, matmul_to,
+};
+use crate::parse;
 use anyhow::{Context, Result};
 use faer::{Accum, Par};
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write as IoWrite};
-use crate::cli::L2Args;
-use crate::cts_annot;
-use crate::parse;
 
 /// GEMM scratch buffers — either f32 (fast) or f64 (default precision).
 enum GemmBufs {
@@ -33,7 +33,13 @@ enum GemmBufs {
 }
 
 impl GemmBufs {
-    fn new(use_f32: bool, n_indiv: usize, chunk_c: usize, ring_size: usize, max_window: usize) -> Self {
+    fn new(
+        use_f32: bool,
+        n_indiv: usize,
+        chunk_c: usize,
+        ring_size: usize,
+        max_window: usize,
+    ) -> Self {
         let mw = max_window.max(1);
         if use_f32 {
             Self::F32 {
@@ -57,7 +63,11 @@ impl GemmBufs {
 
 /// Extract column-major f32 data from an f32 faer matrix for GPU upload.
 #[cfg(feature = "gpu")]
-fn mat_to_col_major_f32_from_f32(mat: faer::MatRef<'_, f32>, nrows: usize, ncols: usize) -> Vec<f32> {
+fn mat_to_col_major_f32_from_f32(
+    mat: faer::MatRef<'_, f32>,
+    nrows: usize,
+    ncols: usize,
+) -> Vec<f32> {
     let mut data = Vec::with_capacity(nrows * ncols);
     for j in 0..ncols {
         for i in 0..nrows {
@@ -69,7 +79,11 @@ fn mat_to_col_major_f32_from_f32(mat: faer::MatRef<'_, f32>, nrows: usize, ncols
 
 /// Extract column-major f32 data from an f64 faer matrix for GPU upload.
 #[cfg(feature = "gpu")]
-fn mat_to_col_major_f32_from_f64(mat: faer::MatRef<'_, f64>, nrows: usize, ncols: usize) -> Vec<f32> {
+fn mat_to_col_major_f32_from_f64(
+    mat: faer::MatRef<'_, f64>,
+    nrows: usize,
+    ncols: usize,
+) -> Vec<f32> {
     let mut data = Vec::with_capacity(nrows * ncols);
     for j in 0..ncols {
         for i in 0..nrows {
@@ -81,7 +95,12 @@ fn mat_to_col_major_f32_from_f64(mat: faer::MatRef<'_, f64>, nrows: usize, ncols
 
 /// Write GPU result (row-major f32) back into an f32 faer matrix.
 #[cfg(feature = "gpu")]
-fn write_gpu_result_f32(result: &[f32], mut dst: faer::MatMut<'_, f32>, nrows: usize, ncols: usize) {
+fn write_gpu_result_f32(
+    result: &[f32],
+    mut dst: faer::MatMut<'_, f32>,
+    nrows: usize,
+    ncols: usize,
+) {
     for i in 0..nrows {
         for j in 0..ncols {
             dst[(i, j)] = result[i * ncols + j];
@@ -91,7 +110,12 @@ fn write_gpu_result_f32(result: &[f32], mut dst: faer::MatMut<'_, f32>, nrows: u
 
 /// Write GPU result (row-major f32) back into an f64 faer matrix.
 #[cfg(feature = "gpu")]
-fn write_gpu_result_f64(result: &[f32], mut dst: faer::MatMut<'_, f64>, nrows: usize, ncols: usize) {
+fn write_gpu_result_f64(
+    result: &[f32],
+    mut dst: faer::MatMut<'_, f64>,
+    nrows: usize,
+    ncols: usize,
+) {
     for i in 0..nrows {
         for j in 0..ncols {
             dst[(i, j)] = result[i * ncols + j] as f64;
@@ -163,7 +187,6 @@ fn load_individual_indices(keep_path: &str, fam_ids: &[(String, String)]) -> Res
     );
     Ok(indices)
 }
-
 
 /// Window mode for LD score computation.
 #[derive(Debug, Clone, Copy)]
@@ -251,7 +274,6 @@ fn get_block_lefts_by_chr(all_snps: &[BimRecord], mode: WindowMode) -> (Vec<usiz
     (block_left, any_full_chr_window)
 }
 
-
 /// Normalize genotype column in-place (impute NaN→mean, centre, scale). Returns MAF.
 fn normalize_col_f64(col: &mut [f64], n: usize) -> f64 {
     let (sum, count) = col.iter().fold((0f64, 0usize), |(s, c), &v| {
@@ -287,7 +309,6 @@ fn normalize_col_f32(col: &mut [f32], n: usize) -> f32 {
     }
     maf as f32
 }
-
 
 /// Compute LD scores for all SNPs. Returns `(l2, maf)`.
 #[allow(clippy::too_many_arguments, clippy::unnecessary_cast)]
@@ -417,7 +438,11 @@ fn compute_ldscore_global(
 
         for j in 0..c {
             match bufs {
-                GemmBufs::F32 { ref mut b_mat, ref mut col_buf, .. } => {
+                GemmBufs::F32 {
+                    ref mut b_mat,
+                    ref mut col_buf,
+                    ..
+                } => {
                     for i in 0..n_indiv {
                         col_buf[i] = raw[(i, j)];
                     }
@@ -432,7 +457,11 @@ fn compute_ldscore_global(
                         b_mat[(i, j)] = col_buf[i];
                     }
                 }
-                GemmBufs::F64 { ref mut b_mat, ref mut col_buf, .. } => {
+                GemmBufs::F64 {
+                    ref mut b_mat,
+                    ref mut col_buf,
+                    ..
+                } => {
                     for i in 0..n_indiv {
                         col_buf[i] = raw[(i, j)] as f64;
                     }
@@ -528,7 +557,14 @@ fn compute_ldscore_global(
                         }
                     }
                     if !_did_gpu {
-                        matmul_tn_to_f32(bb.as_mut(), b_slice, b_slice, 1.0f32, Accum::Replace, Par::rayon(0));
+                        matmul_tn_to_f32(
+                            bb.as_mut(),
+                            b_slice,
+                            b_slice,
+                            1.0f32,
+                            Accum::Replace,
+                            Par::rayon(0),
+                        );
                     }
                     fill_r2u_bb(&|k, j| bb[(k, j)] as f64);
                 }
@@ -552,7 +588,14 @@ fn compute_ldscore_global(
                         }
                     }
                     if !_did_gpu {
-                        matmul_tn_to(bb.as_mut(), b_slice, b_slice, 1.0f64, Accum::Replace, Par::rayon(0));
+                        matmul_tn_to(
+                            bb.as_mut(),
+                            b_slice,
+                            b_slice,
+                            1.0f64,
+                            Accum::Replace,
+                            Par::rayon(0),
+                        );
                     }
                     fill_r2u_bb(&|k, j| bb[(k, j)]);
                 }
@@ -639,7 +682,11 @@ fn compute_ldscore_global(
                 // Compute A^T × B GEMM, then fill r2u_ab (always f64).
                 match bufs {
                     GemmBufs::F32 {
-                        ref mut ring_buf, ref mut b_mat, ref mut a_buf, ref mut ab_buf, ..
+                        ref mut ring_buf,
+                        ref mut b_mat,
+                        ref mut a_buf,
+                        ref mut ab_buf,
+                        ..
                     } => {
                         if !contiguous {
                             for (wi, (_, slot)) in window.iter().enumerate() {
@@ -649,7 +696,11 @@ fn compute_ldscore_global(
                             }
                         }
                         let a_view = if contiguous {
-                            mat_slice_f32(ring_buf.as_ref(), 0..n_indiv, first_slot..(first_slot + w))
+                            mat_slice_f32(
+                                ring_buf.as_ref(),
+                                0..n_indiv,
+                                first_slot..(first_slot + w),
+                            )
                         } else {
                             mat_slice_f32(a_buf.as_ref(), 0..n_indiv, 0..w)
                         };
@@ -670,7 +721,8 @@ fn compute_ldscore_global(
                                     write_gpu_result_f32(
                                         &result,
                                         mat_slice_mut_f32(ab_buf.as_mut(), 0..w, 0..c),
-                                        w, c,
+                                        w,
+                                        c,
                                     );
                                     _did_gpu = true;
                                 }
@@ -679,7 +731,11 @@ fn compute_ldscore_global(
                         if !_did_gpu {
                             matmul_tn_to_f32(
                                 mat_slice_mut_f32(ab_buf.as_mut(), 0..w, 0..c),
-                                a_view, b_sl, 1.0f32, Accum::Replace, Par::rayon(0),
+                                a_view,
+                                b_sl,
+                                1.0f32,
+                                Accum::Replace,
+                                Par::rayon(0),
                             );
                         }
                         let ab_view = mat_slice_f32(ab_buf.as_ref(), 0..w, 0..c);
@@ -690,7 +746,11 @@ fn compute_ldscore_global(
                         }
                     }
                     GemmBufs::F64 {
-                        ref mut ring_buf, ref mut b_mat, ref mut a_buf, ref mut ab_buf, ..
+                        ref mut ring_buf,
+                        ref mut b_mat,
+                        ref mut a_buf,
+                        ref mut ab_buf,
+                        ..
                     } => {
                         if !contiguous {
                             for (wi, (_, slot)) in window.iter().enumerate() {
@@ -721,7 +781,8 @@ fn compute_ldscore_global(
                                     write_gpu_result_f64(
                                         &result,
                                         mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
-                                        w, c,
+                                        w,
+                                        c,
                                     );
                                     _did_gpu = true;
                                 }
@@ -730,7 +791,11 @@ fn compute_ldscore_global(
                         if !_did_gpu {
                             matmul_tn_to(
                                 mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
-                                a_view, b_sl, 1.0f64, Accum::Replace, Par::rayon(0),
+                                a_view,
+                                b_sl,
+                                1.0f64,
+                                Accum::Replace,
+                                Par::rayon(0),
                             );
                         }
                         let ab_view = mat_slice(ab_buf.as_ref(), 0..w, 0..c);
@@ -806,7 +871,11 @@ fn compute_ldscore_global(
 
         // Push B columns into ring buffer.
         match bufs {
-            GemmBufs::F32 { ref mut ring_buf, ref b_mat, .. } => {
+            GemmBufs::F32 {
+                ref mut ring_buf,
+                ref b_mat,
+                ..
+            } => {
                 for j in 0..c {
                     let slot = ring_next % ring_size;
                     for i in 0..n_indiv {
@@ -816,7 +885,11 @@ fn compute_ldscore_global(
                     ring_next += 1;
                 }
             }
-            GemmBufs::F64 { ref mut ring_buf, ref b_mat, .. } => {
+            GemmBufs::F64 {
+                ref mut ring_buf,
+                ref b_mat,
+                ..
+            } => {
                 for j in 0..c {
                     let slot = ring_next % ring_size;
                     for i in 0..n_indiv {
@@ -1032,7 +1105,6 @@ fn r2_unbiased(r: f64, n: usize) -> f64 {
     sq - (1.0 - sq) / denom
 }
 
-
 /// Write per-SNP LD scores to a gzip TSV.  `col_names` is `["L2"]` or `["{ANNOT}L2", …]`.
 fn write_ldscore_refs(
     path: &str,
@@ -1109,7 +1181,6 @@ fn format_m_vals(vals: &[f64]) -> String {
         .join("\t");
     format!("{joined}\n")
 }
-
 
 /// Load SNP IDs from a file (one per line; first token used; `#` lines skipped).
 fn load_snp_set(path: &str) -> Result<HashSet<String>> {
@@ -1596,10 +1667,7 @@ pub fn run(args: L2Args) -> Result<()> {
         }
     };
 
-    let out_snps: Vec<&BimRecord> = all_snps
-        .iter()
-        .filter(|s| should_output(s))
-        .collect();
+    let out_snps: Vec<&BimRecord> = all_snps.iter().filter(|s| should_output(s)).collect();
     let out_l2 = extract_rows(&out_positions, col_names.len());
     let out_path = format!("{}.l2.ldscore.gz", args.out);
     write_ldscore_refs(&out_path, &out_snps, &out_l2, &col_names)
@@ -1665,4 +1733,3 @@ pub fn run(args: L2Args) -> Result<()> {
     }
     Ok(())
 }
-

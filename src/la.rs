@@ -162,4 +162,3 @@ pub fn mat_slice_mut_f32<'a>(
     let ncols = cols.end.saturating_sub(cols.start);
     mat.submatrix_mut(rows.start, cols.start, nrows, ncols)
 }
-
