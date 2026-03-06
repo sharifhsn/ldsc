@@ -1,4 +1,5 @@
 //! LDSC h2 regression logic aligned to the Python implementation.
+use crate::jackknife::jackknife_se_cov;
 use crate::la::{
     ColF, MatF, col_from_vec, col_len, col_mean, col_sum, col_zeros, mat_add_in_place, mat_slice,
     matmul_tn_to,
@@ -25,10 +26,6 @@ pub struct H2Result {
     pub mean_chi2: f64,
     pub lambda_gc: f64,
     pub ratio: Option<(f64, f64)>,
-}
-
-fn mean(arr: &ColF) -> f64 {
-    col_mean(arr)
 }
 
 fn get_separators(n: usize, n_blocks: usize) -> Vec<usize> {
@@ -173,49 +170,7 @@ pub(crate) fn jackknife_fast(
         }
     }
 
-    let mut pseudovalues = MatF::zeros(n_blocks, p);
-    for i in 0..n_blocks {
-        for j in 0..p {
-            let pv =
-                est[(j, 0)] * (n_blocks as f64) - delete_values[(i, j)] * ((n_blocks - 1) as f64);
-            pseudovalues[(i, j)] = pv;
-        }
-    }
-
-    let mut mean_pv = vec![0.0f64; p];
-    for j in 0..p {
-        let mut sum = 0.0;
-        for i in 0..n_blocks {
-            sum += pseudovalues[(i, j)];
-        }
-        mean_pv[j] = sum / n_blocks as f64;
-    }
-
-    let mut centered = MatF::zeros(n_blocks, p);
-    for i in 0..n_blocks {
-        for j in 0..p {
-            centered[(i, j)] = pseudovalues[(i, j)] - mean_pv[j];
-        }
-    }
-    let mut jknife_cov = MatF::zeros(p, p);
-    matmul_tn_to(
-        jknife_cov.as_mut(),
-        centered.as_ref(),
-        centered.as_ref(),
-        1.0,
-        Accum::Replace,
-        Par::rayon(0),
-    );
-    let denom = (n_blocks - 1) as f64 * n_blocks as f64;
-    for i in 0..p {
-        for j in 0..p {
-            jknife_cov[(i, j)] /= denom;
-        }
-    }
-    let mut jknife_se = col_zeros(p);
-    for j in 0..p {
-        jknife_se[(j, 0)] = jknife_cov[(j, j)].sqrt();
-    }
+    let (jknife_se, jknife_cov) = jackknife_se_cov(&est, &delete_values, n_blocks);
 
     Ok(JackknifeResult {
         est,
@@ -250,13 +205,13 @@ pub(crate) fn ldsc_weights(
 }
 
 pub(crate) fn aggregate(y: &ColF, x: &ColF, n_vec: &ColF, m: f64, intercept: f64) -> f64 {
-    let num = m * (mean(y) - intercept);
+    let num = m * (col_mean(y) - intercept);
     let n = col_len(x);
     let mut denom_vec = col_zeros(n);
     for i in 0..n {
         denom_vec[(i, 0)] = x[(i, 0)] * n_vec[(i, 0)];
     }
-    let denom = mean(&denom_vec);
+    let denom = col_mean(&denom_vec);
     num / denom
 }
 
@@ -287,47 +242,7 @@ pub(crate) fn combine_twostep(
         }
     }
 
-    let mut pseudovalues = MatF::zeros(n_blocks, n_annot + 1);
-    for k in 0..n_blocks {
-        for j in 0..(n_annot + 1) {
-            let pv =
-                est[(j, 0)] * (n_blocks as f64) - delete_values[(k, j)] * ((n_blocks - 1) as f64);
-            pseudovalues[(k, j)] = pv;
-        }
-    }
-    let mut mean_pv = vec![0.0f64; n_annot + 1];
-    for j in 0..(n_annot + 1) {
-        let mut sum = 0.0;
-        for k in 0..n_blocks {
-            sum += pseudovalues[(k, j)];
-        }
-        mean_pv[j] = sum / n_blocks as f64;
-    }
-    let mut centered = MatF::zeros(n_blocks, n_annot + 1);
-    for i in 0..n_blocks {
-        for j in 0..(n_annot + 1) {
-            centered[(i, j)] = pseudovalues[(i, j)] - mean_pv[j];
-        }
-    }
-    let mut jknife_cov = MatF::zeros(n_annot + 1, n_annot + 1);
-    matmul_tn_to(
-        jknife_cov.as_mut(),
-        centered.as_ref(),
-        centered.as_ref(),
-        1.0,
-        Accum::Replace,
-        Par::rayon(0),
-    );
-    let denom = (n_blocks - 1) as f64 * n_blocks as f64;
-    for i in 0..(n_annot + 1) {
-        for j in 0..(n_annot + 1) {
-            jknife_cov[(i, j)] /= denom;
-        }
-    }
-    let mut jknife_se = col_zeros(n_annot + 1);
-    for j in 0..(n_annot + 1) {
-        jknife_se[(j, 0)] = jknife_cov[(j, j)].sqrt();
-    }
+    let (jknife_se, jknife_cov) = jackknife_se_cov(&est, &delete_values, n_blocks);
 
     Ok(JackknifeResult {
         est,
@@ -353,7 +268,7 @@ pub fn run_h2_ldsc(
     if col_len(ref_l2) != n || col_len(w_l2) != n || col_len(n_vec) != n {
         bail!("run_h2_ldsc: input length mismatch");
     }
-    let nbar = mean(n_vec);
+    let nbar = col_mean(n_vec);
 
     let intercept0 = fixed_intercept.unwrap_or(1.0);
     let tot_agg = aggregate(chi2, ref_l2, n_vec, m_snps, intercept0);
@@ -474,7 +389,7 @@ pub fn run_h2_ldsc(
         (jknife.est[(1, 0)], jknife.jknife_se[(1, 0)])
     };
 
-    let mean_chi2 = mean(chi2);
+    let mean_chi2 = col_mean(chi2);
     let lambda_gc = {
         let mut vals = Vec::with_capacity(n);
         for i in 0..n {

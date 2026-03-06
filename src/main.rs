@@ -1,6 +1,8 @@
 mod bed;
 mod cli;
 mod cts_annot;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod h2;
 mod irwls;
 mod jackknife;

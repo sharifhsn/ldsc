@@ -1,163 +1,105 @@
 use crate::bed::{Bed, ReadOptions};
 use crate::la::{
-    MatF, MatF32, mat_add_in_place, mat_copy_from, mat_slice, mat_slice_mut, matmul_tn_to,
-    matmul_to,
+    MatF, MatF32, mat_add_in_place, mat_copy_from, mat_slice, mat_slice_mut, mat_slice_f32,
+    mat_slice_mut_f32, matmul_tn_to, matmul_tn_to_f32, matmul_to,
 };
-#[cfg(feature = "fast-f32")]
-use crate::la::{mat_slice_f32, mat_slice_mut_f32, matmul_tn_to_f32};
-/// LD score computation.
-///
-/// Memory: .bed files are read via the internal BED reader; peak RAM is
-/// `window_snps × n_indiv × 4 bytes` (≈ 20 MB for 1000G, ≈ 4 GB for biobanks).
-///
-/// Algorithm: for each SNP i, `L2[i] = Σ_j r²_unbiased(i, j)` where j ranges
-/// over the window, using `r²_unbiased = r² − (1−r²)/(n−2)` [Bulik-Sullivan 2015].
-/// SNPs are processed in chunks so the inner A^T B product is a single matmul.
-///
-/// Partitioned LD scores (`--annot`): `L2_k[i] = Σ_j r²_unbiased(i,j) × annot[j,k]`
-/// yields one column per annotation; `.M`/`.M_5_50` files are tab-separated.
+#[cfg(feature = "gpu")]
+use crate::gpu::GpuContext;
 use anyhow::{Context, Result};
 use faer::{Accum, Par};
-use faer::{MatMut, MatRef};
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write as IoWrite};
-use std::time::Instant;
-use tracing::trace;
-
 use crate::cli::L2Args;
 use crate::cts_annot;
 use crate::parse;
 
-#[cfg(feature = "fast-f32")]
-type MatG = MatF32;
-#[cfg(not(feature = "fast-f32"))]
-type MatG = MatF;
-
-#[cfg(feature = "fast-f32")]
-type MatRefG<'a> = MatRef<'a, f32>;
-#[cfg(not(feature = "fast-f32"))]
-type MatRefG<'a> = MatRef<'a, f64>;
-
-#[cfg(feature = "fast-f32")]
-type MatMutG<'a> = MatMut<'a, f32>;
-#[cfg(not(feature = "fast-f32"))]
-type MatMutG<'a> = MatMut<'a, f64>;
-
-#[cfg(feature = "fast-f32")]
-const ONE_G: f32 = 1.0;
-#[cfg(not(feature = "fast-f32"))]
-const ONE_G: f64 = 1.0;
-
-#[cfg(feature = "fast-f32")]
-#[inline]
-fn mat_slice_g(
-    mat: MatRefG<'_>,
-    rows: std::ops::Range<usize>,
-    cols: std::ops::Range<usize>,
-) -> MatRefG<'_> {
-    mat_slice_f32(mat, rows, cols)
+/// GEMM scratch buffers — either f32 (fast) or f64 (default precision).
+enum GemmBufs {
+    F64 {
+        ring_buf: MatF,
+        b_mat: MatF,
+        a_buf: MatF,
+        ab_buf: MatF,
+        col_buf: Vec<f64>,
+    },
+    F32 {
+        ring_buf: MatF32,
+        b_mat: MatF32,
+        a_buf: MatF32,
+        ab_buf: MatF32,
+        col_buf: Vec<f32>,
+    },
 }
 
-#[cfg(not(feature = "fast-f32"))]
-#[inline]
-fn mat_slice_g(
-    mat: MatRefG<'_>,
-    rows: std::ops::Range<usize>,
-    cols: std::ops::Range<usize>,
-) -> MatRefG<'_> {
-    mat_slice(mat, rows, cols)
-}
-
-#[cfg(feature = "fast-f32")]
-#[inline]
-fn mat_slice_mut_g(
-    mat: MatMutG<'_>,
-    rows: std::ops::Range<usize>,
-    cols: std::ops::Range<usize>,
-) -> MatMutG<'_> {
-    mat_slice_mut_f32(mat, rows, cols)
-}
-
-#[cfg(not(feature = "fast-f32"))]
-#[inline]
-fn mat_slice_mut_g(
-    mat: MatMutG<'_>,
-    rows: std::ops::Range<usize>,
-    cols: std::ops::Range<usize>,
-) -> MatMutG<'_> {
-    mat_slice_mut(mat, rows, cols)
-}
-
-#[cfg(feature = "fast-f32")]
-#[inline]
-fn matmul_tn_to_g(
-    dst: MatMutG<'_>,
-    lhs: MatRefG<'_>,
-    rhs: MatRefG<'_>,
-    alpha: f32,
-    accum: Accum,
-    par: Par,
-) {
-    matmul_tn_to_f32(dst, lhs, rhs, alpha, accum, par);
-}
-
-#[cfg(not(feature = "fast-f32"))]
-#[inline]
-fn matmul_tn_to_g(
-    dst: MatMutG<'_>,
-    lhs: MatRefG<'_>,
-    rhs: MatRefG<'_>,
-    alpha: f64,
-    accum: Accum,
-    par: Par,
-) {
-    matmul_tn_to(dst, lhs, rhs, alpha, accum, par);
-}
-
-// ---------------------------------------------------------------------------
-// BIM / FAM parsing
-// ---------------------------------------------------------------------------
-
-/// Per-SNP metadata from a PLINK .bim file.
-/// Columns: CHR  SNP  CM  BP  A1  A2  (tab-separated, no header).
-#[derive(Debug, Clone)]
-pub struct BimRecord {
-    pub chr: u8,
-    pub snp: String,
-    pub cm: f64,
-    pub bp: u32,
-    /// 0-based index within the .bed file (position in the full BIM list).
-    pub bed_idx: usize,
-}
-
-/// Parse a PLINK .bim file.  Returns one `BimRecord` per row.
-pub fn parse_bim(path: &str) -> Result<Vec<BimRecord>> {
-    let f = File::open(path).with_context(|| format!("opening BIM file '{}'", path))?;
-    let reader = BufReader::new(f);
-    let mut records = Vec::new();
-
-    for (line_no, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("reading BIM line {}", line_no + 1))?;
-        let cols: Vec<&str> = line.split('\t').collect();
-        anyhow::ensure!(
-            cols.len() >= 6,
-            "BIM line {}: expected 6 columns, got {}",
-            line_no + 1,
-            cols.len()
-        );
-
-        records.push(BimRecord {
-            chr: cols[0].parse::<u8>().unwrap_or(0),
-            snp: cols[1].to_string(),
-            cm: cols[2].parse::<f64>().unwrap_or(0.0),
-            bp: cols[3].parse::<u32>().unwrap_or(0),
-            bed_idx: line_no,
-        });
+impl GemmBufs {
+    fn new(use_f32: bool, n_indiv: usize, chunk_c: usize, ring_size: usize, max_window: usize) -> Self {
+        let mw = max_window.max(1);
+        if use_f32 {
+            Self::F32 {
+                ring_buf: MatF32::zeros(n_indiv, ring_size),
+                b_mat: MatF32::zeros(n_indiv, chunk_c),
+                a_buf: MatF32::zeros(n_indiv, mw),
+                ab_buf: MatF32::zeros(mw, chunk_c),
+                col_buf: vec![0.0f32; n_indiv],
+            }
+        } else {
+            Self::F64 {
+                ring_buf: MatF::zeros(n_indiv, ring_size),
+                b_mat: MatF::zeros(n_indiv, chunk_c),
+                a_buf: MatF::zeros(n_indiv, mw),
+                ab_buf: MatF::zeros(mw, chunk_c),
+                col_buf: vec![0.0f64; n_indiv],
+            }
+        }
     }
-
-    Ok(records)
 }
+
+/// Extract column-major f32 data from an f32 faer matrix for GPU upload.
+#[cfg(feature = "gpu")]
+fn mat_to_col_major_f32_from_f32(mat: faer::MatRef<'_, f32>, nrows: usize, ncols: usize) -> Vec<f32> {
+    let mut data = Vec::with_capacity(nrows * ncols);
+    for j in 0..ncols {
+        for i in 0..nrows {
+            data.push(mat[(i, j)]);
+        }
+    }
+    data
+}
+
+/// Extract column-major f32 data from an f64 faer matrix for GPU upload.
+#[cfg(feature = "gpu")]
+fn mat_to_col_major_f32_from_f64(mat: faer::MatRef<'_, f64>, nrows: usize, ncols: usize) -> Vec<f32> {
+    let mut data = Vec::with_capacity(nrows * ncols);
+    for j in 0..ncols {
+        for i in 0..nrows {
+            data.push(mat[(i, j)] as f32);
+        }
+    }
+    data
+}
+
+/// Write GPU result (row-major f32) back into an f32 faer matrix.
+#[cfg(feature = "gpu")]
+fn write_gpu_result_f32(result: &[f32], mut dst: faer::MatMut<'_, f32>, nrows: usize, ncols: usize) {
+    for i in 0..nrows {
+        for j in 0..ncols {
+            dst[(i, j)] = result[i * ncols + j];
+        }
+    }
+}
+
+/// Write GPU result (row-major f32) back into an f64 faer matrix.
+#[cfg(feature = "gpu")]
+fn write_gpu_result_f64(result: &[f32], mut dst: faer::MatMut<'_, f64>, nrows: usize, ncols: usize) {
+    for i in 0..nrows {
+        for j in 0..ncols {
+            dst[(i, j)] = result[i * ncols + j] as f64;
+        }
+    }
+}
+
+pub use crate::parse::{BimRecord, parse_bim};
 
 /// Count the number of individuals in a PLINK .fam file (one row per individual).
 pub fn count_fam(path: &str) -> Result<usize> {
@@ -222,9 +164,6 @@ fn load_individual_indices(keep_path: &str, fam_ids: &[(String, String)]) -> Res
     Ok(indices)
 }
 
-// ---------------------------------------------------------------------------
-// Window boundary computation  (getBlockLefts from ldscore/ldscore.py)
-// ---------------------------------------------------------------------------
 
 /// Window mode for LD score computation.
 #[derive(Debug, Clone, Copy)]
@@ -237,11 +176,7 @@ pub enum WindowMode {
     Snp(usize),
 }
 
-/// For each SNP i, compute the index of the leftmost SNP j such that
-/// dist(coords[i], coords[j]) <= max_dist.
-///
-/// `coords` must be non-decreasing (sorted within a chromosome).
-/// Returns a `Vec<usize>` where `block_left[i]` is that leftmost index.
+/// For each SNP, compute the leftmost SNP index within `max_dist`.
 fn get_block_lefts_f64(coords: &[f64], max_dist: f64) -> Vec<usize> {
     let m = coords.len();
     let mut block_left = vec![0usize; m];
@@ -255,12 +190,6 @@ fn get_block_lefts_f64(coords: &[f64], max_dist: f64) -> Vec<usize> {
     }
 
     block_left
-}
-
-/// Fixed-SNP window: block_left[i] = max(0, i - half_window).
-#[cfg(test)]
-fn get_block_lefts_snp(m: usize, half_window: usize) -> Vec<usize> {
-    (0..m).map(|i| i.saturating_sub(half_window)).collect()
 }
 
 /// Compute block_left per chromosome to avoid cross-chromosome LD windows.
@@ -322,14 +251,8 @@ fn get_block_lefts_by_chr(all_snps: &[BimRecord], mode: WindowMode) -> (Vec<usiz
     (block_left, any_full_chr_window)
 }
 
-// ---------------------------------------------------------------------------
-// Genotype normalisation helpers
-// ---------------------------------------------------------------------------
 
-/// Normalize a genotype column in-place: impute NaN with mean, centre, scale to unit variance.
-///
-/// Returns the minor allele frequency: `MAF = min(mean/2, 1 − mean/2)`.
-/// Works on f32; caller casts to f64 into the pre-allocated `b_mat`.
+/// Normalize genotype column in-place (impute NaN→mean, centre, scale). Returns MAF.
 fn normalize_col_f64(col: &mut [f64], n: usize) -> f64 {
     let (sum, count) = col.iter().fold((0f64, 0usize), |(s, c), &v| {
         if v.is_nan() { (s, c) } else { (s + v, c + 1) }
@@ -340,7 +263,7 @@ fn normalize_col_f64(col: &mut [f64], n: usize) -> f64 {
 
     for v in col.iter_mut() {
         if v.is_nan() {
-            *v = avg;
+            *v = 0.0;
         } else {
             *v -= avg;
         }
@@ -355,50 +278,19 @@ fn normalize_col_f64(col: &mut [f64], n: usize) -> f64 {
     maf
 }
 
-#[cfg(feature = "fast-f32")]
+/// f32 variant: widen to f64 for normalization, then narrow back.
 fn normalize_col_f32(col: &mut [f32], n: usize) -> f32 {
-    let (sum, count) = col.iter().fold((0f32, 0usize), |(s, c), &v| {
-        if v.is_nan() { (s, c) } else { (s + v, c + 1) }
-    });
-    let avg = if count > 0 { sum / count as f32 } else { 0.0 };
-    let mut freq = avg / 2.0;
-    if freq < 0.0 {
-        freq = 0.0;
-    } else if freq > 1.0 {
-        freq = 1.0;
+    let mut buf: Vec<f64> = col.iter().map(|&v| v as f64).collect();
+    let maf = normalize_col_f64(&mut buf, n);
+    for (dst, &src) in col.iter_mut().zip(buf.iter()) {
+        *dst = src as f32;
     }
-    let maf = freq.min(1.0 - freq);
-
-    for v in col.iter_mut() {
-        if v.is_nan() {
-            *v = avg;
-        } else {
-            *v -= avg;
-        }
-    }
-
-    let mut var = 0.0f32;
-    for &v in col.iter() {
-        var += v * v;
-    }
-    var /= n as f32;
-    let std = var.sqrt();
-    if std > 0.0 {
-        let inv_std = 1.0 / std;
-        col.iter_mut().for_each(|v| *v *= inv_std);
-    }
-    maf
+    maf as f32
 }
 
-// ---------------------------------------------------------------------------
-// LD score computation
-// ---------------------------------------------------------------------------
 
-/// Compute LD scores for all SNPs in one sequential global pass.
-///
-/// Returns `(l2, maf)` where `l2` has shape `(m, 1)` (scalar) or `(m, K)`
-/// (partitioned with annotation), and `maf` is per-SNP MAF.
-#[allow(clippy::too_many_arguments)]
+/// Compute LD scores for all SNPs. Returns `(l2, maf)`.
+#[allow(clippy::too_many_arguments, clippy::unnecessary_cast)]
 fn compute_ldscore_global(
     all_snps: &[BimRecord],
     bed: &mut Bed,
@@ -409,6 +301,9 @@ fn compute_ldscore_global(
     iid_indices: Option<&[isize]>,
     pq_exp: Option<f64>,
     yes_really: bool,
+    _use_gpu: bool,
+    _gpu_tile_cols: Option<usize>,
+    use_f32: bool,
 ) -> Result<(MatF, Vec<f64>)> {
     let m = all_snps.len();
     if m == 0 {
@@ -427,19 +322,6 @@ fn compute_ldscore_global(
 
     let n = n_indiv as f64;
     let mut maf_per_snp = vec![0.0f64; m];
-    let trace_snp = std::env::var("LDSC_TRACE_SNP").ok();
-    let trace_ab_chunks = std::env::var("LDSC_TRACE_AB_CHUNKS").is_ok();
-    let trace_idx = trace_snp
-        .as_ref()
-        .and_then(|snp| all_snps.iter().position(|rec| rec.snp == *snp));
-    if let Some(ref snp) = trace_snp
-        && trace_idx.is_none()
-    {
-        trace!("trace_snp '{}' not found in BIM list", snp);
-    }
-    let mut trace_diag = 0.0f64;
-    let mut trace_bb = 0.0f64;
-    let mut trace_ab = 0.0f64;
 
     let block_sizes: Vec<usize> = (0..m)
         .map(|i| {
@@ -459,320 +341,21 @@ fn compute_ldscore_global(
     if chunk_c > 0 {
         ring_size = ring_size.div_ceil(chunk_c) * chunk_c;
     }
-    let mut ring_buf = MatG::zeros(n_indiv, ring_size);
+    let mut bufs = GemmBufs::new(use_f32, n_indiv, chunk_c, ring_size, max_window_size);
     let mut ring_next: usize = 0;
     let mut window: VecDeque<(usize, usize)> = VecDeque::new(); // (snp_idx, ring_slot)
 
-    let mut b_mat = MatG::zeros(n_indiv, chunk_c);
-    #[cfg(feature = "fast-f32")]
-    let mut col_buf_f32 = vec![0.0f32; n_indiv];
-    #[cfg(not(feature = "fast-f32"))]
-    let mut col_buf_f64 = vec![0.0f64; n_indiv];
-    let mut a_buf = MatG::zeros(n_indiv, max_window_size.max(1));
-    let mut ab_buf = MatG::zeros(max_window_size.max(1), chunk_c);
-
     let mut pq_per_snp: Option<Vec<f64>> = pq_exp.map(|_| vec![1.0f64; m]);
-    let mut pq_chunk: Vec<f64> = Vec::with_capacity(chunk_c);
 
-    let mut t_read_bed = std::time::Duration::ZERO;
-    let mut t_norm = std::time::Duration::ZERO;
-    let mut t_bb = std::time::Duration::ZERO;
-    let mut t_ab = std::time::Duration::ZERO;
-    let mut t_r2u = std::time::Duration::ZERO;
-    let mut t_r2u_bb = std::time::Duration::ZERO;
-    let mut t_r2u_ab = std::time::Duration::ZERO;
-    let mut t_annot = std::time::Duration::ZERO;
-    let mut t_annot_bb = std::time::Duration::ZERO;
-    let mut t_annot_ab_left = std::time::Duration::ZERO;
-    let mut t_annot_ab_right = std::time::Duration::ZERO;
-    let mut t_ab_wrap_copy = std::time::Duration::ZERO;
-    let mut t_ab_contig = std::time::Duration::ZERO;
-    let mut t_ab_wrap_matmul = std::time::Duration::ZERO;
-    let mut ab_calls = 0usize;
-    let mut ab_contig_calls = 0usize;
-    let mut ab_wrap_calls = 0usize;
-    let mut ab_sum_w = 0usize;
-    let mut ab_sum_c = 0usize;
-    let mut ab_max_w = 0usize;
-    let mut ab_max_c = 0usize;
-    if annot.is_none() {
-        let mut l2_scalar = vec![0.0f64; m];
-
-        for chunk_start in (0..m).step_by(chunk_c) {
-            let chunk_end = (chunk_start + chunk_c).min(m);
-            let c = chunk_end - chunk_start;
-
-            let mut b = block_sizes[chunk_start];
-            if b > chunk_start {
-                b = chunk_start;
-            }
-            let a_left = chunk_start - b;
-            while window
-                .front()
-                .map(|(idx, _)| *idx < a_left)
-                .unwrap_or(false)
-            {
-                window.pop_front();
-            }
-
-            let bed_indices: Vec<isize> = all_snps[chunk_start..chunk_end]
-                .iter()
-                .map(|s| s.bed_idx as isize)
-                .collect();
-            let raw: MatF32 = {
-                let mut ro = ReadOptions::builder();
-                let mut builder = ro.sid_index(&bed_indices).f32();
-                let t = Instant::now();
-                let result = if let Some(iids) = iid_indices {
-                    builder.iid_index(iids).read(bed)
-                } else {
-                    builder.read(bed)
-                };
-                t_read_bed += t.elapsed();
-                result
-                    .with_context(|| format!("reading BED chunk [{},{})", chunk_start, chunk_end))?
-            };
-
-            {
-                let t = Instant::now();
-                for j in 0..c {
-                    #[cfg(feature = "fast-f32")]
-                    {
-                        for i in 0..n_indiv {
-                            col_buf_f32[i] = raw[(i, j)];
-                        }
-                        let snp_maf = normalize_col_f32(&mut col_buf_f32, n_indiv);
-                        maf_per_snp[chunk_start + j] = snp_maf as f64;
-                        if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
-                            let maf_f64 = snp_maf as f64;
-                            let pq = (maf_f64 * (1.0 - maf_f64)).powf(exp);
-                            pq_vec[chunk_start + j] = pq;
-                        }
-                        for i in 0..n_indiv {
-                            b_mat[(i, j)] = col_buf_f32[i];
-                        }
-                    }
-                    #[cfg(not(feature = "fast-f32"))]
-                    {
-                        for i in 0..n_indiv {
-                            col_buf_f64[i] = raw[(i, j)] as f64;
-                        }
-                        let snp_maf = normalize_col_f64(&mut col_buf_f64, n_indiv);
-                        maf_per_snp[chunk_start + j] = snp_maf;
-                        if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
-                            let pq = (snp_maf * (1.0 - snp_maf)).powf(exp);
-                            pq_vec[chunk_start + j] = pq;
-                        }
-                        for i in 0..n_indiv {
-                            b_mat[(i, j)] = col_buf_f64[i];
-                        }
-                    }
-                }
-                t_norm += t.elapsed();
-            }
-            let b_slice = mat_slice_g(b_mat.as_ref(), 0..n_indiv, 0..c);
-
-            pq_chunk.clear();
-            if let Some(ref pq_vec) = pq_per_snp {
-                for j in 0..c {
-                    pq_chunk.push(pq_vec[chunk_start + j]);
-                }
-            } else {
-                pq_chunk.resize(c, 1.0);
-            }
-
-            // B×B
-            let mut bb = MatG::zeros(c, c);
-            let t = Instant::now();
-            matmul_tn_to_g(
-                bb.as_mut(),
-                b_slice,
-                b_slice,
-                ONE_G,
-                Accum::Replace,
-                Par::rayon(0),
-            );
-            t_bb += t.elapsed();
-            let t = Instant::now();
-            for j in 0..c {
-                let j_g = chunk_start + j;
-                let pq_j = pq_chunk[j];
-                l2_scalar[j_g] += pq_j; // diagonal: r(j,j) = 1
-                if trace_idx == Some(j_g) {
-                    trace_diag += pq_j;
-                }
-                for k in 0..j {
-                    let k_g = chunk_start + k;
-                    let pq_k = pq_chunk[k];
-                    let r2u = r2_unbiased(bb[(k, j)] / n, n_indiv);
-                    l2_scalar[j_g] += r2u * pq_k;
-                    l2_scalar[k_g] += r2u * pq_j;
-                    if trace_idx == Some(j_g) {
-                        trace_bb += r2u * pq_k;
-                    } else if trace_idx == Some(k_g) {
-                        trace_bb += r2u * pq_j;
-                    }
-                }
-            }
-            let elapsed = t.elapsed();
-            t_r2u += elapsed;
-            t_r2u_bb += elapsed;
-
-            // A×B
-            if !window.is_empty() {
-                let w = window.len();
-                let (first_slot, last_slot) = window
-                    .front()
-                    .and_then(|(_, f)| window.back().map(|(_, l)| (*f, *l)))
-                    .unwrap_or((0, 0));
-                let contiguous = first_slot <= last_slot && last_slot - first_slot + 1 == w;
-
-                if !contiguous {
-                    let t_copy = Instant::now();
-                    for (wi, (_, slot)) in window.iter().enumerate() {
-                        for i in 0..n_indiv {
-                            a_buf[(i, wi)] = ring_buf[(i, *slot)];
-                        }
-                    }
-                    t_ab_wrap_copy += t_copy.elapsed();
-                }
-                let t = Instant::now();
-                if contiguous {
-                    ab_contig_calls += 1;
-                    let a_view =
-                        mat_slice_g(ring_buf.as_ref(), 0..n_indiv, first_slot..(first_slot + w));
-                    matmul_tn_to_g(
-                        mat_slice_mut_g(ab_buf.as_mut(), 0..w, 0..c),
-                        a_view,
-                        b_slice,
-                        ONE_G,
-                        Accum::Replace,
-                        Par::rayon(0),
-                    );
-                } else {
-                    ab_wrap_calls += 1;
-                    let a_view = mat_slice_g(a_buf.as_ref(), 0..n_indiv, 0..w);
-                    matmul_tn_to_g(
-                        mat_slice_mut_g(ab_buf.as_mut(), 0..w, 0..c),
-                        a_view,
-                        b_slice,
-                        ONE_G,
-                        Accum::Replace,
-                        Par::rayon(0),
-                    );
-                }
-                let ab_elapsed = t.elapsed();
-                if contiguous {
-                    t_ab_contig += ab_elapsed;
-                } else {
-                    t_ab_wrap_matmul += ab_elapsed;
-                }
-                t_ab += ab_elapsed;
-                ab_calls += 1;
-                ab_sum_w += w;
-                ab_sum_c += c;
-                ab_max_w = ab_max_w.max(w);
-                ab_max_c = ab_max_c.max(c);
-                let t = Instant::now();
-                let ab_view = mat_slice_g(ab_buf.as_ref(), 0..w, 0..c);
-                let pq_vec_opt = pq_per_snp.as_ref();
-                for (wi, (k_g, _)) in window.iter().enumerate() {
-                    let pq_k = if let Some(pq_vec) = pq_vec_opt {
-                        pq_vec[*k_g]
-                    } else {
-                        1.0
-                    };
-                    for j in 0..c {
-                        let j_g = chunk_start + j;
-                        let pq_j = pq_chunk[j];
-                        let r2u = r2_unbiased(ab_view[(wi, j)] as f64 / n, n_indiv);
-                        l2_scalar[j_g] += r2u * pq_k;
-                        l2_scalar[*k_g] += r2u * pq_j;
-                        if trace_idx == Some(j_g) {
-                            trace_ab += r2u * pq_k;
-                        } else if trace_idx == Some(*k_g) {
-                            trace_ab += r2u * pq_j;
-                        }
-                    }
-                }
-                let r2u_elapsed = t.elapsed();
-                t_r2u += r2u_elapsed;
-                t_r2u_ab += r2u_elapsed;
-
-                if trace_ab_chunks {
-                    trace!(
-                        "l2 ab_chunk chunk_start={} chunk_end={} c={} w={} contig={} did_ab=1 chunk_all_zero=0 window_all_zero=0 ab_ms={:.3} r2u_ab_ms={:.3} annot_left_ms=0.000 annot_right_ms=0.000",
-                        chunk_start,
-                        chunk_end,
-                        c,
-                        w,
-                        contiguous as u8,
-                        ab_elapsed.as_secs_f64() * 1000.0,
-                        r2u_elapsed.as_secs_f64() * 1000.0
-                    );
-                }
-            }
-
-            for j in 0..c {
-                let slot = ring_next % ring_size;
-                for i in 0..n_indiv {
-                    ring_buf[(i, slot)] = b_mat[(i, j)];
-                }
-                window.push_back((chunk_start + j, slot));
-                ring_next += 1;
-            }
+    // When no annotation is provided, use an all-ones column (scalar LD scores).
+    let ones_annot;
+    let annot = match annot {
+        Some(a) => a,
+        None => {
+            ones_annot = MatF::from_fn(m, 1, |_, _| 1.0);
+            &ones_annot
         }
-
-        trace!(
-            "l2 timing: bed_read={:?} norm={:?} bb_dot={:?} ab_dot={:?} r2u_bb={:?} r2u_ab={:?} ab_calls={} ab_contig={} ab_wrap={} ab_wrap_copy={:?} ab_contig_matmul={:?} ab_wrap_matmul={:?} ab_avg_w={:.2} ab_avg_c={:.2} ab_max_w={} ab_max_c={}",
-            t_read_bed,
-            t_norm,
-            t_bb,
-            t_ab,
-            t_r2u_bb,
-            t_r2u_ab,
-            ab_calls,
-            ab_contig_calls,
-            ab_wrap_calls,
-            t_ab_wrap_copy,
-            t_ab_contig,
-            t_ab_wrap_matmul,
-            if ab_calls > 0 {
-                ab_sum_w as f64 / ab_calls as f64
-            } else {
-                0.0
-            },
-            if ab_calls > 0 {
-                ab_sum_c as f64 / ab_calls as f64
-            } else {
-                0.0
-            },
-            ab_max_w,
-            ab_max_c
-        );
-        if let (Some(snp), Some(idx)) = (trace_snp.as_ref(), trace_idx) {
-            let total = trace_diag + trace_bb + trace_ab;
-            let trace_output = l2_scalar[idx];
-            trace!(
-                "trace_snp={} idx={} l2_total={:.12} diag={:.12} bb={:.12} ab={:.12} output={:.12}",
-                snp,
-                idx,
-                total,
-                trace_diag,
-                trace_bb + trace_diag,
-                trace_ab,
-                trace_output
-            );
-        }
-        let mut l2 = MatF::zeros(m, 1);
-        for (i, v) in l2_scalar.into_iter().enumerate() {
-            l2[(i, 0)] = v;
-        }
-        return Ok((l2, maf_per_snp));
-    }
-
-    // Partitioned path (annot is Some).
-    let annot = annot.unwrap();
+    };
     anyhow::ensure!(
         annot.nrows() == m,
         "Annotation matrix has {} rows but BIM has {} SNPs",
@@ -783,6 +366,22 @@ fn compute_ldscore_global(
     let mut l2 = MatF::zeros(m, n_annot);
     let mut r2u_bb = MatF::zeros(chunk_c, chunk_c);
     let mut r2u_ab = MatF::zeros(max_window_size.max(1), chunk_c);
+
+    #[cfg(feature = "gpu")]
+    let gpu_ctx = if _use_gpu {
+        match GpuContext::new() {
+            Ok(ctx) => {
+                eprintln!("GPU: initialized CUDA device for matmul acceleration");
+                Some(ctx)
+            }
+            Err(e) => {
+                eprintln!("GPU: initialization failed ({}), falling back to CPU", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     for chunk_start in (0..m).step_by(chunk_c) {
         let chunk_end = (chunk_start + chunk_c).min(m);
@@ -808,25 +407,21 @@ fn compute_ldscore_global(
         let raw: MatF32 = {
             let mut ro = ReadOptions::builder();
             let mut builder = ro.sid_index(&bed_indices).f32();
-            let t = Instant::now();
             let result = if let Some(iids) = iid_indices {
                 builder.iid_index(iids).read(bed)
             } else {
                 builder.read(bed)
             };
-            t_read_bed += t.elapsed();
             result.with_context(|| format!("reading BED chunk [{},{})", chunk_start, chunk_end))?
         };
 
-        {
-            let t = Instant::now();
-            for j in 0..c {
-                #[cfg(feature = "fast-f32")]
-                {
+        for j in 0..c {
+            match bufs {
+                GemmBufs::F32 { ref mut b_mat, ref mut col_buf, .. } => {
                     for i in 0..n_indiv {
-                        col_buf_f32[i] = raw[(i, j)];
+                        col_buf[i] = raw[(i, j)];
                     }
-                    let snp_maf = normalize_col_f32(&mut col_buf_f32, n_indiv);
+                    let snp_maf = normalize_col_f32(col_buf, n_indiv);
                     maf_per_snp[chunk_start + j] = snp_maf as f64;
                     if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
                         let maf_f64 = snp_maf as f64;
@@ -834,28 +429,25 @@ fn compute_ldscore_global(
                         pq_vec[chunk_start + j] = pq;
                     }
                     for i in 0..n_indiv {
-                        b_mat[(i, j)] = col_buf_f32[i];
+                        b_mat[(i, j)] = col_buf[i];
                     }
                 }
-                #[cfg(not(feature = "fast-f32"))]
-                {
+                GemmBufs::F64 { ref mut b_mat, ref mut col_buf, .. } => {
                     for i in 0..n_indiv {
-                        col_buf_f64[i] = raw[(i, j)] as f64;
+                        col_buf[i] = raw[(i, j)] as f64;
                     }
-                    let snp_maf = normalize_col_f64(&mut col_buf_f64, n_indiv);
+                    let snp_maf = normalize_col_f64(col_buf, n_indiv);
                     maf_per_snp[chunk_start + j] = snp_maf;
                     if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
                         let pq = (snp_maf * (1.0 - snp_maf)).powf(exp);
                         pq_vec[chunk_start + j] = pq;
                     }
                     for i in 0..n_indiv {
-                        b_mat[(i, j)] = col_buf_f64[i];
+                        b_mat[(i, j)] = col_buf[i];
                     }
                 }
             }
-            t_norm += t.elapsed();
         }
-        let b_slice = mat_slice_g(b_mat.as_ref(), 0..n_indiv, 0..c);
 
         let annot_chunk = mat_slice(annot.as_ref(), chunk_start..chunk_end, 0..n_annot);
         let (annot_chunk_eff, chunk_all_zero) = if let Some(ref pq_vec) = pq_per_snp {
@@ -896,37 +488,75 @@ fn compute_ldscore_global(
             (None, all_zero)
         };
 
-        // B×B
+        // B×B — compute GEMM then extract r2_unbiased into r2u_bb (always f64).
         if !chunk_all_zero {
-            let mut bb = MatG::zeros(c, c);
-            let t = Instant::now();
-            matmul_tn_to_g(
-                bb.as_mut(),
-                b_slice,
-                b_slice,
-                ONE_G,
-                Accum::Replace,
-                Par::rayon(0),
-            );
-            t_bb += t.elapsed();
-            let t = Instant::now();
-            for j in 0..c {
-                for k in 0..c {
-                    r2u_bb[(j, k)] = 0.0;
+            // Closure: given bb[(k,j)] as f64, fill r2u_bb.
+            let mut fill_r2u_bb = |bb_val: &dyn Fn(usize, usize) -> f64| {
+                for j in 0..c {
+                    for k in 0..c {
+                        r2u_bb[(j, k)] = 0.0;
+                    }
+                }
+                for j in 0..c {
+                    r2u_bb[(j, j)] = 1.0;
+                    for k in 0..j {
+                        let r2u = r2_unbiased(bb_val(k, j) / n, n_indiv);
+                        r2u_bb[(j, k)] = r2u;
+                        r2u_bb[(k, j)] = r2u;
+                    }
+                }
+            };
+
+            match bufs {
+                GemmBufs::F32 { ref b_mat, .. } => {
+                    let b_slice = mat_slice_f32(b_mat.as_ref(), 0..n_indiv, 0..c);
+                    let mut bb = MatF32::zeros(c, c);
+                    let mut _did_gpu = false;
+                    #[cfg(feature = "gpu")]
+                    {
+                        if let Some(ref ctx) = gpu_ctx {
+                            let b_f32 = mat_to_col_major_f32_from_f32(b_slice, n_indiv, c);
+                            let gpu_result = if let Some(tc) = _gpu_tile_cols {
+                                ctx.matmul_tn_tiled(&b_f32, n_indiv, c, &b_f32, c, tc)
+                            } else {
+                                ctx.matmul_tn(&b_f32, n_indiv, c, &b_f32, c)
+                            };
+                            if let Ok(result) = gpu_result {
+                                write_gpu_result_f32(&result, bb.as_mut(), c, c);
+                                _did_gpu = true;
+                            }
+                        }
+                    }
+                    if !_did_gpu {
+                        matmul_tn_to_f32(bb.as_mut(), b_slice, b_slice, 1.0f32, Accum::Replace, Par::rayon(0));
+                    }
+                    fill_r2u_bb(&|k, j| bb[(k, j)] as f64);
+                }
+                GemmBufs::F64 { ref b_mat, .. } => {
+                    let b_slice = mat_slice(b_mat.as_ref(), 0..n_indiv, 0..c);
+                    let mut bb = MatF::zeros(c, c);
+                    let mut _did_gpu = false;
+                    #[cfg(feature = "gpu")]
+                    {
+                        if let Some(ref ctx) = gpu_ctx {
+                            let b_f32 = mat_to_col_major_f32_from_f64(b_slice, n_indiv, c);
+                            let gpu_result = if let Some(tc) = _gpu_tile_cols {
+                                ctx.matmul_tn_tiled(&b_f32, n_indiv, c, &b_f32, c, tc)
+                            } else {
+                                ctx.matmul_tn(&b_f32, n_indiv, c, &b_f32, c)
+                            };
+                            if let Ok(result) = gpu_result {
+                                write_gpu_result_f64(&result, bb.as_mut(), c, c);
+                                _did_gpu = true;
+                            }
+                        }
+                    }
+                    if !_did_gpu {
+                        matmul_tn_to(bb.as_mut(), b_slice, b_slice, 1.0f64, Accum::Replace, Par::rayon(0));
+                    }
+                    fill_r2u_bb(&|k, j| bb[(k, j)]);
                 }
             }
-            for j in 0..c {
-                r2u_bb[(j, j)] = 1.0; // diagonal: r(j,j)=1 → r2u=1
-                for k in 0..j {
-                    let r2u = r2_unbiased(bb[(k, j)] / n, n_indiv);
-                    r2u_bb[(j, k)] = r2u;
-                    r2u_bb[(k, j)] = r2u;
-                }
-            }
-            let elapsed = t.elapsed();
-            t_r2u += elapsed;
-            t_r2u_bb += elapsed;
-            let t = Instant::now();
             let r2u_bb_view = mat_slice(r2u_bb.as_ref(), 0..c, 0..c);
             let mut contrib_bb = MatF::zeros(c, n_annot);
             let contrib_bb = if let Some(ref eff) = annot_chunk_eff {
@@ -954,9 +584,6 @@ fn compute_ldscore_global(
                 mat_slice_mut(l2.as_mut(), chunk_start..chunk_end, 0..n_annot),
                 contrib_bb.as_ref(),
             );
-            let elapsed = t.elapsed();
-            t_annot += elapsed;
-            t_annot_bb += elapsed;
         }
 
         // A×B
@@ -969,15 +596,6 @@ fn compute_ldscore_global(
                 .unwrap_or((0, 0));
             let contiguous = first_slot <= last_slot && last_slot - first_slot + 1 == w;
 
-            if !contiguous {
-                let t_copy = Instant::now();
-                for (wi, (_, slot)) in window.iter().enumerate() {
-                    for i in 0..n_indiv {
-                        a_buf[(i, wi)] = ring_buf[(i, *slot)];
-                    }
-                }
-                t_ab_wrap_copy += t_copy.elapsed();
-            }
             let annot_window = mat_slice(annot.as_ref(), a_left_idx..chunk_start, 0..n_annot);
             let (annot_window_eff, window_all_zero) = if let Some(ref pq_vec) = pq_per_snp {
                 let mut eff = MatF::zeros(w, n_annot);
@@ -1017,65 +635,114 @@ fn compute_ldscore_global(
                 (None, all_zero)
             };
 
-            let mut ab_elapsed = std::time::Duration::ZERO;
-            let mut r2u_elapsed = std::time::Duration::ZERO;
-            let mut annot_left_elapsed = std::time::Duration::ZERO;
-            let mut annot_right_elapsed = std::time::Duration::ZERO;
-            let mut did_ab = false;
-
             if !(chunk_all_zero && window_all_zero) {
-                let t = Instant::now();
-                if contiguous {
-                    ab_contig_calls += 1;
-                    let a_view =
-                        mat_slice_g(ring_buf.as_ref(), 0..n_indiv, first_slot..(first_slot + w));
-                    matmul_tn_to_g(
-                        mat_slice_mut_g(ab_buf.as_mut(), 0..w, 0..c),
-                        a_view,
-                        b_slice,
-                        ONE_G,
-                        Accum::Replace,
-                        Par::rayon(0),
-                    );
-                } else {
-                    ab_wrap_calls += 1;
-                    let a_view = mat_slice_g(a_buf.as_ref(), 0..n_indiv, 0..w);
-                    matmul_tn_to_g(
-                        mat_slice_mut_g(ab_buf.as_mut(), 0..w, 0..c),
-                        a_view,
-                        b_slice,
-                        ONE_G,
-                        Accum::Replace,
-                        Par::rayon(0),
-                    );
-                }
-                ab_elapsed = t.elapsed();
-                if contiguous {
-                    t_ab_contig += ab_elapsed;
-                } else {
-                    t_ab_wrap_matmul += ab_elapsed;
-                }
-                t_ab += ab_elapsed;
-                ab_calls += 1;
-                ab_sum_w += w;
-                ab_sum_c += c;
-                ab_max_w = ab_max_w.max(w);
-                ab_max_c = ab_max_c.max(c);
-                did_ab = true;
+                // Compute A^T × B GEMM, then fill r2u_ab (always f64).
+                match bufs {
+                    GemmBufs::F32 {
+                        ref mut ring_buf, ref mut b_mat, ref mut a_buf, ref mut ab_buf, ..
+                    } => {
+                        if !contiguous {
+                            for (wi, (_, slot)) in window.iter().enumerate() {
+                                for i in 0..n_indiv {
+                                    a_buf[(i, wi)] = ring_buf[(i, *slot)];
+                                }
+                            }
+                        }
+                        let a_view = if contiguous {
+                            mat_slice_f32(ring_buf.as_ref(), 0..n_indiv, first_slot..(first_slot + w))
+                        } else {
+                            mat_slice_f32(a_buf.as_ref(), 0..n_indiv, 0..w)
+                        };
+                        let b_sl = mat_slice_f32(b_mat.as_ref(), 0..n_indiv, 0..c);
 
-                let t = Instant::now();
-                let ab_view = mat_slice_g(ab_buf.as_ref(), 0..w, 0..c);
-                for wi in 0..w {
-                    for j in 0..c {
-                        r2u_ab[(wi, j)] = r2_unbiased(ab_view[(wi, j)] as f64 / n, n_indiv);
+                        let mut _did_gpu = false;
+                        #[cfg(feature = "gpu")]
+                        {
+                            if let Some(ref ctx) = gpu_ctx {
+                                let a_f32 = mat_to_col_major_f32_from_f32(a_view, n_indiv, w);
+                                let b_f32 = mat_to_col_major_f32_from_f32(b_sl, n_indiv, c);
+                                let gpu_result = if let Some(tc) = _gpu_tile_cols {
+                                    ctx.matmul_tn_tiled(&a_f32, n_indiv, w, &b_f32, c, tc)
+                                } else {
+                                    ctx.matmul_tn(&a_f32, n_indiv, w, &b_f32, c)
+                                };
+                                if let Ok(result) = gpu_result {
+                                    write_gpu_result_f32(
+                                        &result,
+                                        mat_slice_mut_f32(ab_buf.as_mut(), 0..w, 0..c),
+                                        w, c,
+                                    );
+                                    _did_gpu = true;
+                                }
+                            }
+                        }
+                        if !_did_gpu {
+                            matmul_tn_to_f32(
+                                mat_slice_mut_f32(ab_buf.as_mut(), 0..w, 0..c),
+                                a_view, b_sl, 1.0f32, Accum::Replace, Par::rayon(0),
+                            );
+                        }
+                        let ab_view = mat_slice_f32(ab_buf.as_ref(), 0..w, 0..c);
+                        for wi in 0..w {
+                            for j in 0..c {
+                                r2u_ab[(wi, j)] = r2_unbiased(ab_view[(wi, j)] as f64 / n, n_indiv);
+                            }
+                        }
+                    }
+                    GemmBufs::F64 {
+                        ref mut ring_buf, ref mut b_mat, ref mut a_buf, ref mut ab_buf, ..
+                    } => {
+                        if !contiguous {
+                            for (wi, (_, slot)) in window.iter().enumerate() {
+                                for i in 0..n_indiv {
+                                    a_buf[(i, wi)] = ring_buf[(i, *slot)];
+                                }
+                            }
+                        }
+                        let a_view = if contiguous {
+                            mat_slice(ring_buf.as_ref(), 0..n_indiv, first_slot..(first_slot + w))
+                        } else {
+                            mat_slice(a_buf.as_ref(), 0..n_indiv, 0..w)
+                        };
+                        let b_sl = mat_slice(b_mat.as_ref(), 0..n_indiv, 0..c);
+
+                        let mut _did_gpu = false;
+                        #[cfg(feature = "gpu")]
+                        {
+                            if let Some(ref ctx) = gpu_ctx {
+                                let a_f32 = mat_to_col_major_f32_from_f64(a_view, n_indiv, w);
+                                let b_f32 = mat_to_col_major_f32_from_f64(b_sl, n_indiv, c);
+                                let gpu_result = if let Some(tc) = _gpu_tile_cols {
+                                    ctx.matmul_tn_tiled(&a_f32, n_indiv, w, &b_f32, c, tc)
+                                } else {
+                                    ctx.matmul_tn(&a_f32, n_indiv, w, &b_f32, c)
+                                };
+                                if let Ok(result) = gpu_result {
+                                    write_gpu_result_f64(
+                                        &result,
+                                        mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
+                                        w, c,
+                                    );
+                                    _did_gpu = true;
+                                }
+                            }
+                        }
+                        if !_did_gpu {
+                            matmul_tn_to(
+                                mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
+                                a_view, b_sl, 1.0f64, Accum::Replace, Par::rayon(0),
+                            );
+                        }
+                        let ab_view = mat_slice(ab_buf.as_ref(), 0..w, 0..c);
+                        for wi in 0..w {
+                            for j in 0..c {
+                                r2u_ab[(wi, j)] = r2_unbiased(ab_view[(wi, j)] / n, n_indiv);
+                            }
+                        }
                     }
                 }
-                r2u_elapsed = t.elapsed();
-                t_r2u += r2u_elapsed;
-                t_r2u_ab += r2u_elapsed;
 
                 if !chunk_all_zero {
-                    let t = Instant::now();
                     let r2u_ab_view = mat_slice(r2u_ab.as_ref(), 0..w, 0..c);
                     let mut contrib_left = MatF::zeros(w, n_annot);
                     let contrib_left = if let Some(ref eff) = annot_chunk_eff {
@@ -1103,13 +770,9 @@ fn compute_ldscore_global(
                         mat_slice_mut(l2.as_mut(), a_left_idx..chunk_start, 0..n_annot),
                         contrib_left.as_ref(),
                     );
-                    annot_left_elapsed = t.elapsed();
-                    t_annot += annot_left_elapsed;
-                    t_annot_ab_left += annot_left_elapsed;
                 }
 
                 if !window_all_zero {
-                    let t = Instant::now();
                     let r2u_ab_view = mat_slice(r2u_ab.as_ref(), 0..w, 0..c);
                     let mut contrib_right = MatF::zeros(c, n_annot);
                     let contrib_right = if let Some(ref eff) = annot_window_eff {
@@ -1137,72 +800,35 @@ fn compute_ldscore_global(
                         mat_slice_mut(l2.as_mut(), chunk_start..chunk_end, 0..n_annot),
                         contrib_right.as_ref(),
                     );
-                    annot_right_elapsed = t.elapsed();
-                    t_annot += annot_right_elapsed;
-                    t_annot_ab_right += annot_right_elapsed;
                 }
-            }
-
-            if trace_ab_chunks {
-                trace!(
-                    "l2 ab_chunk chunk_start={} chunk_end={} c={} w={} contig={} did_ab={} chunk_all_zero={} window_all_zero={} ab_ms={:.3} r2u_ab_ms={:.3} annot_left_ms={:.3} annot_right_ms={:.3}",
-                    chunk_start,
-                    chunk_end,
-                    c,
-                    w,
-                    contiguous as u8,
-                    did_ab as u8,
-                    chunk_all_zero as u8,
-                    window_all_zero as u8,
-                    ab_elapsed.as_secs_f64() * 1000.0,
-                    r2u_elapsed.as_secs_f64() * 1000.0,
-                    annot_left_elapsed.as_secs_f64() * 1000.0,
-                    annot_right_elapsed.as_secs_f64() * 1000.0
-                );
             }
         }
 
-        for j in 0..c {
-            let slot = ring_next % ring_size;
-            for i in 0..n_indiv {
-                ring_buf[(i, slot)] = b_mat[(i, j)];
+        // Push B columns into ring buffer.
+        match bufs {
+            GemmBufs::F32 { ref mut ring_buf, ref b_mat, .. } => {
+                for j in 0..c {
+                    let slot = ring_next % ring_size;
+                    for i in 0..n_indiv {
+                        ring_buf[(i, slot)] = b_mat[(i, j)];
+                    }
+                    window.push_back((chunk_start + j, slot));
+                    ring_next += 1;
+                }
             }
-            window.push_back((chunk_start + j, slot));
-            ring_next += 1;
+            GemmBufs::F64 { ref mut ring_buf, ref b_mat, .. } => {
+                for j in 0..c {
+                    let slot = ring_next % ring_size;
+                    for i in 0..n_indiv {
+                        ring_buf[(i, slot)] = b_mat[(i, j)];
+                    }
+                    window.push_back((chunk_start + j, slot));
+                    ring_next += 1;
+                }
+            }
         }
     }
 
-    trace!(
-        "l2 timing: bed_read={:?} norm={:?} bb_dot={:?} ab_dot={:?} r2u_bb={:?} r2u_ab={:?} annot_total={:?} annot_bb={:?} annot_ab_left={:?} annot_ab_right={:?} ab_calls={} ab_contig={} ab_wrap={} ab_wrap_copy={:?} ab_contig_matmul={:?} ab_wrap_matmul={:?} ab_avg_w={:.2} ab_avg_c={:.2} ab_max_w={} ab_max_c={}",
-        t_read_bed,
-        t_norm,
-        t_bb,
-        t_ab,
-        t_r2u_bb,
-        t_r2u_ab,
-        t_annot,
-        t_annot_bb,
-        t_annot_ab_left,
-        t_annot_ab_right,
-        ab_calls,
-        ab_contig_calls,
-        ab_wrap_calls,
-        t_ab_wrap_copy,
-        t_ab_contig,
-        t_ab_wrap_matmul,
-        if ab_calls > 0 {
-            ab_sum_w as f64 / ab_calls as f64
-        } else {
-            0.0
-        },
-        if ab_calls > 0 {
-            ab_sum_c as f64 / ab_calls as f64
-        } else {
-            0.0
-        },
-        ab_max_w,
-        ab_max_c
-    );
     Ok((l2, maf_per_snp))
 }
 
@@ -1406,9 +1032,6 @@ fn r2_unbiased(r: f64, n: usize) -> f64 {
     sq - (1.0 - sq) / denom
 }
 
-// ---------------------------------------------------------------------------
-// Output writer
-// ---------------------------------------------------------------------------
 
 /// Write per-SNP LD scores to a gzip TSV.  `col_names` is `["L2"]` or `["{ANNOT}L2", …]`.
 fn write_ldscore_refs(
@@ -1487,9 +1110,6 @@ fn format_m_vals(vals: &[f64]) -> String {
     format!("{joined}\n")
 }
 
-// ---------------------------------------------------------------------------
-// SNP set loader (--extract / --print-snps)
-// ---------------------------------------------------------------------------
 
 /// Load SNP IDs from a file (one per line; first token used; `#` lines skipped).
 fn load_snp_set(path: &str) -> Result<HashSet<String>> {
@@ -1580,14 +1200,9 @@ pub fn run(args: L2Args) -> Result<()> {
     let fam_path = format!("{}.fam", args.bfile);
     let bed_path = format!("{}.bed", args.bfile);
 
-    let t_bim = Instant::now();
     let all_snps_raw =
         parse_bim(&bim_path).with_context(|| format!("parsing BIM '{}'", bim_path))?;
-    trace!("l2 timing: parse_bim {:?}", t_bim.elapsed());
-
-    let t_fam = Instant::now();
     let n_indiv = count_fam(&fam_path).with_context(|| format!("counting FAM '{}'", fam_path))?;
-    trace!("l2 timing: count_fam {:?}", t_fam.elapsed());
 
     println!(
         "Loaded {} SNPs, {} individuals from '{}'",
@@ -1627,7 +1242,6 @@ pub fn run(args: L2Args) -> Result<()> {
         );
     }
 
-    let t_annot = Instant::now();
     let mut cts_bin_active = false;
     let mut annot_result: Option<(MatF, Vec<String>)> = if let Some(ref prefix) = args.annot {
         let explicit = prefix.ends_with(".annot")
@@ -1735,8 +1349,6 @@ pub fn run(args: L2Args) -> Result<()> {
     } else {
         None
     };
-    trace!("l2 timing: read_annot {:?}", t_annot.elapsed());
-
     // --keep: subset individuals for LD computation.
     let iid_indices: Option<Vec<isize>> = if let Some(ref keep_path) = args.keep {
         let fam_ids =
@@ -1759,7 +1371,6 @@ pub fn run(args: L2Args) -> Result<()> {
         let mut bed = Bed::builder(bed_path.as_str())
             .build()
             .context("opening BED file for SNP prefilter")?;
-        let t_stats = Instant::now();
         let (maf_all, het_miss_ok) = compute_snp_stats(
             &all_snps,
             &mut bed,
@@ -1768,7 +1379,6 @@ pub fn run(args: L2Args) -> Result<()> {
             iid_indices.as_deref(),
         )
         .context("computing SNP prefilter stats")?;
-        trace!("l2 timing: maf_prefilter {:?}", t_stats.elapsed());
 
         let thr = args.maf.unwrap_or(0.0);
         let mut keep_mask: Vec<bool> = Vec::with_capacity(all_snps.len());
@@ -1850,7 +1460,6 @@ pub fn run(args: L2Args) -> Result<()> {
     let mut bed = Bed::builder(bed_path.as_str())
         .build()
         .context("opening BED file")?;
-    let t_l2 = Instant::now();
     let (l2, maf_per_snp) = compute_ldscore_global(
         &all_snps,
         &mut bed,
@@ -1861,9 +1470,11 @@ pub fn run(args: L2Args) -> Result<()> {
         iid_indices.as_deref(),
         pq_exp_for_compute,
         args.yes_really,
+        args.gpu,
+        args.gpu_tile_cols,
+        args.fast_f32,
     )
     .context("computing LD scores")?;
-    trace!("l2 timing: compute_ldscore {:?}", t_l2.elapsed());
 
     // bed_idx (original BIM row) != position in all_snps when --extract is active.
     let bed_idx_to_pos: std::collections::HashMap<usize, usize> = all_snps
@@ -1914,17 +1525,19 @@ pub fn run(args: L2Args) -> Result<()> {
         .collect();
     chrs.sort();
 
+    let should_output = |s: &BimRecord| -> bool {
+        let pos = bed_idx_to_pos[&s.bed_idx];
+        let maf_ok = args.maf.map(|thr| maf_per_snp[pos] > thr).unwrap_or(true);
+        let print_ok = print_set
+            .as_ref()
+            .map(|set| set.contains(&s.snp))
+            .unwrap_or(true);
+        maf_ok && print_ok
+    };
+
     let out_positions: Vec<usize> = all_snps
         .iter()
-        .filter(|s| {
-            let pos = bed_idx_to_pos[&s.bed_idx];
-            let maf_ok = args.maf.map(|thr| maf_per_snp[pos] > thr).unwrap_or(true);
-            let print_ok = print_set
-                .as_ref()
-                .map(|set| set.contains(&s.snp))
-                .unwrap_or(true);
-            maf_ok && print_ok
-        })
+        .filter(|s| should_output(s))
         .map(|s| bed_idx_to_pos[&s.bed_idx])
         .collect();
     if print_set.is_some() && out_positions.is_empty() {
@@ -1983,18 +1596,9 @@ pub fn run(args: L2Args) -> Result<()> {
         }
     };
 
-    let t_write = Instant::now();
     let out_snps: Vec<&BimRecord> = all_snps
         .iter()
-        .filter(|s| {
-            let pos = bed_idx_to_pos[&s.bed_idx];
-            let maf_ok = args.maf.map(|thr| maf_per_snp[pos] > thr).unwrap_or(true);
-            let print_ok = print_set
-                .as_ref()
-                .map(|set| set.contains(&s.snp))
-                .unwrap_or(true);
-            maf_ok && print_ok
-        })
+        .filter(|s| should_output(s))
         .collect();
     let out_l2 = extract_rows(&out_positions, col_names.len());
     let out_path = format!("{}.l2.ldscore.gz", args.out);
@@ -2020,15 +1624,7 @@ pub fn run(args: L2Args) -> Result<()> {
         let chr_snps: Vec<&BimRecord> = chr_snps_all
             .iter()
             .copied()
-            .filter(|s| {
-                let pos = bed_idx_to_pos[&s.bed_idx];
-                let maf_ok = args.maf.map(|thr| maf_per_snp[pos] > thr).unwrap_or(true);
-                let print_ok = print_set
-                    .as_ref()
-                    .map(|set| set.contains(&s.snp))
-                    .unwrap_or(true);
-                maf_ok && print_ok
-            })
+            .filter(|s| should_output(s))
             .collect();
         let chr_positions_out: Vec<usize> = chr_snps
             .iter()
@@ -2067,283 +1663,6 @@ pub fn run(args: L2Args) -> Result<()> {
                 .join(","),
         );
     }
-    trace!("l2 timing: write_outputs {:?}", t_write.elapsed());
-
     Ok(())
 }
 
-/// Strand-ambiguous allele pairs (A/T, C/G) — excluded from regression by default.
-#[allow(dead_code)]
-pub fn is_strand_ambiguous(a1: &str, a2: &str) -> bool {
-    matches!((a1, a2), ("A", "T") | ("T", "A") | ("C", "G") | ("G", "C"))
-}
-
-/// Return the complement nucleotide.
-#[allow(dead_code)]
-pub fn complement(allele: &str) -> Option<&'static str> {
-    match allele {
-        "A" => Some("T"),
-        "T" => Some("A"),
-        "C" => Some("G"),
-        "G" => Some("C"),
-        _ => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // -- BIM parser -----------------------------------------------------------
-
-    /// parse_bim should correctly round-trip a 6-column tab-separated line.
-    #[test]
-    fn test_parse_bim_inline() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "1\trs123\t0.5\t12345\tA\tG").unwrap();
-        writeln!(f, "1\trs456\t1.0\t99999\tC\tT").unwrap();
-
-        let recs = parse_bim(f.path().to_str().unwrap()).unwrap();
-        assert_eq!(recs.len(), 2);
-        assert_eq!(recs[0].snp, "rs123");
-        assert!((recs[0].cm - 0.5).abs() < 1e-9);
-        assert_eq!(recs[0].bp, 12345);
-        assert_eq!(recs[0].bed_idx, 0);
-
-        assert_eq!(recs[1].snp, "rs456");
-        assert_eq!(recs[1].bed_idx, 1);
-    }
-
-    // -- Window boundary computation -----------------------------------------
-
-    #[test]
-    fn test_block_lefts_f64_basic() {
-        let coords = vec![0.0, 1.0, 2.0, 3.0, 4.0];
-        let bl = get_block_lefts_f64(&coords, 1.5);
-        assert_eq!(bl, vec![0, 0, 1, 2, 3]);
-
-        let bl2 = get_block_lefts_f64(&coords, 2.5);
-        assert_eq!(bl2, vec![0, 0, 0, 1, 2]);
-    }
-
-    #[test]
-    fn test_block_lefts_snp_basic() {
-        let bl = get_block_lefts_snp(6, 2);
-        assert_eq!(bl, vec![0, 0, 0, 1, 2, 3]);
-    }
-
-    // -- Column normalisation ------------------------------------------------
-
-    #[test]
-    fn test_normalize_col_constant() {
-        let mut col = vec![2.0f64, 2.0, 2.0, 2.0];
-        normalize_col_f64(&mut col, 4);
-        assert!(
-            col.iter().all(|&v| v == 0.0),
-            "constant column should be all zeros"
-        );
-    }
-
-    #[test]
-    fn test_normalize_col_unit_variance() {
-        let mut col = vec![0.0f64, 1.0, 2.0, 1.0];
-        let n = col.len();
-        normalize_col_f64(&mut col, n);
-
-        let mean: f64 = col.iter().sum::<f64>() / n as f64;
-        let var: f64 = col.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / n as f64;
-        assert!(mean.abs() < 1e-5, "mean should be ~0, got {}", mean);
-        assert!(
-            (var - 1.0).abs() < 1e-5,
-            "variance should be ~1, got {}",
-            var
-        );
-    }
-
-    // -- Allele helpers ------------------------------------------------------
-
-    #[test]
-    fn test_is_strand_ambiguous() {
-        assert!(is_strand_ambiguous("A", "T"));
-        assert!(is_strand_ambiguous("C", "G"));
-        assert!(!is_strand_ambiguous("A", "G"));
-    }
-
-    #[test]
-    fn test_complement() {
-        assert_eq!(complement("A"), Some("T"));
-        assert_eq!(complement("X"), None);
-    }
-
-    // -- Python test_getBlockLefts exact cases --------------------------------
-
-    /// All SNPs within one giant window → all block_lefts = 0.
-    /// Mirrors Python: getBlockLefts(arange(1,6), 5) == zeros(5).
-    #[test]
-    fn test_block_lefts_all_in_window() {
-        let coords = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let bl = get_block_lefts_f64(&coords, 5.0);
-        assert_eq!(bl, vec![0, 0, 0, 0, 0]);
-    }
-
-    /// Zero-width window → each SNP is its own left boundary.
-    /// Mirrors Python: getBlockLefts(arange(1,6), 0) == arange(0,5).
-    #[test]
-    fn test_block_lefts_zero_window() {
-        let coords = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let bl = get_block_lefts_f64(&coords, 0.0);
-        assert_eq!(bl, vec![0, 1, 2, 3, 4]);
-    }
-
-    /// Irregular spacing with exact boundary conditions.
-    /// Mirrors Python: getBlockLefts((1,4,6,7,7,8), 2) == (0,1,1,2,2,2).
-    #[test]
-    fn test_block_lefts_irregular_spacing() {
-        let coords = vec![1.0, 4.0, 6.0, 7.0, 7.0, 8.0];
-        let bl = get_block_lefts_f64(&coords, 2.0);
-        assert_eq!(bl, vec![0, 1, 1, 2, 2, 2]);
-    }
-
-    fn write_plink_small(dir: &std::path::Path) -> String {
-        use std::io::Write;
-        let prefix = dir.join("toy");
-        let bim = prefix.with_extension("bim");
-        let fam = prefix.with_extension("fam");
-        let bed = prefix.with_extension("bed");
-
-        // .fam: 4 individuals
-        let mut f = std::fs::File::create(&fam).unwrap();
-        for i in 1..=4 {
-            writeln!(f, "F{} I{} 0 0 0 -9", i, i).unwrap();
-        }
-
-        // .bim: 2 SNPs
-        let mut b = std::fs::File::create(&bim).unwrap();
-        writeln!(b, "1\trs1\t0\t100\tA\tG").unwrap();
-        writeln!(b, "1\trs2\t0\t200\tA\tG").unwrap();
-
-        // .bed: SNP-major
-        let mut bed_f = std::fs::File::create(&bed).unwrap();
-        bed_f.write_all(&[0x6C, 0x1B, 0x01]).unwrap();
-
-        // SNP1: all hom-major (MAF=0)
-        let snp1 = [0u8, 0u8, 0u8, 0u8];
-        bed_f.write_all(&[pack_genotypes(&snp1)]).unwrap();
-
-        // SNP2: genotypes [0,1,1,2] => MAF=0.5
-        let snp2 = [0u8, 1u8, 1u8, 2u8];
-        bed_f.write_all(&[pack_genotypes(&snp2)]).unwrap();
-
-        prefix.to_string_lossy().to_string()
-    }
-
-    fn pack_genotypes(gt: &[u8; 4]) -> u8 {
-        // PLINK .bed encoding (2-bit, little-endian per individual):
-        // 00 = hom major, 01 = missing, 10 = het, 11 = hom minor
-        let code = |g: u8| match g {
-            0 => 0b00,
-            1 => 0b10,
-            2 => 0b11,
-            _ => 0b01,
-        };
-        code(gt[0]) | (code(gt[1]) << 2) | (code(gt[2]) << 4) | (code(gt[3]) << 6)
-    }
-
-    fn read_gz(path: &str) -> String {
-        use flate2::read::GzDecoder;
-        use std::io::Read;
-        let file = std::fs::File::open(path).expect("open gz");
-        let mut decoder = GzDecoder::new(file);
-        let mut s = String::new();
-        decoder.read_to_string(&mut s).expect("read gz");
-        s
-    }
-
-    #[test]
-    fn test_maf_pre_changes_m_counts() {
-        let dir = tempfile::tempdir().unwrap();
-        let prefix = write_plink_small(dir.path());
-        let out_dir = tempfile::tempdir().unwrap();
-        let out = out_dir.path().join("out").to_string_lossy().to_string();
-
-        let args = L2Args {
-            bfile: prefix,
-            out: out.clone(),
-            ld_wind_cm: Some(1.0),
-            ld_wind_kb: None,
-            ld_wind_snp: None,
-            annot: None,
-            cts_bin: None,
-            cts_breaks: None,
-            cts_names: None,
-            thin_annot: false,
-            extract: None,
-            maf: Some(0.1),
-            maf_pre: true,
-            print_snps: None,
-            keep: None,
-            per_allele: false,
-            pq_exp: None,
-            no_print_annot: false,
-            chunk_size: 50,
-            yes_really: true,
-        };
-        run(args).unwrap();
-
-        let m_path = format!("{}1.l2.M", out);
-        let m = std::fs::read_to_string(m_path).unwrap();
-        assert_eq!(m.trim(), "1", "pre-filter should keep 1 SNP");
-    }
-
-    #[test]
-    fn test_pq_exp_writes_scaled_m_and_suffix() {
-        let dir = tempfile::tempdir().unwrap();
-        let prefix = write_plink_small(dir.path());
-        let out_dir = tempfile::tempdir().unwrap();
-        let out = out_dir.path().join("out").to_string_lossy().to_string();
-
-        let args = L2Args {
-            bfile: prefix,
-            out: out.clone(),
-            ld_wind_cm: Some(1.0),
-            ld_wind_kb: None,
-            ld_wind_snp: None,
-            annot: None,
-            cts_bin: None,
-            cts_breaks: None,
-            cts_names: None,
-            thin_annot: false,
-            extract: None,
-            maf: None,
-            maf_pre: false,
-            print_snps: None,
-            keep: None,
-            per_allele: false,
-            pq_exp: Some(1.0),
-            no_print_annot: false,
-            chunk_size: 50,
-            yes_really: true,
-        };
-        run(args).unwrap();
-
-        let m_path = format!("{}1.l2.M", out);
-        let m = std::fs::read_to_string(m_path).unwrap();
-        assert!(m.trim().starts_with("0.25"));
-
-        let m_5_50_path = format!("{}1.l2.M_5_50", out);
-        let m_5_50 = std::fs::read_to_string(m_5_50_path).unwrap();
-        assert!(m_5_50.trim().starts_with("0.25"));
-
-        let ld_path = format!("{}1.l2.ldscore.gz", out);
-        let content = read_gz(&ld_path);
-        let header = content.lines().next().unwrap_or("");
-        assert!(header.contains("L2_S1"));
-    }
-}

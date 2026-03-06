@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use faer::{Accum, Par};
 use polars::prelude::*;
 use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -118,39 +119,40 @@ pub(crate) fn resolve_text_path(path: &str) -> Result<PathBuf> {
     normalize_whitespace_to_tsv(path, false)
 }
 
-// ---------------------------------------------------------------------------
-// Readers
-// ---------------------------------------------------------------------------
 
-/// Scan a `.sumstats[.gz|.bz2]` file as a Polars LazyFrame.
+/// Scan a TSV text file (`.sumstats`, `.ldscore`, etc.) as a Polars LazyFrame.
+/// Handles `.gz` and `.bz2` decompression transparently.
+pub fn scan_tsv(path: &str) -> Result<LazyFrame> {
+    let resolved = resolve_text_path(path)?;
+    let resolved_str = resolved.to_string_lossy();
+    let lf = LazyCsvReader::new(resolved_str.as_ref().into())
+        .with_separator(b'\t')
+        .with_has_header(true)
+        .with_null_values(Some(NullValues::AllColumns(vec!["NA".into(), ".".into()])))
+        .finish()?;
+    Ok(lf)
+}
+
+/// Alias for backward compatibility.
 pub fn scan_sumstats(path: &str) -> Result<LazyFrame> {
-    let resolved = resolve_text_path(path)?;
-    let resolved_str = resolved.to_string_lossy();
-    let lf = LazyCsvReader::new(resolved_str.as_ref().into())
-        .with_separator(b'\t')
-        .with_has_header(true)
-        .with_null_values(Some(NullValues::AllColumns(vec!["NA".into(), ".".into()])))
-        .finish()?;
-    Ok(lf)
+    scan_tsv(path)
 }
 
-/// Scan a `.ldscore[.gz|.bz2]` file as a Polars LazyFrame.
+/// Alias for backward compatibility.
 pub fn scan_ldscore(path: &str) -> Result<LazyFrame> {
-    let resolved = resolve_text_path(path)?;
-    let resolved_str = resolved.to_string_lossy();
-    let lf = LazyCsvReader::new(resolved_str.as_ref().into())
-        .with_separator(b'\t')
-        .with_has_header(true)
-        .with_null_values(Some(NullValues::AllColumns(vec!["NA".into(), ".".into()])))
-        .finish()?;
-    Ok(lf)
+    scan_tsv(path)
 }
 
-/// Build a per-chromosome path from `prefix`, `chr`, and `suffix`.
-///
-/// If `prefix` contains `@`, it is used as a placeholder for the chromosome number
-/// (matching Python LDSC behaviour: `ld/chr@_scores` → `ld/chr22_scores.l2.ldscore.gz`).
-/// Otherwise the chromosome number is appended after the prefix.
+/// Comma-separated path list → Vec of trimmed, non-empty strings.
+pub fn split_paths(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Build a per-chromosome path; `@` in prefix is replaced with chr number.
 fn make_chr_path(prefix: &str, chr: u8, suffix: &str) -> String {
     if prefix.contains('@') {
         format!("{}{}", prefix.replace('@', &chr.to_string()), suffix)
@@ -192,10 +194,7 @@ pub fn read_m_total(prefix: &str, suffix: &str) -> Result<f64> {
     Ok(total)
 }
 
-/// Read per-annotation M values from per-chromosome `.M[_5_50]` files.
-///
-/// Each file contains K tab-separated values (K=1 for scalar LD scores).
-/// Returns a `Vec<f64>` of length K, summed across chromosomes.
+/// Read per-annotation M values from per-chromosome `.M[_5_50]` files, summed.
 pub fn read_m_vec(prefix: &str, suffix: &str) -> Result<Vec<f64>> {
     let chrs = get_present_chrs(prefix, suffix);
     anyhow::ensure!(
@@ -259,14 +258,7 @@ pub fn concat_chrs_any(prefix: &str, suffixes: &[&str]) -> Result<LazyFrame> {
             .iter()
             .map(|chr| {
                 let path = make_chr_path(prefix, *chr, suffix);
-                let resolved = resolve_text_path(&path)?;
-                let resolved_str = resolved.to_string_lossy();
-                LazyCsvReader::new(resolved_str.as_ref().into())
-                    .with_separator(b'\t')
-                    .with_has_header(true)
-                    .with_null_values(Some(NullValues::AllColumns(vec!["NA".into(), ".".into()])))
-                    .finish()
-                    .map_err(anyhow::Error::from)
+                scan_tsv(&path)
             })
             .collect::<Result<_>>()?;
 
@@ -280,15 +272,8 @@ pub fn concat_chrs_any(prefix: &str, suffixes: &[&str]) -> Result<LazyFrame> {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Annotation file reader
-// ---------------------------------------------------------------------------
 
-/// Read a partitioned LD score annotation file into a dense `Mat<f64>`.
-///
-/// Full format (`thin=false`): `CHR SNP BP CM ANNOT1 …` — skips first 4 columns.
-/// Thin format (`thin=true`): all columns are annotations.
-/// Tries `{prefix}.annot.gz`, `{prefix}.annot.bz2`, then `{prefix}.annot`.
+/// Read annotation file into dense `Mat<f64>`. Skips first 4 cols unless `thin`.
 pub fn read_annot(prefix: &str, thin: bool) -> Result<(MatF, Vec<String>)> {
     let path = resolve_annot_path(prefix)?;
     read_annot_path(&path, thin)
@@ -322,13 +307,7 @@ pub fn resolve_annot_path(prefix: &str) -> Result<String> {
 /// Read a partitioned LD score annotation file into a dense `Mat<f64>`.
 /// `path` must include the extension (e.g., `.annot.gz`).
 pub fn read_annot_path(path: &str, thin: bool) -> Result<(MatF, Vec<String>)> {
-    let resolved = resolve_text_path(path)?;
-    let resolved_str = resolved.to_string_lossy();
-    let df = LazyCsvReader::new(resolved_str.as_ref().into())
-        .with_separator(b'\t')
-        .with_has_header(true)
-        .with_null_values(Some(NullValues::AllColumns(vec!["NA".into(), ".".into()])))
-        .finish()
+    let df = scan_tsv(path)
         .with_context(|| format!("scanning annot file '{}'", path))?
         .collect()
         .with_context(|| format!("reading annot file '{}'", path))?;
@@ -372,9 +351,6 @@ pub fn read_annot_path(path: &str, thin: bool) -> Result<(MatF, Vec<String>)> {
     Ok((matrix, col_names))
 }
 
-// ---------------------------------------------------------------------------
-// Overlap-annot helpers
-// ---------------------------------------------------------------------------
 
 fn get_present_chrs_any(prefix: &str, suffixes: &[&str]) -> Vec<u8> {
     use std::collections::BTreeSet;
@@ -405,13 +381,7 @@ fn resolve_frq_path(prefix: &str, chr: Option<u8>) -> Result<String> {
 /// Read a .frq file and return a MAF filter mask: keep 0.05 < FRQ < 0.95.
 /// Accepts either FRQ or MAF column names (MAF is renamed to FRQ in Python).
 pub fn read_frq_mask(path: &str) -> Result<Vec<bool>> {
-    let resolved = resolve_text_path(path)?;
-    let resolved_str = resolved.to_string_lossy();
-    let df = LazyCsvReader::new(resolved_str.as_ref().into())
-        .with_separator(b'\t')
-        .with_has_header(true)
-        .with_null_values(Some(NullValues::AllColumns(vec!["NA".into(), ".".into()])))
-        .finish()
+    let df = scan_tsv(path)
         .with_context(|| format!("scanning frq file '{}'", path))?
         .collect()
         .with_context(|| format!("reading frq file '{}'", path))?;
@@ -440,12 +410,6 @@ pub fn read_frq_mask(path: &str) -> Result<Vec<bool>> {
 }
 
 /// Compute annotation overlap matrix XᵀX and total SNP count (M_tot).
-///
-/// When `chr_split` is true, reads per-chromosome `{prefix}{chr}.annot[.gz|.bz2]`.
-/// When false, reads single `{prefix}.annot[.gz|.bz2]`.
-///
-/// `frqfile` / `frqfile_chr` apply the Python MAF filter (0.05 < FRQ < 0.95)
-/// before computing XᵀX.
 pub fn read_overlap_matrix(
     prefixes: &[String],
     frqfile: Option<&str>,
@@ -659,199 +623,45 @@ pub fn read_overlap_matrix(
     Ok((overlap, m_tot, col_names))
 }
 
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[allow(unused_imports)]
-    use std::io::Write;
-
-    /// read_m_total should sum values across two single-value chromosome M files.
-    /// Mirrors Python Test_M::test_M_loop (sums per-chr M values).
-    #[test]
-    fn test_read_m_total_two_chrs() {
-        let dir = tempfile::tempdir().unwrap();
-        let prefix = format!("{}/test", dir.path().to_str().unwrap());
-
-        std::fs::write(format!("{}1.l2.M", prefix), "1000\n").unwrap();
-        std::fs::write(format!("{}2.l2.M", prefix), "2000\n").unwrap();
-
-        let total = read_m_total(&prefix, ".l2.M").unwrap();
-        assert!((total - 3000.0).abs() < 0.01, "total={}", total);
-    }
-
-    /// read_m_total should error when no chromosome M files exist.
-    /// Mirrors Python Test_M::test_bad_M.
-    #[test]
-    fn test_read_m_total_missing_files_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let prefix = format!("{}/nofiles", dir.path().to_str().unwrap());
-        assert!(read_m_total(&prefix, ".l2.M").is_err());
-    }
-
-    /// read_m_vec on single-column M files returns Vec of length 1.
-    #[test]
-    fn test_read_m_vec_single_col() {
-        let dir = tempfile::tempdir().unwrap();
-        let prefix = format!("{}/test", dir.path().to_str().unwrap());
-
-        std::fs::write(format!("{}1.l2.M", prefix), "1000\n").unwrap();
-        std::fs::write(format!("{}2.l2.M", prefix), "2000\n").unwrap();
-
-        let v = read_m_vec(&prefix, ".l2.M").unwrap();
-        assert_eq!(v.len(), 1);
-        assert!((v[0] - 3000.0).abs() < 0.01, "v[0]={}", v[0]);
-    }
-
-    #[test]
-    fn test_overlap_matrix_no_frq() {
-        let dir = tempfile::tempdir().unwrap();
-        let prefix = dir.path().join("test");
-        let annot_path = format!("{}.annot", prefix.to_string_lossy());
-        std::fs::write(
-            &annot_path,
-            "CHR\tBP\tSNP\tCM\tC1\tC2\tC3\n\
-1\t1\trs_0\t0\t1\t0\t0\n\
-1\t2\trs_1\t0\t0\t1\t1\n\
-1\t3\trs_2\t0\t0\t1\t1\n",
-        )
-        .unwrap();
-
-        let (overlap, m_tot, names) =
-            read_overlap_matrix(&[prefix.to_string_lossy().to_string()], None, None, false)
-                .unwrap();
-
-        assert_eq!(m_tot, 3);
-        assert_eq!(
-            names,
-            vec!["C1".to_string(), "C2".to_string(), "C3".to_string()]
-        );
-        assert!((overlap[(0, 0)] - 1.0).abs() < 1e-6);
-        assert!((overlap[(1, 1)] - 2.0).abs() < 1e-6);
-        assert!((overlap[(2, 2)] - 2.0).abs() < 1e-6);
-        assert!((overlap[(1, 2)] - 2.0).abs() < 1e-6);
-        assert!((overlap[(2, 1)] - 2.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_overlap_matrix_with_frq() {
-        let dir = tempfile::tempdir().unwrap();
-        let prefix = dir.path().join("test");
-        let annot_path = format!("{}.annot", prefix.to_string_lossy());
-        let frq_path = format!("{}.frq", prefix.to_string_lossy());
-
-        std::fs::write(
-            &annot_path,
-            "CHR\tBP\tSNP\tCM\tC1\tC2\tC3\n\
-1\t1\trs_0\t0\t1\t0\t0\n\
-1\t2\trs_1\t0\t0\t1\t1\n\
-1\t3\trs_2\t0\t0\t1\t1\n",
-        )
-        .unwrap();
-        std::fs::write(
-            &frq_path,
-            "CHR\tSNP\tCM\tBP\tA1\tFRQ\n\
-1\trs_0\t0\t1\tA\t0.7\n\
-1\trs_1\t0\t2\tA\t0.1\n\
-1\trs_2\t0\t3\tA\t0.01\n",
-        )
-        .unwrap();
-
-        let (overlap, m_tot, _) = read_overlap_matrix(
-            &[prefix.to_string_lossy().to_string()],
-            Some(prefix.to_string_lossy().as_ref()),
-            None,
-            false,
-        )
-        .unwrap();
-
-        assert_eq!(m_tot, 2);
-        assert!((overlap[(0, 0)] - 1.0).abs() < 1e-6);
-        assert!((overlap[(1, 1)] - 1.0).abs() < 1e-6);
-        assert!((overlap[(2, 2)] - 1.0).abs() < 1e-6);
-        assert!((overlap[(1, 2)] - 1.0).abs() < 1e-6);
-        assert!((overlap[(2, 1)] - 1.0).abs() < 1e-6);
-    }
-
-    /// read_m_vec on two-column (partitioned) M files returns Vec of length 2
-    /// with correct per-annotation sums.
-    #[test]
-    fn test_read_m_vec_multi_col() {
-        let dir = tempfile::tempdir().unwrap();
-        let prefix = format!("{}/test", dir.path().to_str().unwrap());
-
-        // chr1: annot1=100, annot2=200
-        std::fs::write(format!("{}1.l2.M", prefix), "100\t200\n").unwrap();
-        // chr2: annot1=300, annot2=400
-        std::fs::write(format!("{}2.l2.M", prefix), "300\t400\n").unwrap();
-
-        let v = read_m_vec(&prefix, ".l2.M").unwrap();
-        assert_eq!(v.len(), 2);
-        assert!((v[0] - 400.0).abs() < 0.01, "annot1 sum={}", v[0]); // 100+300
-        assert!((v[1] - 600.0).abs() < 0.01, "annot2 sum={}", v[1]); // 200+400
-    }
-
-    /// scan_ldscore can read the existing test .ldscore.gz file and returns
-    /// a LazyFrame with the expected columns.
-    /// Mirrors Python Test_ldscore::test_ldscore (l2 mode).
-    #[test]
-    fn test_scan_ldscore_gz() {
-        let manifest = env!("CARGO_MANIFEST_DIR");
-        let path = format!("{}/tests/fixtures/test.l2.ldscore.gz", manifest);
-        let lf = scan_ldscore(&path).unwrap();
-        let df = lf.collect().unwrap();
-
-        let cols: Vec<&str> = df.get_column_names().iter().map(|s| s.as_str()).collect();
-        assert!(cols.contains(&"SNP"), "missing SNP column");
-        assert!(cols.contains(&"AL2"), "missing AL2 column");
-        assert!(cols.contains(&"BL2"), "missing BL2 column");
-        assert_eq!(df.height(), 22, "expected 22 SNPs, got {}", df.height());
-    }
-
-    #[test]
-    fn test_scan_sumstats_whitespace() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sumstats.txt");
-        let content = "\
-SNP A1 A2 Z N
-rs1 A G 1.0 100
-rs2 C T 2.5 200
-";
-        std::fs::write(&path, content).unwrap();
-        let lf = scan_sumstats(path.to_str().unwrap()).unwrap();
-        let df = lf.collect().unwrap();
-        assert_eq!(df.height(), 2);
-        let cols: Vec<String> = df
-            .get_column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert!(cols.contains(&"SNP".to_string()));
-        assert!(cols.contains(&"Z".to_string()));
-    }
-
-    #[test]
-    fn test_scan_ldscore_whitespace() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ldscore.txt");
-        let content = "\
-CHR SNP BP L2
-1 rs1 100 1.0
-1 rs2 200 2.0
-";
-        std::fs::write(&path, content).unwrap();
-        let lf = scan_ldscore(path.to_str().unwrap()).unwrap();
-        let df = lf.collect().unwrap();
-        assert_eq!(df.height(), 2);
-        let cols: Vec<String> = df
-            .get_column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert!(cols.contains(&"SNP".to_string()));
-        assert!(cols.contains(&"L2".to_string()));
-    }
+/// Per-SNP metadata from a PLINK .bim file.
+/// Columns: CHR  SNP  CM  BP  A1  A2  (tab-separated, no header).
+#[derive(Debug, Clone)]
+pub struct BimRecord {
+    pub chr: u8,
+    pub snp: String,
+    pub cm: f64,
+    pub bp: u32,
+    /// 0-based index within the .bed file (position in the full BIM list).
+    pub bed_idx: usize,
 }
+
+/// Parse a PLINK .bim file.  Returns one `BimRecord` per row.
+pub fn parse_bim(path: &str) -> Result<Vec<BimRecord>> {
+    let f = File::open(path).with_context(|| format!("opening BIM file '{}'", path))?;
+    let reader = BufReader::new(f);
+    let mut records = Vec::new();
+
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("reading BIM line {}", line_no + 1))?;
+        let cols: Vec<&str> = line.split('\t').collect();
+        anyhow::ensure!(
+            cols.len() >= 6,
+            "BIM line {}: expected 6 columns, got {}",
+            line_no + 1,
+            cols.len()
+        );
+
+        records.push(BimRecord {
+            chr: cols[0].parse::<u8>().unwrap_or(0),
+            snp: cols[1].to_string(),
+            cm: cols[2].parse::<f64>().unwrap_or(0.0),
+            bp: cols[3].parse::<u32>().unwrap_or(0),
+            bed_idx: line_no,
+        });
+    }
+
+    Ok(records)
+}
+
+

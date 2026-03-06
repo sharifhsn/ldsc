@@ -1,6 +1,6 @@
 [package]
 name          = "ldsc"
-version       = "0.2.1"
+version       = "0.3.0"
 edition       = "2024"
 description   = "LD Score Regression — fast Rust reimplementation of Bulik-Sullivan et al. LDSC"
 license       = "GPL-3.0-only"
@@ -26,7 +26,7 @@ exclude       = [
 [dependencies]
 # Data munging — replaces pandas in munge_sumstats.py.
 # decompress feature required for transparent .gz decompression in LazyCsvReader.
-polars = { version = "0.53", features = ["lazy", "csv", "parquet", "decompress", "strings"] }
+polars = { version = "0.53", features = ["lazy", "csv", "decompress", "strings"] }
 
 faer = "0.24.0"
 
@@ -41,7 +41,6 @@ clap = { version = "4", features = ["derive"] }
 
 # Error handling
 anyhow = "1"
-thiserror = "2"
 
 # Logging / tracing
 tracing = "0.1"
@@ -55,6 +54,8 @@ bzip2-rs = "0.1"
 
 # Temp files for on-the-fly .bz2 decompression
 tempfile = "3"
+cubecl = { version = "=0.10.0-pre.2", features = ["cuda"], optional = true }
+cubek-matmul = { version = "=0.2.0-pre.2", optional = true }
 
 [profile.release]
 opt-level     = 3
@@ -62,7 +63,6 @@ lto           = "thin"
 codegen-units = 1
 
 [features]
-bed-polars = []
-fast-f32 = []
+gpu = ["dep:cubecl", "dep:cubek-matmul"]
 
 [dev-dependencies]

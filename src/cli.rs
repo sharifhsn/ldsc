@@ -39,9 +39,6 @@ pub enum Command {
     CtsAnnot(CtsAnnotArgs),
 }
 
-// ---------------------------------------------------------------------------
-// munge-sumstats
-// ---------------------------------------------------------------------------
 
 #[derive(Args)]
 pub struct MungeArgs {
@@ -58,11 +55,11 @@ pub struct MungeArgs {
     pub merge_alleles: Option<String>,
 
     /// Parse Stephan Ripke's daner format (infer N_cas/N_con from FRQ_A_/FRQ_U_ headers).
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub daner: bool,
 
     /// Parse newer daner format (uses Nca/Nco columns for N_cas/N_con).
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub daner_n: bool,
 
     /// Minimum sample size to retain a SNP (0 → Python default: 90th percentile / 1.5)
@@ -76,10 +73,6 @@ pub struct MungeArgs {
     /// Minimum INFO score to retain a SNP (0 to disable)
     #[arg(long, default_value_t = 0.9)]
     pub info_min: f64,
-
-    /// Remove strand-ambiguous SNPs (A/T, C/G)
-    #[arg(long, default_value_t = true)]
-    pub keep_mhc: bool,
 
     // --- Sample size overrides -----------------------------------------------
     /// Fix sample size for all SNPs (overrides any N column in the file)
@@ -145,17 +138,17 @@ pub struct MungeArgs {
 
     /// Keep the allele frequency (MAF) column in the output file.
     /// By default only SNP, A1, A2, Z, N are written.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub keep_maf: bool,
 
     /// A1 is always the increasing allele — treat all Z-scores as positive when
     /// deriving Z from P-values. Eliminates the need for a signed summary stat.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub a1_inc: bool,
 
     /// Allow summary statistics files without allele columns (A1/A2).
     /// Skips strand-ambiguity filtering; output will not include A1/A2.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub no_alleles: bool,
 
     /// Comma-separated list of INFO column names (e.g. "INFO_EUR,INFO_EAS").
@@ -174,9 +167,6 @@ pub struct MungeArgs {
     pub nstudy_min: Option<u64>,
 }
 
-// ---------------------------------------------------------------------------
-// l2 (--l2)
-// ---------------------------------------------------------------------------
 
 #[derive(Args)]
 pub struct L2Args {
@@ -221,7 +211,7 @@ pub struct L2Args {
 
     /// The annot file contains only annotation columns (no CHR/SNP/BP/CM columns).
     /// Use when working with "thin" annotation files.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub thin_annot: bool,
 
     /// File containing SNP IDs (one per line) to include in LD score computation.
@@ -252,7 +242,7 @@ pub struct L2Args {
 
     /// Compute per-allele LD scores: weight each r² by p·(1−p) of the source SNP.
     /// L2[i] = Σ_j r²_unbiased(i,j) × p_j·(1−p_j).
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub per_allele: bool,
 
     /// Generalized per-allele weighting: weight each r² by (p·(1−p))^S.
@@ -261,7 +251,7 @@ pub struct L2Args {
     pub pq_exp: Option<f64>,
 
     /// Do not write the annot matrix produced by --cts-bin.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub no_print_annot: bool,
 
     /// Number of SNPs to process per BLAS chunk (default 200).
@@ -270,13 +260,29 @@ pub struct L2Args {
     pub chunk_size: usize,
 
     /// Allow whole-chromosome LD windows without warning.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub yes_really: bool,
+
+    /// Use GPU for matrix multiplication (requires --features gpu).
+    #[arg(long)]
+    pub gpu: bool,
+
+    /// Tile size (columns per GPU tile) for tiled GPU matmul. When set, large A×B
+    /// multiplications are split into tiles of this many A-columns, so that only
+    /// one tile + B need to fit in VRAM at a time. Useful at biobank scale
+    /// (n ≥ 50k) with whole-chromosome windows where the full A matrix exceeds
+    /// GPU memory. Ignored without --gpu.
+    #[arg(long)]
+    pub gpu_tile_cols: Option<usize>,
+
+    /// Use f32 instead of f64 for the genotype GEMM (normalization and r2_unbiased
+    /// remain f64). Roughly halves memory for the ring buffer and scratch matrices
+    /// and can be ~1.5× faster on CPUs with 256-bit SIMD. Max LD score error is
+    /// ~0.001 at 1000G scale.
+    #[arg(long)]
+    pub fast_f32: bool,
 }
 
-// ---------------------------------------------------------------------------
-// h2 (heritability)
-// ---------------------------------------------------------------------------
 
 #[derive(Args)]
 pub struct H2Args {
@@ -324,7 +330,7 @@ pub struct H2Args {
 
     /// Use .l2.M instead of .l2.M_5_50 as the M denominator.
     /// Python LDSC defaults to .l2.M_5_50; set this flag to replicate --not-M-5-50.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub not_m_5_50: bool,
 
     /// Sample prevalence (for liability-scale conversion; requires --pop-prev)
@@ -337,7 +343,7 @@ pub struct H2Args {
 
     /// Constrain the LD score regression intercept to 1 (for h2) rather than estimating it.
     /// Equivalent to Python's --no-intercept.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub no_intercept: bool,
 
     /// Fix the LD score regression intercept to a specific value (e.g. 1.02).
@@ -361,16 +367,16 @@ pub struct H2Args {
 
     /// Print per-annotation τ coefficients and enrichment alongside total h2.
     /// Only meaningful when --ref-ld-chr points to partitioned (multi-column) LD score files.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub print_coefficients: bool,
 
     /// For --h2-cts: report coefficients for all LD score sets in each line.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub print_all_cts: bool,
 
     /// Treat partitioned annotations as overlapping categories (Python LDSC --overlap-annot).
     /// Requires --frqfile/--frqfile-chr unless --not-m-5-50 is set.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub overlap_annot: bool,
 
     /// Allele frequency file for overlapping annotations (single fileset).
@@ -384,26 +390,23 @@ pub struct H2Args {
     pub frqfile_chr: Option<String>,
 
     /// Print jackknife covariance matrix of regression estimates.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub print_cov: bool,
 
     /// Print per-block jackknife delete values for regression estimates.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub print_delete_vals: bool,
 
     /// Allow h2 < 0 or |rg| > 1 in output (Rust never clips; accepted for CLI parity).
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub return_silly_things: bool,
 
     /// Force matrix inversion even when ill-conditioned (Rust uses least-squares solver;
     /// accepted for CLI parity).
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub invert_anyway: bool,
 }
 
-// ---------------------------------------------------------------------------
-// rg (genetic correlation)
-// ---------------------------------------------------------------------------
 
 #[derive(Args)]
 pub struct RgArgs {
@@ -439,11 +442,11 @@ pub struct RgArgs {
     pub m_snps: Option<f64>,
 
     /// Use .l2.M instead of .l2.M_5_50 as the M denominator.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub not_m_5_50: bool,
 
     /// Constrain the genetic covariance intercept to 0 rather than estimating it.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub no_intercept: bool,
 
     /// Two-step estimator for gencov: estimate intercept on SNPs with |Z1·Z2| ≤ CHI2_MAX,
@@ -481,29 +484,26 @@ pub struct RgArgs {
 
     /// Skip allele consistency checking between summary statistic files.
     /// When set, skips allele alignment and mismatch filtering.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub no_check_alleles: bool,
 
     /// Print jackknife covariance matrix of regression estimates.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub print_cov: bool,
 
     /// Print per-block jackknife delete values for regression estimates.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub print_delete_vals: bool,
 
     /// Allow |rg| > 1 or negative h2 in output (Rust never clips; accepted for CLI parity).
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub return_silly_things: bool,
 
     /// Force matrix inversion even when ill-conditioned (accepted for CLI parity).
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub invert_anyway: bool,
 }
 
-// ---------------------------------------------------------------------------
-// make-annot
-// ---------------------------------------------------------------------------
 
 #[derive(Args)]
 pub struct MakeAnnotArgs {
@@ -537,13 +537,10 @@ pub struct MakeAnnotArgs {
 
     /// Do not merge overlapping BED intervals before annotation.
     /// By default adjacent/overlapping intervals are merged.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub nomerge: bool,
 }
 
-// ---------------------------------------------------------------------------
-// cts-annot (continuous binning)
-// ---------------------------------------------------------------------------
 
 #[derive(Args)]
 pub struct CtsAnnotArgs {

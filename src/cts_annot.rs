@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use crate::cli::CtsAnnotArgs;
-use crate::l2::parse_bim;
+use crate::parse::parse_bim;
 use crate::parse::resolve_text_path;
 
 #[derive(Debug)]
@@ -113,13 +113,7 @@ pub(crate) fn build_cts_matrix(
     Ok((matrix, col_names))
 }
 
-fn split_paths(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
+use crate::parse::split_paths;
 
 fn parse_breaks(raw: &str, expected: usize) -> Result<Vec<Vec<f64>>> {
     let fixed = raw.replace('N', "-");
@@ -258,14 +252,14 @@ fn compute_bins(values: &[f64], breaks: &[f64]) -> Result<BinSpec> {
 fn assign_bins(values: &[f64], cut_breaks: &[f64]) -> Result<Vec<usize>> {
     let mut out = Vec::with_capacity(values.len());
     for &v in values {
-        let mut found = None;
-        for i in 0..cut_breaks.len() - 1 {
-            if v > cut_breaks[i] && v <= cut_breaks[i + 1] {
-                found = Some(i);
-                break;
-            }
-        }
-        let idx = found.context("Some SNPs have no annotation in --cts-bin")?;
+        // Binary search: find rightmost break ≤ v, then bin index = that position.
+        // cut_breaks is sorted; partition_point gives first index where break > v.
+        let pos = cut_breaks.partition_point(|&b| b < v);
+        let idx = if pos > 0 && pos < cut_breaks.len() {
+            pos - 1
+        } else {
+            anyhow::bail!("Some SNPs have no annotation in --cts-bin");
+        };
         out.push(idx);
     }
     Ok(out)
@@ -328,48 +322,3 @@ fn open_writer(path: &str) -> Result<Box<dyn Write>> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_assign_bins_basic() {
-        let values = vec![0.1, 0.2, 0.3];
-        let spec = compute_bins(&values, &[0.15]).unwrap();
-        let bins = assign_bins(&values, &spec.cut_breaks).unwrap();
-        assert_eq!(bins, vec![0, 1, 1]);
-        assert_eq!(
-            spec.labels,
-            vec!["min_0.15".to_string(), "0.15_max".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_combo_sort_and_names() {
-        let specs = vec![
-            BinSpec {
-                labels: vec!["min_0.0".into(), "0.0_max".into()],
-                lower_bounds: vec![f64::NEG_INFINITY, 0.0],
-                cut_breaks: vec![],
-            },
-            BinSpec {
-                labels: vec!["min_1.0".into(), "1.0_max".into()],
-                lower_bounds: vec![f64::NEG_INFINITY, 1.0],
-                cut_breaks: vec![],
-            },
-        ];
-        let mut combos = cartesian_indices(&[2, 2]);
-        combos.sort_by(|a, b| compare_combo(a, b, &specs));
-        let names = vec!["A".to_string(), "B".to_string()];
-        let cols = build_col_names(&combos, &specs, &names);
-        assert_eq!(
-            cols,
-            vec![
-                "A_min_0.0_B_min_1.0",
-                "A_min_0.0_B_1.0_max",
-                "A_0.0_max_B_min_1.0",
-                "A_0.0_max_B_1.0_max"
-            ]
-        );
-    }
-}

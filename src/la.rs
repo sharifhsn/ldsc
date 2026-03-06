@@ -11,30 +11,8 @@ pub fn mat_zeros(nrows: usize, ncols: usize) -> MatF {
 }
 
 #[inline]
-#[allow(dead_code)]
-pub fn mat_zeros_f32(nrows: usize, ncols: usize) -> MatF32 {
-    Mat::zeros(nrows, ncols)
-}
-
-#[inline]
-#[allow(dead_code)]
-pub fn mat_from_fn(nrows: usize, ncols: usize, f: impl FnMut(usize, usize) -> f64) -> MatF {
-    Mat::from_fn(nrows, ncols, f)
-}
-
-#[inline]
 pub fn col_zeros(nrows: usize) -> ColF {
     Mat::zeros(nrows, 1)
-}
-
-#[inline]
-#[allow(dead_code)]
-pub fn col_ones(nrows: usize) -> ColF {
-    let mut out = Mat::zeros(nrows, 1);
-    for i in 0..nrows {
-        out[(i, 0)] = 1.0;
-    }
-    out
 }
 
 #[inline]
@@ -50,18 +28,6 @@ pub fn col_from_vec(values: Vec<f64>) -> ColF {
 #[inline]
 pub fn col_len(col: &ColF) -> usize {
     col.nrows()
-}
-
-#[inline]
-#[allow(dead_code)]
-pub fn col_get(col: &ColF, i: usize) -> f64 {
-    col[(i, 0)]
-}
-
-#[inline]
-#[allow(dead_code)]
-pub fn col_set(col: &mut ColF, i: usize, v: f64) {
-    col[(i, 0)] = v;
 }
 
 #[inline]
@@ -81,67 +47,6 @@ pub fn col_mean(col: &ColF) -> f64 {
         return f64::NAN;
     }
     col_sum(col) / n as f64
-}
-
-#[inline]
-#[allow(dead_code)]
-pub fn col_map_in_place(col: &mut ColF, f: impl Fn(f64) -> f64) {
-    let n = col.nrows();
-    for i in 0..n {
-        col[(i, 0)] = f(col[(i, 0)]);
-    }
-}
-
-#[inline]
-#[allow(dead_code)]
-pub fn col_mul_in_place(col: &mut ColF, other: &ColF) {
-    let n = col.nrows();
-    for i in 0..n {
-        col[(i, 0)] *= other[(i, 0)];
-    }
-}
-
-#[inline]
-#[allow(dead_code)]
-pub fn col_add_in_place(col: &mut ColF, other: &ColF) {
-    let n = col.nrows();
-    for i in 0..n {
-        col[(i, 0)] += other[(i, 0)];
-    }
-}
-
-#[inline]
-#[allow(dead_code)]
-pub fn col_sub_in_place(col: &mut ColF, other: &ColF) {
-    let n = col.nrows();
-    for i in 0..n {
-        col[(i, 0)] -= other[(i, 0)];
-    }
-}
-
-#[inline]
-#[allow(dead_code)]
-pub fn mat_row_scale_in_place(mat: &mut MatF, scales: &ColF) {
-    let nrows = mat.nrows();
-    let ncols = mat.ncols();
-    for i in 0..nrows {
-        let s = scales[(i, 0)];
-        for j in 0..ncols {
-            mat[(i, j)] *= s;
-        }
-    }
-}
-
-#[inline]
-#[allow(dead_code)]
-pub fn mat_fill(mut mat: MatMut<'_, f64>, value: f64) {
-    let nrows = mat.nrows();
-    let ncols = mat.ncols();
-    for i in 0..nrows {
-        for j in 0..ncols {
-            mat[(i, j)] = value;
-        }
-    }
 }
 
 #[inline]
@@ -190,7 +95,6 @@ pub fn matmul_tn_to(
     matmul(dst, accum, lhs.transpose(), rhs, alpha, par);
 }
 
-#[cfg(feature = "fast-f32")]
 #[inline]
 pub fn matmul_tn_to_f32(
     dst: MatMut<'_, f32>,
@@ -226,7 +130,6 @@ pub fn mat_slice<'a>(
     mat.submatrix(rows.start, cols.start, nrows, ncols)
 }
 
-#[cfg(feature = "fast-f32")]
 #[inline]
 pub fn mat_slice_f32<'a>(
     mat: MatRef<'a, f32>,
@@ -249,7 +152,6 @@ pub fn mat_slice_mut<'a>(
     mat.submatrix_mut(rows.start, cols.start, nrows, ncols)
 }
 
-#[cfg(feature = "fast-f32")]
 #[inline]
 pub fn mat_slice_mut_f32<'a>(
     mat: MatMut<'a, f32>,
@@ -260,3 +162,4 @@ pub fn mat_slice_mut_f32<'a>(
     let ncols = cols.end.saturating_sub(cols.start);
     mat.submatrix_mut(rows.start, cols.start, nrows, ncols)
 }
+

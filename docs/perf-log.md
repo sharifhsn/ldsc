@@ -351,3 +351,130 @@ how changes affect runtime.
   - `max_abs_diff=0.008`
   - `max_rel_diff=0.000651466` (relative to f64, excluding zero refs)
 - Note: f32 path is **not parity‑safe**; use for performance experiments only.
+
+## 2026-03-05 (no-window / whole-chromosome LD scores via --ld-wind-cm 1)
+- Approach: 1000G BED files have CM=0 for all SNPs. With `--ld-wind-cm 1`, every SNP is within 1cM of every other on the same chromosome → effectively a whole-chromosome window with no truncation. Using single-chromosome BED files avoids cross-chromosome bleeding.
+- Machine: Ryzen 5 5600X (6 cores / 12 threads), faer `Par::rayon(0)`.
+
+### Parity + perf (Python vs Rust, --ld-wind-cm 1, single chr22 BED)
+- Commands: `ldsc.py --l2 --bfile <chr22_bed> --ld-wind-cm 1 --yes-really` / `ldsc l2 --bfile <chr22_bed> --ld-wind-cm 1 --yes-really`
+- Speedup grows with M because work is O(M²): Python single-threaded, Rust uses faer Par::rayon(0) across 12 threads.
+
+| SNPs   | Python wall | Rust wall | Rust user | Speedup     | max_abs_diff |
+|--------|-------------|-----------|-----------|-------------|--------------|
+| 2,950  | 8.36s       | 0.222s    | 1.184s    | **33.7×**   | 0 ✓          |
+| 24,624 | 664s        | 14.0s     | 119.8s    | **47.4×**   | 0 ✓          |
+
+- Rayon speedup at 2,950 SNPs: 5.3× (small matrices, overhead dominates); at 24,624 SNPs: 8.6×
+- Calibration: O(M²) confirmed; `k = 1.426e-7 s·CPU/SNP²` (user time per SNP pair)
+
+### Full-genome no-window estimate (sequential, O(M²) per chr, 9.32× rayon)
+- Total wall: ~**38 min**, total CPU: ~**6h**
+- Bottleneck: chr1 (288s) + chr2 (295s) = ~10 min combined
+- If chromosomes parallelized independently (each chr independent in no-window mode): bottleneck = chr2 ~295s → ~5 min wall
+- Per-chromosome wall times:
+  - chr1: 288s, chr2: 295s, chr3: 206s, chr4: 170s, chr5: 162s, chr6: 183s
+  - chr7: 128s, chr8: 124s, chr9: 89s, chr10: 119s, chr11: 109s, chr12: 97s
+  - chr13: 59s, chr14: 46s, chr15: 40s, chr16: 46s, chr17: 34s, chr18: 38s
+  - chr19: 18s, chr20: 29s, chr21: 9s, chr22: 9s
+
+## 2026-03-05 (B1 scalar/partitioned path unification)
+- Change: removed separate scalar LD-score accumulation path (~170 lines); scalar case now uses the partitioned matmul path with a synthetic all-ones annotation column. Also removed dead code (jackknife, irwls, Bed.path), tracing from regressions.rs, section separators, and verbose doc comments. Total: 8,457 → 7,835 lines.
+- Machine: Ryzen 5 5600X (6 cores / 12 threads), faer `Par::rayon(0)`.
+
+### No-window (--ld-wind-cm 1, single-chr BEDs)
+
+| Chr | SNPs | Previous wall | Current wall | Previous user | Current user |
+|-----|------|--------------|--------------|---------------|--------------|
+| chr22 | 24,624 | 14.0s | 9.2s | 119.8s | 88.2s |
+| chr1 | 137,124 | 288s | 300s | — | 3126s |
+
+- chr22: **34% faster wall, 26% faster CPU** — matmul-based accumulation is more cache-friendly than the hand-written scalar loop at this matrix size.
+- chr1: within noise (~4% diff); at 137k SNPs both paths are memory-bandwidth-limited.
+
+### Full 1000G (--ld-wind-kb 1000, --chunk-size 200, 1,664,852 SNPs)
+- Command: `ldsc l2 --bfile data/1000G_phase3_common_norel --ld-wind-kb 1000 --chunk-size 200 --out /tmp/ldsc_full_perf --yes-really`
+- Timing: `real 70.0s`, `user 430.1s`
+- Previous best (pre-B1): `real 60.7s`–`68.5s` range
+- Within normal run-to-run noise (~5-10s variance on this machine).
+
+### Parity
+- `bench_5k` (5k SNPs, --ld-wind-kb 1000): `max_abs_diff=0` ✓
+- `check_l2_tiny_py_vs_rust.sh` (2k extract): `max_abs_diff=0` ✓
+- fast-f32 vs f64 drift: `max_abs_diff=0.001` (unchanged from pre-B1)
+
+## 2026-03-06 (GPU acceleration via CubeCL + CubeK)
+- Change: added optional `--features gpu` feature gate using `cubecl 0.10.0-pre.2` (CUDA backend) and `cubek-matmul 0.2.0-pre.2` (autotuned GPU GEMM). New `src/gpu.rs` (~160 lines) wraps `GpuContext` with `matmul_tn()` and `matmul_tn_tiled()`. CLI flag `--gpu` dispatches GEMM to GPU at both B×B and A×B call sites in `compute_ldscore_global`. Output tensor uses pitched/padded strides from `TensorHandle::empty`; stride-aware extraction handles this correctly. Default build (no `gpu` feature) is completely unaffected.
+- Machine: Ryzen 5 5600X (6C/12T) + NVIDIA GeForce RTX 3060 (12 GB VRAM), CUDA 13.1, cudarc 0.19.3.
+- Dependencies: `cubecl =0.10.0-pre.2` (features=["cuda"]), `cubek-matmul =0.2.0-pre.2`.
+
+### Parity (GPU f32 vs CPU f64)
+- `bench_5k` (5k SNPs, --ld-wind-kb 1000): `max_abs_diff=0.001`, `max_rel_diff=0.049%`
+- `chr1` (137k SNPs, whole-chromosome): `max_abs_diff=0.003`, `max_rel_diff=0.020%`
+- Drift is inherent to f32 matmul precision — matches `--features fast-f32` behavior.
+  With f16 matmul (supported by cubek-matmul via `MatmulPrecision` trait), precision would
+  degrade further (~3 decimal digits), but transfer bandwidth would halve, potentially
+  improving the compute-to-transfer ratio on bandwidth-bound problems.
+
+### Small data: bench_5k (5,000 SNPs, n=2,490, --ld-wind-kb 1000)
+
+| Mode | Wall | User | Sys |
+|------|------|------|-----|
+| CPU (rayon) | **0.14s** | 0.57s | 0.05s |
+| GPU (RTX 3060) | 1.02s | 0.62s | 0.39s |
+
+- GPU **7× slower** — dominated by ~1s CUDA initialization overhead.
+  f16 would not help here; the bottleneck is init, not compute or transfer.
+
+### Medium data: bench_200k (200,237 SNPs, n=2,490, --ld-wind-kb 1000)
+
+| Mode | Wall | User | Sys |
+|------|------|------|-----|
+| CPU (rayon) | **5.4s** | 27.0s | 1.9s |
+| GPU (RTX 3060) | 8.9s | 7.8s | 1.4s |
+
+- GPU **1.6× slower wall** but uses **3.5× less CPU time** (7.8s vs 27s).
+  Each GEMM is ~2490×200×200 ≈ 100 MFLOP — microseconds on GPU, but PCIe
+  transfer of the 2490×200 matrices (~2 MB) takes longer than the compute.
+  f16 would halve transfer size to ~1 MB per matrix, potentially bringing GPU
+  wall time closer to CPU by reducing PCIe bottleneck.
+
+### Largest problem: chr1 whole-chromosome (137,124 SNPs, n=2,490, --ld-wind-snps 999999999)
+
+| Mode | Wall | User | Sys |
+|------|------|------|-----|
+| CPU (rayon) | **6m56s** | 70m30s | 0m21s |
+| GPU (RTX 3060) | 10m25s | 5m31s | 6m09s |
+
+- GPU **1.5× slower wall** but uses **13× less CPU time** (5.5 min vs 70.5 min).
+- The massive `sys` time (6 min) is CPU↔GPU data transfer. With n=2,490, each
+  chunk GEMM is ~2490×200×200 ≈ 100 MFLOP — trivial compute for GPU.
+  The window grows to 137k columns, but each A×B dispatch is still small.
+  f16 would halve transfer volume (~4 MB→2 MB per chunk pair), cutting the
+  6-minute sys overhead significantly.
+
+### Analysis: when does GPU break even?
+
+At n=2,490 individuals, GEMM sizes are too small for GPU to overcome PCIe
+transfer latency. The crossover depends on the compute-to-transfer ratio:
+
+- **Compute per chunk**: `n × W × C` FLOPs (W=window cols, C=chunk cols)
+- **Transfer per chunk**: `(n×C + n×W) × 4 bytes` (f32) for upload + `(W×C) × 4 bytes` for download
+- **GPU compute throughput**: ~10 TFLOPS (RTX 3060 f32)
+- **PCIe bandwidth**: ~12 GB/s (PCIe 4.0 x16)
+
+For n=2,490, W=200, C=200: compute = 100 MFLOP = 10µs; transfer = 4 MB = 330µs → **33× transfer-bound**.
+For n=500,000, W=200, C=200: compute = 20 GFLOP = 2ms; transfer = 800 MB = 67ms → still transfer-bound but ratio improves.
+For n=500,000 with f16: transfer halved to 400 MB = 33ms; compute still ~2ms → **better ratio**.
+
+**Crossover estimate**: GPU breaks even at roughly n≥50k individuals with f32,
+or n≥25k with f16. At UK Biobank scale (n=500k), GPU would be ~3-5× faster
+than CPU, with f16 potentially reaching ~8-10× by halving transfer overhead.
+
+### Notes
+- `Strategy::Auto` selects kernel automatically; on first run it autotuned
+  (cache stored on device for subsequent runs).
+- `TensorHandle::empty()` returns pitched/padded strides (e.g., stride 4 for
+  shape [2,2]); `extract_result()` handles this correctly.
+- Build: `cargo build --release --features gpu` requires CUDA toolkit.
+  Default build (`cargo build --release`) is completely unaffected.

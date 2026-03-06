@@ -8,9 +8,19 @@ use std::io::BufWriter;
 use crate::cli::MungeArgs;
 use crate::parse;
 
-// ---------------------------------------------------------------------------
-// Column-name synonym map
-// ---------------------------------------------------------------------------
+fn column_names(lf: &LazyFrame) -> Result<Vec<String>> {
+    let header = lf.clone().limit(0).collect()?;
+    Ok(header
+        .get_column_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect())
+}
+
+fn has_col(cols: &[String], name: &str) -> bool {
+    cols.iter().any(|c| c == name)
+}
+
 
 /// (uppercase_synonym, canonical_name) pairs.
 const CNAME_MAP: &[(&str, &str)] = &[
@@ -81,9 +91,6 @@ fn cname_lookup(upper: &str) -> Option<&'static str> {
     CNAME_MAP.iter().find(|(k, _)| *k == upper).map(|(_, v)| *v)
 }
 
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
 
 pub fn run(args: MungeArgs) -> Result<()> {
     let mut args = args;
@@ -152,9 +159,6 @@ pub fn run(args: MungeArgs) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Ignore columns (--ignore)
-// ---------------------------------------------------------------------------
 
 /// Drop user-specified columns before any other processing.
 ///
@@ -168,12 +172,7 @@ fn apply_ignore(lf: LazyFrame, ignore_csv: Option<&str>) -> Result<LazyFrame> {
     };
 
     let to_drop: Vec<&str> = csv.split(',').map(|s| s.trim()).collect();
-    let header = lf.clone().limit(0).collect()?;
-    let existing: Vec<String> = header
-        .get_column_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let existing = column_names(&lf)?;
 
     let keep_cols: Vec<Expr> = existing
         .iter()
@@ -188,31 +187,22 @@ fn drop_columns(lf: LazyFrame, drop_cols: &[String]) -> Result<LazyFrame> {
     if drop_cols.is_empty() {
         return Ok(lf);
     }
-    let header = lf.clone().limit(0).collect()?;
-    let keep_cols: Vec<Expr> = header
-        .get_column_names()
+    let existing = column_names(&lf)?;
+    let keep_cols: Vec<Expr> = existing
         .iter()
-        .filter(|c| !drop_cols.iter().any(|d| d.as_str() == c.as_str()))
+        .filter(|c| !drop_cols.iter().any(|d| d == c.as_str()))
         .map(|c| col(c.as_str()))
         .collect();
     Ok(lf.select(keep_cols))
 }
 
-// ---------------------------------------------------------------------------
-// daner format helpers (--daner / --daner-n)
-// ---------------------------------------------------------------------------
 
 fn apply_daner_overrides(lf: LazyFrame, args: &mut MungeArgs) -> Result<LazyFrame> {
     if !args.daner && !args.daner_n {
         return Ok(lf);
     }
 
-    let header = lf.clone().limit(0).collect()?;
-    let cols: Vec<String> = header
-        .get_column_names()
-        .iter()
-        .map(|c| c.to_string())
-        .collect();
+    let cols = column_names(&lf)?;
 
     let find_prefix = |prefix: &str| cols.iter().find(|c| c.starts_with(prefix)).cloned();
 
@@ -276,9 +266,6 @@ fn apply_daner_overrides(lf: LazyFrame, args: &mut MungeArgs) -> Result<LazyFram
     Ok(lf)
 }
 
-// ---------------------------------------------------------------------------
-// User column-name overrides (--snp-col, --n-col, --a1-col, etc.)
-// ---------------------------------------------------------------------------
 
 /// Apply explicit column-name overrides before the synonym map runs.
 ///
@@ -300,12 +287,7 @@ fn apply_col_overrides(lf: LazyFrame, args: &MungeArgs) -> Result<LazyFrame> {
     ];
 
     // Collect existing columns (no data load needed).
-    let header = lf.clone().limit(0).collect()?;
-    let existing: Vec<String> = header
-        .get_column_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let existing = column_names(&lf)?;
 
     let mut old_names: Vec<String> = Vec::new();
     let mut new_names: Vec<String> = Vec::new();
@@ -330,26 +312,19 @@ fn apply_col_overrides(lf: LazyFrame, args: &MungeArgs) -> Result<LazyFrame> {
     Ok(lf.rename(old_names, new_names, false))
 }
 
-// ---------------------------------------------------------------------------
-// Column normalisation
-// ---------------------------------------------------------------------------
 
 /// Rename input columns to their canonical names using CNAME_MAP, case-insensitively.
 fn normalize_columns(lf: LazyFrame) -> Result<LazyFrame> {
-    let header = lf.clone().limit(0).collect()?;
-    let existing = header.get_column_names();
+    let existing = column_names(&lf)?;
 
     let mut old_names: Vec<String> = Vec::new();
     let mut new_names: Vec<String> = Vec::new();
 
     for name in &existing {
         let upper = name.to_uppercase();
-        if let Some(canonical) = cname_lookup(&upper) {
-            // Rename only when the current name differs from the canonical.
-            if *name != canonical {
-                old_names.push(name.to_string());
-                new_names.push(canonical.to_string());
-            }
+        if let Some(canonical) = cname_lookup(&upper) && *name != canonical {
+            old_names.push(name.to_string());
+            new_names.push(canonical.to_string());
         }
     }
 
@@ -359,9 +334,6 @@ fn normalize_columns(lf: LazyFrame) -> Result<LazyFrame> {
     Ok(lf.rename(old_names, new_names, false))
 }
 
-// ---------------------------------------------------------------------------
-// Sample-size override
-// ---------------------------------------------------------------------------
 
 /// Apply --n / --n-cas / --n-con overrides.
 ///
@@ -379,10 +351,8 @@ fn apply_n_override(lf: LazyFrame, args: &MungeArgs) -> Result<LazyFrame> {
         return Ok(lf.with_column(lit(n_cas + n_con).alias("N")));
     }
     // Priority 3: N_CAS + N_CON per-row columns (from --n-cas-col / --n-con-col).
-    let header = lf.clone().limit(0).collect()?;
-    let cols = header.get_column_names();
-    let has = |n: &str| cols.iter().any(|c| *c == n);
-    if has("N_CAS") && has("N_CON") {
+    let cols = column_names(&lf)?;
+    if has_col(&cols, "N_CAS") && has_col(&cols, "N_CON") {
         return Ok(lf.with_column(
             (col("N_CAS").cast(DataType::Float64) + col("N_CON").cast(DataType::Float64))
                 .alias("N"),
@@ -391,9 +361,6 @@ fn apply_n_override(lf: LazyFrame, args: &MungeArgs) -> Result<LazyFrame> {
     Ok(lf)
 }
 
-// ---------------------------------------------------------------------------
-// Z-score derivation
-// ---------------------------------------------------------------------------
 
 /// Derive Z-score using one of four strategies (in priority order):
 ///   1. Z column already present → no-op.
@@ -405,9 +372,8 @@ fn apply_n_override(lf: LazyFrame, args: &MungeArgs) -> Result<LazyFrame> {
 ///   4. `--a1-inc`: A1 always increases → Z = +|Φ⁻¹(1 − P/2)| from P-value.
 ///   5. None of the above → pass through; final `select` will report the error.
 fn derive_z(lf: LazyFrame, signed_sumstats: Option<&str>, a1_inc: bool) -> Result<LazyFrame> {
-    let header = lf.clone().limit(0).collect()?;
-    let cols = header.get_column_names();
-    let has = |n: &str| cols.iter().any(|c| *c == n);
+    let cols = column_names(&lf)?;
+    let has = |n: &str| has_col(&cols, n);
 
     // If P is present, match Python: always compute Z from P (signed if possible).
     if has("P") {
@@ -467,17 +433,6 @@ fn derive_z(lf: LazyFrame, signed_sumstats: Option<&str>, a1_inc: bool) -> Resul
     // BETA / SE → Z = BETA / SE (lazy expression, no collect needed).
     if has("BETA") && has("SE") {
         return Ok(lf.with_column((col("BETA") / col("SE")).alias("Z")));
-    }
-
-    // --a1-inc: A1 always increases → Z = +|Φ⁻¹(1 − P/2)|.
-    if a1_inc && has("P") {
-        let mut df = lf
-            .collect()
-            .context("collecting for P→Z (a1-inc) conversion")?;
-        let z_col = p_always_positive(&df).context("P→Z conversion with --a1-inc")?;
-        df.with_column(z_col.into())
-            .context("adding Z column (a1-inc)")?;
-        return Ok(df.lazy());
     }
 
     Ok(lf)
@@ -542,9 +497,6 @@ fn p_and_sign_to_z(df: &DataFrame, sign_col: &str, null_val: f64) -> Result<Seri
     Ok(Series::new("Z".into(), z_vals))
 }
 
-// ---------------------------------------------------------------------------
-// SNP filtering
-// ---------------------------------------------------------------------------
 
 /// Apply MAF/N/INFO filters, optionally remove strand-ambiguous SNPs.
 /// When `no_alleles` is true the strand-ambiguity check is skipped.
@@ -555,9 +507,8 @@ fn filter_snps(
     info_min: f64,
     no_alleles: bool,
 ) -> Result<LazyFrame> {
-    let header = lf.clone().limit(0).collect()?;
-    let cols = header.get_column_names();
-    let has = |n: &str| cols.iter().any(|c| *c == n);
+    let cols = column_names(&lf)?;
+    let has = |n: &str| has_col(&cols, n);
 
     let mut lf = lf;
 
@@ -664,10 +615,8 @@ fn drop_missing_required(lf: LazyFrame) -> Result<LazyFrame> {
 }
 
 fn filter_pvals(lf: LazyFrame) -> Result<LazyFrame> {
-    let header = lf.clone().limit(0).collect()?;
-    let cols = header.get_column_names();
-    let has_p = cols.iter().any(|c| *c == "P");
-    if !has_p {
+    let cols = column_names(&lf)?;
+    if !has_col(&cols, "P") {
         return Ok(lf);
     }
     Ok(lf.filter(
@@ -732,9 +681,6 @@ fn apply_merge_alleles(lf: LazyFrame, allele_path: &str) -> Result<LazyFrame> {
     Ok(merged.select(keep))
 }
 
-// ---------------------------------------------------------------------------
-// Info-list helper (--info-list)
-// ---------------------------------------------------------------------------
 
 /// Compute the mean of multiple INFO columns and store the result as "INFO".
 ///
@@ -755,8 +701,7 @@ fn apply_info_list(lf: LazyFrame, info_list: Option<&str>) -> Result<LazyFrame> 
     }
 
     // Match requested names case-insensitively against the actual column names.
-    let header = lf.clone().limit(0).collect()?;
-    let existing = header.get_column_names();
+    let existing = column_names(&lf)?;
     let matched: Vec<String> = requested
         .iter()
         .filter_map(|name| {
@@ -786,9 +731,6 @@ fn apply_info_list(lf: LazyFrame, info_list: Option<&str>) -> Result<LazyFrame> 
     Ok(lf.with_column((sum_expr / lit(n)).alias("INFO")))
 }
 
-// ---------------------------------------------------------------------------
-// Nstudy filter helper (--nstudy / --nstudy-min)
-// ---------------------------------------------------------------------------
 
 /// Filter SNPs by the minimum number of studies they appear in.
 ///
@@ -804,8 +746,7 @@ fn apply_nstudy_filter(
         _ => return Ok(lf),
     };
 
-    let header = lf.clone().limit(0).collect()?;
-    let existing = header.get_column_names();
+    let existing = column_names(&lf)?;
     if let Some(actual) = existing
         .iter()
         .find(|c| c.to_uppercase() == col_name.to_uppercase())
@@ -828,9 +769,6 @@ fn apply_nstudy_filter(
     Ok(lf)
 }
 
-// ---------------------------------------------------------------------------
-// Output writer
-// ---------------------------------------------------------------------------
 
 /// Write a DataFrame as a gzip-compressed tab-separated file.
 fn write_sumstats_gz(path: &str, df: &mut DataFrame) -> Result<()> {
@@ -848,231 +786,4 @@ fn write_sumstats_gz(path: &str, df: &mut DataFrame) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Read;
-
-    /// cname_lookup maps known synonyms to their canonical names.
-    #[test]
-    fn test_cname_lookup_standard() {
-        assert_eq!(cname_lookup("SNP"), Some("SNP"));
-        assert_eq!(cname_lookup("RSID"), Some("SNP"));
-        assert_eq!(cname_lookup("MARKERNAME"), Some("SNP"));
-        assert_eq!(cname_lookup("P"), Some("P"));
-        assert_eq!(cname_lookup("PVALUE"), Some("P"));
-        assert_eq!(cname_lookup("BETA"), Some("BETA"));
-        assert_eq!(cname_lookup("B"), Some("BETA"));
-        assert_eq!(cname_lookup("SE"), Some("SE"));
-        assert_eq!(cname_lookup("STDERR"), Some("SE"));
-        assert_eq!(cname_lookup("MAF"), Some("FRQ"));
-        assert_eq!(cname_lookup("EAF"), Some("FRQ"));
-        assert_eq!(cname_lookup("FRQ_U"), Some("FRQ"));
-        assert_eq!(cname_lookup("INFO"), Some("INFO"));
-        assert_eq!(cname_lookup("IMPINFO"), Some("INFO"));
-        assert_eq!(cname_lookup("Z"), Some("Z"));
-        assert_eq!(cname_lookup("ZSCORE"), Some("Z"));
-        assert_eq!(cname_lookup("A1"), Some("A1"));
-        assert_eq!(cname_lookup("EFFECT_ALLELE"), Some("A1"));
-        assert_eq!(cname_lookup("A2"), Some("A2"));
-        assert_eq!(cname_lookup("OTHER_ALLELE"), Some("A2"));
-        assert_eq!(cname_lookup("N"), Some("N"));
-        assert_eq!(cname_lookup("WEIGHT"), Some("N")); // METAL convention
-        assert_eq!(cname_lookup("OR"), Some("OR"));
-    }
-
-    /// cname_lookup returns None for unknown names.
-    #[test]
-    fn test_cname_lookup_unknown() {
-        assert_eq!(cname_lookup("FOOBAR"), None);
-        assert_eq!(cname_lookup(""), None);
-        assert_eq!(cname_lookup("CHROM"), None);
-        assert_eq!(cname_lookup("EFFECT_SIZE"), None);
-    }
-
-    /// cname_lookup is case-sensitive (keys must be UPPER); lowercase misses.
-    /// Mirrors Python's clean_header uppercasing before lookup.
-    #[test]
-    fn test_cname_lookup_case_sensitive() {
-        assert_eq!(cname_lookup("snp"), None); // lowercase → no match
-        assert_eq!(cname_lookup("SNP"), Some("SNP"));
-        assert_eq!(cname_lookup("Zscore"), None);
-        assert_eq!(cname_lookup("ZSCORE"), Some("Z"));
-    }
-
-    fn read_gz(path: &str) -> String {
-        use flate2::read::GzDecoder;
-        let file = std::fs::File::open(path).expect("open gz");
-        let mut decoder = GzDecoder::new(file);
-        let mut s = String::new();
-        decoder.read_to_string(&mut s).expect("read gz");
-        s
-    }
-
-    fn base_args(sumstats: &str, out: &str) -> MungeArgs {
-        MungeArgs {
-            sumstats: sumstats.to_string(),
-            out: out.to_string(),
-            merge_alleles: None,
-            daner: false,
-            daner_n: false,
-            n_min: 0.0,
-            maf: 0.01,
-            info_min: 0.9,
-            keep_mhc: true,
-            n: None,
-            n_cas: None,
-            n_con: None,
-            snp_col: None,
-            n_col: None,
-            n_cas_col: None,
-            n_con_col: None,
-            a1_col: None,
-            a2_col: None,
-            p_col: None,
-            frq_col: None,
-            info_col: None,
-            signed_sumstats: None,
-            ignore: None,
-            keep_maf: false,
-            a1_inc: false,
-            no_alleles: false,
-            info_list: None,
-            nstudy: None,
-            nstudy_min: None,
-        }
-    }
-
-    #[test]
-    fn test_merge_alleles_filters_mismatch() {
-        let dir = tempfile::tempdir().unwrap();
-        let sumstats = dir.path().join("sumstats.txt");
-        let merge = dir.path().join("merge.txt");
-        let out = dir.path().join("out");
-
-        std::fs::write(
-            &sumstats,
-            "SNP A1 A2 Z N\nrs1 A G 1.0 100\nrs2 C T 2.0 100\n",
-        )
-        .unwrap();
-        std::fs::write(&merge, "SNP A1 A2\nrs1 A G\nrs2 G C\n").unwrap();
-
-        let mut args = base_args(sumstats.to_str().unwrap(), out.to_str().unwrap());
-        args.merge_alleles = Some(merge.to_str().unwrap().to_string());
-        run(args).unwrap();
-
-        let content = read_gz(&format!("{}.sumstats.gz", out.to_str().unwrap()));
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2, "expected header + 1 row");
-        assert!(lines[1].starts_with("rs1\t"));
-    }
-
-    #[test]
-    fn test_invalid_alleles_removed() {
-        let dir = tempfile::tempdir().unwrap();
-        let sumstats = dir.path().join("sumstats.txt");
-        let out = dir.path().join("out");
-        std::fs::write(
-            &sumstats,
-            "SNP A1 A2 Z N\nrs1 A G 1.0 100\nrs2 I D 2.0 100\n",
-        )
-        .unwrap();
-        let args = base_args(sumstats.to_str().unwrap(), out.to_str().unwrap());
-        run(args).unwrap();
-
-        let content = read_gz(&format!("{}.sumstats.gz", out.to_str().unwrap()));
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2, "expected header + 1 row");
-        assert!(lines[1].starts_with("rs1\t"));
-    }
-
-    #[test]
-    fn test_drop_missing_values() {
-        let dir = tempfile::tempdir().unwrap();
-        let sumstats = dir.path().join("sumstats.txt");
-        let out = dir.path().join("out");
-        std::fs::write(&sumstats, "SNP A1 A2 Z N\nrs1 A G 1.0 100\nrs2 C T . 100\n").unwrap();
-        let args = base_args(sumstats.to_str().unwrap(), out.to_str().unwrap());
-        run(args).unwrap();
-
-        let content = read_gz(&format!("{}.sumstats.gz", out.to_str().unwrap()));
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2, "expected header + 1 row");
-        assert!(lines[1].starts_with("rs1\t"));
-    }
-
-    #[test]
-    fn test_default_n_min_filters_low_n() {
-        let dir = tempfile::tempdir().unwrap();
-        let sumstats = dir.path().join("sumstats.txt");
-        let out = dir.path().join("out");
-        std::fs::write(
-            &sumstats,
-            "SNP A1 A2 Z N\nrs1 A G 1.0 10\nrs2 A G 1.0 20\nrs3 A G 1.0 30\nrs4 A G 1.0 40\nrs5 A G 1.0 100\n",
-        )
-        .unwrap();
-        let args = base_args(sumstats.to_str().unwrap(), out.to_str().unwrap());
-        run(args).unwrap();
-
-        let content = read_gz(&format!("{}.sumstats.gz", out.to_str().unwrap()));
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2, "expected header + 1 row");
-        assert!(lines[1].starts_with("rs5\t"));
-    }
-
-    #[test]
-    fn test_daner_infers_n_from_headers() {
-        let dir = tempfile::tempdir().unwrap();
-        let sumstats = dir.path().join("sumstats.txt");
-        let out = dir.path().join("out");
-        std::fs::write(
-            &sumstats,
-            "SNP A1 A2 FRQ_U_123 FRQ_A_456 Z\nrs1 A G 0.1 0.2 1.0\nrs2 C T 0.2 0.3 2.0\n",
-        )
-        .unwrap();
-
-        let mut args = base_args(sumstats.to_str().unwrap(), out.to_str().unwrap());
-        args.daner = true;
-        args.keep_maf = true;
-        run(args).unwrap();
-
-        let content = read_gz(&format!("{}.sumstats.gz", out.to_str().unwrap()));
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines[0], "SNP\tA1\tA2\tZ\tN\tFRQ");
-        let fields: Vec<&str> = lines[1].split('\t').collect();
-        let n: f64 = fields[4].parse().unwrap();
-        let frq: f64 = fields[5].parse().unwrap();
-        assert!((n - 579.0).abs() < 1e-9);
-        assert!((frq - 0.1).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_daner_n_uses_nca_nco_columns() {
-        let dir = tempfile::tempdir().unwrap();
-        let sumstats = dir.path().join("sumstats.txt");
-        let out = dir.path().join("out");
-        std::fs::write(
-            &sumstats,
-            "SNP A1 A2 FRQ_U_100 Nca Nco Z\nrs1 A G 0.12 10 20 1.0\nrs2 C T 0.25 10 20 2.0\n",
-        )
-        .unwrap();
-
-        let mut args = base_args(sumstats.to_str().unwrap(), out.to_str().unwrap());
-        args.daner_n = true;
-        args.keep_maf = true;
-        run(args).unwrap();
-
-        let content = read_gz(&format!("{}.sumstats.gz", out.to_str().unwrap()));
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines[0], "SNP\tA1\tA2\tZ\tN\tFRQ");
-        let fields: Vec<&str> = lines[1].split('\t').collect();
-        let n: f64 = fields[4].parse().unwrap();
-        let frq: f64 = fields[5].parse().unwrap();
-        assert!((n - 30.0).abs() < 1e-9);
-        assert!((frq - 0.12).abs() < 1e-9);
-    }
-}

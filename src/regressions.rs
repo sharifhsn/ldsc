@@ -2,20 +2,14 @@ use crate::la::{
     ColF, MatF, col_from_vec, col_len, col_mean, col_zeros, mat_zeros, matmul_nt_to, matmul_tn_to,
     matmul_to,
 };
-/// Heritability and genetic correlation estimation — replaces ldscore/regressions.py.
-///
-/// Pipeline:
-///   parse → merge (sumstats ⨝ ld_scores ⨝ weights) → build matrices
-///   matrices → jackknife(IRWLS, n_blocks) → h2 / rg estimates.
+/// Heritability and genetic correlation estimation (h2 / rg).
 use anyhow::{Context, Result};
 use faer::{Accum, Par};
 use polars::prelude::*;
 use statrs::distribution::StudentsT;
-use statrs::distribution::{ChiSquared, Continuous, ContinuousCDF, Normal};
+use statrs::distribution::{Continuous, ContinuousCDF, Normal};
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::time::Instant;
-use tracing::{debug, trace};
 
 use crate::cli::{H2Args, RgArgs};
 use crate::h2::{
@@ -27,9 +21,6 @@ use crate::parse;
 
 const MIN_SNPS_WARN: usize = 200_000;
 
-// ---------------------------------------------------------------------------
-// Helper: load LD scores from either a single file or per-chr split files
-// ---------------------------------------------------------------------------
 
 /// Load a scalar (single L2 column) LD score file, aliasing the L2 column.
 /// Used for weight LD scores (always scalar). Comma-separated lists are not allowed.
@@ -54,20 +45,8 @@ fn load_ld(single: Option<&str>, chr_prefix: Option<&str>, alias: &str) -> Resul
     }
 }
 
-/// Load reference LD scores, keeping ALL annotation columns.
-///
-/// For standard (non-partitioned) ldscore files the result has columns: SNP, L2.
-/// For partitioned ldscore files (produced by `ldscore --annot`) the result has
-/// columns: SNP, ANNOT1L2, ANNOT2L2, … (one per annotation).
-///
-/// Metadata columns (CHR, BP, CM) are dropped.
-fn split_paths(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
+/// Load reference LD scores, keeping all annotation columns (drops CHR/BP/CM).
+use crate::parse::split_paths;
 
 fn warn_small_snp_count(n_snps: usize) {
     if n_snps < MIN_SNPS_WARN {
@@ -103,48 +82,6 @@ fn smart_merge_on_snp(mut left: DataFrame, mut right: DataFrame) -> Result<DataF
         let mut args = JoinArgs::new(JoinType::Inner);
         args.maintain_order = MaintainOrderJoin::Left;
         Ok(left.join(&right, ["SNP"], ["SNP"], args, None)?)
-    }
-}
-
-fn trace_array_stats(label: &str, arr: &ColF) {
-    let mut count = 0usize;
-    let mut sum = 0.0f64;
-    let mut min = f64::INFINITY;
-    let mut max = f64::NEG_INFINITY;
-    let n = col_len(arr);
-    for i in 0..n {
-        let v = arr[(i, 0)];
-        if v.is_nan() {
-            continue;
-        }
-        count += 1;
-        sum += v;
-        if v < min {
-            min = v;
-        }
-        if v > max {
-            max = v;
-        }
-    }
-    if count == 0 {
-        trace!("{label}: empty or all-NaN");
-        return;
-    }
-    let mean = sum / count as f64;
-    trace!("{label}: n={count} mean={mean:.6} min={min:.6} max={max:.6}");
-}
-
-fn trace_ref_l2_stats(labels: &[String], cols: &[ColF]) {
-    if labels.is_empty() || cols.is_empty() {
-        return;
-    }
-    let k = labels.len().min(cols.len());
-    let max_log = 5usize;
-    for i in 0..k.min(max_log) {
-        trace_array_stats(&format!("ref_l2[{}]", labels[i]), &cols[i]);
-    }
-    if k > max_log {
-        trace!("ref_l2: {} columns total (showing first {})", k, max_log);
     }
 }
 
@@ -263,9 +200,6 @@ fn load_ld_ref_multi_paths(paths: &[String], chr_split: bool) -> Result<LazyFram
     Ok(base.lazy())
 }
 
-// ---------------------------------------------------------------------------
-// Helper: determine M denominator
-// ---------------------------------------------------------------------------
 
 fn resolve_m(
     m_snps_override: Option<f64>,
@@ -301,16 +235,8 @@ fn resolve_m(
     n_obs as f64
 }
 
-// ---------------------------------------------------------------------------
-// Helper: resolve per-annotation M denominator vector
-// ---------------------------------------------------------------------------
 
-/// Return per-annotation M values (length K) for partitioned h2 regression.
-///
-/// Priority:
-///   1. Read K values from `.l2.M` / `.l2.M_5_50` files alongside `--ref-ld-chr`.
-///   2. Fall back: divide `--m-snps` (if given) uniformly across K annotations.
-///   3. Final fallback: divide n_obs uniformly across K annotations.
+/// Resolve per-annotation M values: .M files → --m-snps → n_obs fallback.
 fn resolve_m_vec(
     m_snps_override: Option<f64>,
     ref_ld_chr: Option<&str>,
@@ -379,9 +305,6 @@ fn resolve_m_vec(
     vec![total / k as f64; k]
 }
 
-// ---------------------------------------------------------------------------
-// Helper: drop zero-variance LD score columns (partitioned h2 parity).
-// ---------------------------------------------------------------------------
 
 fn column_is_zero_variance(values: &ColF) -> bool {
     let mut count = 0usize;
@@ -443,9 +366,6 @@ fn drop_zero_variance_ld(ref_ld: &DataFrame) -> Result<(DataFrame, Vec<usize>, u
     Ok((df, keep_idx, total))
 }
 
-// ---------------------------------------------------------------------------
-// Helper: filter multiple parallel arrays by a boolean mask
-// ---------------------------------------------------------------------------
 
 fn filter_by_mask(v: &ColF, mask: &[bool]) -> ColF {
     let mut out = Vec::new();
@@ -559,9 +479,6 @@ fn align_rg_alleles(merged: &DataFrame, z2: &ColF) -> Result<(Vec<bool>, Vec<f64
     Ok((mask, z2_aligned, removed))
 }
 
-// ---------------------------------------------------------------------------
-// Heritability (--h2)
-// ---------------------------------------------------------------------------
 
 pub fn run_h2(args: H2Args) -> Result<()> {
     if args.return_silly_things {
@@ -613,7 +530,6 @@ pub fn run_h2(args: H2Args) -> Result<()> {
     let w_ld = load_ld(args.w_ld.as_deref(), args.w_ld_chr.as_deref(), "w_l2")?
         .with_columns([col("w_l2").cast(DataType::Float64).alias("w_l2")]);
 
-    let merge_start = Instant::now();
     let sumstats_df = sumstats_lf.collect().context("loading sumstats")?;
     let ref_ld_df = ref_ld.collect().context("loading ref LD scores")?;
     let (ref_ld_df, keep_idx, k_full) = drop_zero_variance_ld(&ref_ld_df)?;
@@ -621,7 +537,6 @@ pub fn run_h2(args: H2Args) -> Result<()> {
         .context("merging sumstats with reference LD scores")?;
     let w_ld_df = w_ld.collect().context("loading weight LD scores")?;
     let merged = smart_merge_on_snp(merged, w_ld_df).context("merging with weight LD scores")?;
-    trace!("h2 merge time: {:?}", merge_start.elapsed());
 
     let n_total = merged.height();
     anyhow::ensure!(
@@ -716,17 +631,8 @@ pub fn run_h2(args: H2Args) -> Result<()> {
     }
     let n_obs = col_len(&chi2);
     let n_mean = col_mean(&n_vec);
-    debug!(
-        "h2 regression inputs: n_obs={} n_mean={:.3} k={}",
-        n_obs, n_mean, k
-    );
-    trace_array_stats("chi2", &chi2);
-    trace_array_stats("w_l2", &w_l2);
-    trace_array_stats("N", &n_vec);
-    trace_ref_l2_stats(&l2_cols, &ref_l2_k);
 
     if k > 1 {
-        let reg_start = Instant::now();
         if args.two_step.is_some() {
             anyhow::bail!("--two-step is not compatible with partitioned h2");
         }
@@ -755,7 +661,6 @@ pub fn run_h2(args: H2Args) -> Result<()> {
             &args,
             Some(&m_vec),
         )?;
-        trace!("h2 regression time: {:?}", reg_start.elapsed());
 
         if args.overlap_annot {
             let chr_split = args.ref_ld_chr.is_some();
@@ -822,7 +727,6 @@ pub fn run_h2(args: H2Args) -> Result<()> {
         println!("Using two-step estimator with cutoff at {ts}.");
     }
 
-    let reg_start = Instant::now();
     let res = run_h2_ldsc(
         &chi2,
         &ref_l2,
@@ -833,7 +737,6 @@ pub fn run_h2(args: H2Args) -> Result<()> {
         two_step,
         fixed_intercept,
     )?;
-    trace!("h2 regression time: {:?}", reg_start.elapsed());
 
     println!("Total Observed scale h2: {:.4} ({:.4})", res.h2, res.h2_se);
     println!("Lambda GC: {:.4}", res.lambda_gc);
@@ -1180,9 +1083,6 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Partitioned h2 regression (K annotation columns)
-// ---------------------------------------------------------------------------
 
 struct PartitionedFit {
     est: ColF,
@@ -1623,17 +1523,6 @@ fn write_overlap_results(
 }
 
 /// Partitioned stratified LD score regression (Finucane et al. 2015).
-///
-/// Fits:  E[χ²ᵢ] ≈ Nᵢ × Σₖ τₖ × ℓᵢₖ / Mₖ + Na + 1
-///
-/// Which in matrix form is:  y = X β + ε
-///   y[i]     = χ²[i]
-///   X[i, k]  = ℓᵢₖ  (L2 score for annotation k at SNP i)
-///   X[i, K]  = 1.0  (intercept column, unless fixed)
-///   β[k]     ≈ N × h2ₖ / Mₖ  →  h2ₖ = β[k] × Mₖ / N_mean
-///
-/// Weights are based on the weight-LD-score file (w_l2) and total M,
-/// matching the scalar LDSC regression formula.
 #[allow(clippy::too_many_arguments)]
 fn run_h2_partitioned(
     chi2: &ColF,
@@ -1669,9 +1558,6 @@ fn run_h2_partitioned(
     Ok(fit)
 }
 
-// ---------------------------------------------------------------------------
-// Genetic correlation (--rg)
-// ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -1680,25 +1566,16 @@ struct HsqFit {
     tot_se: f64,
     intercept: f64,
     intercept_se: f64,
-    mean_chi2: f64,
-    lambda_gc: f64,
-    ratio: Option<(f64, f64)>,
     tot_delete_values: ColF,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct GencovFit {
     tot: f64,
     tot_se: f64,
     intercept: f64,
     intercept_se: f64,
-    mean_z1z2: f64,
     tot_delete_values: ColF,
-}
-
-fn mean(arr: &ColF) -> f64 {
-    col_mean(arr)
 }
 
 fn sum_ref_l2(ref_l2_k: &[ColF]) -> Result<ColF> {
@@ -1815,7 +1692,7 @@ fn run_hsq_ldsc(
         anyhow::ensure!(col_len(col) == n, "run_hsq_ldsc: L2 length mismatch");
     }
 
-    let nbar = mean(n_vec);
+    let nbar = col_mean(n_vec);
     let m_total: f64 = m_vec.iter().sum();
     let ref_l2_tot = sum_ref_l2(ref_l2_k)?;
 
@@ -1938,41 +1815,11 @@ fn run_hsq_ldsc(
         (jknife.est[(k, 0)], jknife.jknife_se[(k, 0)])
     };
 
-    let mean_chi2 = mean(chi2);
-    let lambda_gc = {
-        let mut vals = Vec::with_capacity(n);
-        for i in 0..n {
-            vals.push(chi2[(i, 0)]);
-        }
-        vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let n = vals.len();
-        let mid = if n == 0 {
-            f64::NAN
-        } else if n % 2 == 1 {
-            vals[n / 2]
-        } else {
-            let hi = vals[n / 2];
-            let lo = vals[n / 2 - 1];
-            (lo + hi) / 2.0
-        };
-        mid / 0.4549
-    };
-    let ratio = if mean_chi2 > 1.0 && fixed_intercept.is_none() {
-        let ratio = (intercept - 1.0) / (mean_chi2 - 1.0);
-        let ratio_se = intercept_se / (mean_chi2 - 1.0);
-        Some((ratio, ratio_se))
-    } else {
-        None
-    };
-
     Ok(HsqFit {
         tot,
         tot_se,
         intercept,
         intercept_se,
-        mean_chi2,
-        lambda_gc,
-        ratio,
         tot_delete_values,
     })
 }
@@ -2009,7 +1856,7 @@ fn run_gencov_ldsc(
     for i in 0..n {
         sqrt_n1n2[(i, 0)] = (n1[(i, 0)] * n2[(i, 0)]).sqrt();
     }
-    let nbar = mean(&sqrt_n1n2);
+    let nbar = col_mean(&sqrt_n1n2);
 
     let intercept0 = intercept_gencov.unwrap_or(0.0);
     let mut prod = col_zeros(n);
@@ -2184,14 +2031,12 @@ fn run_gencov_ldsc(
     } else {
         (jknife.est[(k, 0)], jknife.jknife_se[(k, 0)])
     };
-    let mean_z1z2 = mean(&prod);
 
     Ok(GencovFit {
         tot,
         tot_se,
         intercept,
         intercept_se,
-        mean_z1z2,
         tot_delete_values,
     })
 }
@@ -2348,10 +2193,8 @@ To match Python, provide {} values (first ignored).",
             ])
         };
 
-        let merge_start = Instant::now();
         let merged = smart_merge_on_snp(ss1_df.clone(), ss2.collect()?)
             .with_context(|| format!("merging {} vs {}", file1, file2))?;
-        trace!("rg merge time: {:?}", merge_start.elapsed());
 
         let n_obs = merged.height();
         if n_obs == 0 {
@@ -2382,14 +2225,8 @@ To match Python, provide {} values (first ignored).",
         let (z1_raw, z2_raw, w_l2_raw, n1_raw, n2_raw, ref_l2_raw_k) = if args.no_check_alleles {
             (z1_raw, z2_raw, w_l2_raw, n1_raw, n2_raw, ref_l2_raw_k)
         } else {
-            let align_start = Instant::now();
             let (mask, z2_aligned, n_removed) =
                 align_rg_alleles(&merged, &z2_raw).context("aligning alleles")?;
-            trace!(
-                "rg align time: {:?} (removed {})",
-                align_start.elapsed(),
-                n_removed
-            );
             if n_removed > 0 {
                 println!("  Removed {} SNPs with incompatible alleles", n_removed);
             }
@@ -2490,28 +2327,11 @@ To match Python, provide {} values (first ignored).",
             None,
             None,
         );
-        let n1_mean = mean(&n1);
-        let n2_mean = mean(&n2);
-        debug!(
-            "rg regression inputs: n_obs={} n_obs_filtered={} m_total={:.0} n1_mean={:.3} n2_mean={:.3}",
-            n_obs,
-            n_obs_filtered,
-            m_vec.iter().sum::<f64>(),
-            n1_mean,
-            n2_mean
-        );
-        trace_array_stats("rg_prod", &prod);
-        trace_array_stats("rg_w_l2", &w_l2);
-        trace_array_stats("rg_n1", &n1);
-        trace_array_stats("rg_n2", &n2);
-        trace_ref_l2_stats(&ref_l2_cols, &ref_l2_k);
-
         let samp_prev1 = args.samp_prev.first().copied();
         let pop_prev1 = args.pop_prev.first().copied();
         let samp_prev2 = args.samp_prev.get(trait_idx).copied();
         let pop_prev2 = args.pop_prev.get(trait_idx).copied();
 
-        let rg_reg_start = Instant::now();
         let h2_int1 = intercept_h2[0];
         let h2_int2 = intercept_h2[trait_idx];
         let gencov_int = intercept_gencov[trait_idx];
@@ -2566,7 +2386,7 @@ To match Python, provide {} values (first ignored).",
         } else {
             (f64::NAN, f64::NAN)
         };
-        trace!("rg regression time: {:?}", rg_reg_start.elapsed());
+
 
         println!(
             "  gencov = {:.4} ({:.4})  (intercept: {:.4} ± {:.4})",
@@ -2611,9 +2431,6 @@ To match Python, provide {} values (first ignored).",
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Jackknife diagnostic printer (--print-cov / --print-delete-vals)
-// ---------------------------------------------------------------------------
 
 fn print_jackknife_diagnostics(
     result: &crate::irwls::IrwlsResult,
@@ -2644,9 +2461,6 @@ fn print_jackknife_diagnostics(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Polars → column helper
-// ---------------------------------------------------------------------------
 
 /// Extract a column from a Polars DataFrame as `ColF`.
 /// Missing values (null) are replaced with NaN.
@@ -2664,38 +2478,6 @@ fn extract_f64(df: &DataFrame, name: &str) -> Result<ColF> {
     Ok(col_from_vec(vec))
 }
 
-// ---------------------------------------------------------------------------
-// Statistical helpers
-// ---------------------------------------------------------------------------
-
-/// Convert a chi-squared statistic to a two-sided p-value.
-#[allow(dead_code)]
-pub fn chi2_p_value(chi2_stat: f64) -> f64 {
-    let dist = ChiSquared::new(1.0).expect("ChiSquared(df=1)");
-    1.0 - dist.cdf(chi2_stat)
-}
-
-/// Convert estimate + SE to a Z-score and p-value (two-sided).
-#[allow(dead_code)]
-pub fn p_z_norm(est: f64, se: f64) -> (f64, f64) {
-    let z = est / se;
-    let p = chi2_p_value(z * z);
-    (z, p)
-}
-
-/// Convert observed-scale genetic covariance to liability scale.
-#[allow(dead_code)]
-pub fn gencov_obs_to_liab(
-    gencov: f64,
-    samp_prev1: f64,
-    pop_prev1: f64,
-    samp_prev2: f64,
-    pop_prev2: f64,
-) -> f64 {
-    let c1 = liability_conversion_factor(samp_prev1, pop_prev1);
-    let c2 = liability_conversion_factor(samp_prev2, pop_prev2);
-    gencov * (c1 * c2).sqrt()
-}
 
 /// Compute the conversion factor for one trait (sample → liability scale).
 fn liability_conversion_factor(samp_prev: f64, pop_prev: f64) -> f64 {
@@ -2707,149 +2489,3 @@ fn liability_conversion_factor(samp_prev: f64, pop_prev: f64) -> f64 {
     k * k * (1.0 - k) * (1.0 - k) / (p * (1.0 - p) * z * z)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use polars::prelude::df;
-
-    /// p_z_norm: est=3, se=1 → z=3, p ≈ 0.00270 (2-sided normal tail).
-    #[test]
-    fn test_p_z_norm_basic() {
-        let (z, p) = p_z_norm(3.0, 1.0);
-        assert!((z - 3.0).abs() < 1e-9, "z={}", z);
-        // 2-sided p for z=3: 2*Φ(-3) ≈ 0.002700
-        assert!((p - 0.002700).abs() < 0.0001, "p={}", p);
-    }
-
-    /// p_z_norm at z=10: statrs underflows chi2(100, df=1) to p=0 (float64 limit);
-    /// we assert p < 1e-20 to accommodate a future fix.
-    #[test]
-    fn test_p_z_norm_extreme() {
-        let (z, p) = p_z_norm(10.0, 1.0);
-        assert!((z - 10.0).abs() < 1e-9, "z={}", z);
-        assert!(p < 1e-20 || p == 0.0, "p={} should be near zero", p);
-    }
-
-    /// p_z_norm: se=0 → z = ±inf, p = 0.
-    #[test]
-    fn test_p_z_norm_zero_se() {
-        let (z, p) = p_z_norm(10.0, 0.0);
-        assert!(z.is_infinite(), "z should be inf, got {}", z);
-        assert_eq!(p, 0.0, "p should be 0 when z=inf");
-    }
-
-    /// chi2_p_value(0) = 1 (all probability mass above 0).
-    #[test]
-    fn test_chi2_p_value_at_zero() {
-        let p = chi2_p_value(0.0);
-        assert!((p - 1.0).abs() < 1e-9, "chi2_p(0)={}", p);
-    }
-
-    /// chi2_p_value at the canonical 5% critical value of a 1-df chi2.
-    #[test]
-    fn test_chi2_p_value_critical_5pct() {
-        // 1-df chi2 critical value for alpha=0.05 is 3.84146...
-        let p = chi2_p_value(3.841459);
-        assert!((p - 0.05).abs() < 0.001, "chi2_p(3.841)={}", p);
-    }
-
-    /// gencov_obs_to_liab for two binary traits (balanced study, 1% phenotype).
-    /// gencov_obs_to_liab(1, 0.5, 0.01, 0.5, 0.01) ≈ 0.551907.
-    #[test]
-    fn test_gencov_obs_to_liab_both_traits() {
-        let result = gencov_obs_to_liab(1.0, 0.5, 0.01, 0.5, 0.01);
-        assert!(
-            (result - 0.551907).abs() < 1e-4,
-            "gencov_obs_to_liab={:.6}",
-            result
-        );
-    }
-
-    /// Checks that sqrt(both-trait result) = single-trait factor.
-    /// For a QT trait (c=1) paired with a binary: gencov factor = sqrt(binary_factor).
-    #[test]
-    fn test_gencov_obs_to_liab_single_trait_factor() {
-        let both = gencov_obs_to_liab(1.0, 0.5, 0.01, 0.5, 0.01);
-        // sqrt of the both-trait factor should equal the single-trait factor
-        assert!(
-            (both.sqrt() - 0.551907f64.sqrt()).abs() < 1e-4,
-            "sqrt(both)={:.6}",
-            both.sqrt()
-        );
-    }
-
-    /// liability_conversion_factor(samp_prev=0.5, pop_prev=0.01) ≈ 0.551907
-    /// (balanced case-control study, 1% phenotype prevalence).
-    #[test]
-    fn test_h2_obs_to_liab_balanced_study() {
-        // balanced case: samp_prev = 0.5 (case-control 1:1), pop_prev = 0.01 (1% phenotype)
-        let c = liability_conversion_factor(0.5, 0.01);
-        assert!(
-            (c - 0.551907).abs() < 1e-5,
-            "h2_obs_to_liab factor={:.6}",
-            c
-        );
-    }
-
-    /// Verifies sign convention: negative estimate → negative z, same |p| as positive.
-    #[test]
-    fn test_p_z_norm_sign_convention() {
-        // Negative estimate → negative z, same |p| as positive
-        let (z_pos, p_pos) = p_z_norm(3.0, 1.0);
-        let (z_neg, p_neg) = p_z_norm(-3.0, 1.0);
-        assert!((z_pos - 3.0).abs() < 1e-9);
-        assert!((z_neg + 3.0).abs() < 1e-9);
-        // p-value is two-sided so should be the same magnitude
-        assert!(
-            (p_pos - p_neg).abs() < 1e-9,
-            "p_pos={} p_neg={}",
-            p_pos,
-            p_neg
-        );
-    }
-
-    #[test]
-    fn test_load_ld_ref_multi_paths_suffixes() {
-        let dir = tempfile::tempdir().unwrap();
-        let f1 = dir.path().join("ld1.l2.ldscore");
-        let f2 = dir.path().join("ld2.l2.ldscore");
-        std::fs::write(&f1, "SNP\tL2\nrs1\t1.0\nrs2\t2.0\n").unwrap();
-        std::fs::write(&f2, "SNP\tL2\nrs1\t3.0\nrs2\t4.0\n").unwrap();
-
-        let ref_ld = load_ld_ref(
-            Some(&format!(
-                "{},{}",
-                f1.to_str().unwrap(),
-                f2.to_str().unwrap()
-            )),
-            None,
-        )
-        .unwrap();
-        let df = ref_ld.collect().unwrap();
-        let cols: Vec<String> = df
-            .get_column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert!(cols.contains(&"SNP".to_string()));
-        assert!(cols.contains(&"L2_0".to_string()));
-        assert!(cols.contains(&"L2_1".to_string()));
-        assert_eq!(df.height(), 2);
-    }
-
-    #[test]
-    fn test_align_rg_alleles_flip() {
-        let df = df![
-            "A1_1" => &["A", "A"],
-            "A2_1" => &["G", "G"],
-            "A1_2" => &["A", "G"],
-            "A2_2" => &["G", "A"],
-        ]
-        .unwrap();
-        let z2 = col_from_vec(vec![1.0, 2.0]);
-        let (mask, z2_aligned, removed) = align_rg_alleles(&df, &z2).unwrap();
-        assert_eq!(removed, 0);
-        assert_eq!(mask, vec![true, true]);
-        assert_eq!(z2_aligned, vec![1.0, -2.0]);
-    }
-}

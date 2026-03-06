@@ -52,7 +52,7 @@ PY_CMD=(uv run --project "$PY_PROJECT")
 if [[ -n "$PY_WITH" ]]; then
   PY_CMD+=(--with "$PY_WITH")
 fi
-PY_CMD+=(python "$PY_PROJECT/ldsc.py" --l2 --bfile "$BFILE" --out "$PY_OUT" --ld-wind-cm "$LD_WIND_CM" --chunk-size "$CHUNK_SIZE" --extract "$EXTRACT_FILE" --yes-really --log-level warn)
+PY_CMD+=(python "$PY_PROJECT/ldsc.py" --l2 --bfile "$BFILE" --out "$PY_OUT" --ld-wind-cm "$LD_WIND_CM" --chunk-size "$CHUNK_SIZE" --extract "$EXTRACT_FILE" --yes-really)
 RS_CMD=("$RUST_BIN" l2 --bfile "$BFILE" --out "$RS_OUT" --ld-wind-cm "$LD_WIND_CM" --chunk-size "$CHUNK_SIZE" --extract "$EXTRACT_FILE" --yes-really)
 
 run_timed() {

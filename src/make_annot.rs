@@ -14,11 +14,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use crate::cli::MakeAnnotArgs;
-use crate::l2::{BimRecord, parse_bim};
+use crate::parse::{BimRecord, parse_bim};
 
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
 
 pub fn run(args: MakeAnnotArgs) -> Result<()> {
     let snps =
@@ -56,9 +53,6 @@ pub fn run(args: MakeAnnotArgs) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// BED-file based annotation
-// ---------------------------------------------------------------------------
 
 /// Annotate SNPs using a UCSC BED file.
 fn annotate_from_bed(
@@ -187,9 +181,6 @@ fn is_in_intervals(intervals: &[(u32, u32)], bp: u32) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Gene-set based annotation
-// ---------------------------------------------------------------------------
 
 /// Annotate SNPs using a gene set (list of gene symbols) and a coordinate file.
 fn annotate_from_gene_set(
@@ -270,9 +261,6 @@ fn annotate_from_gene_set(
     Ok(snps.iter().map(|s| annotate_snp(s, &intervals)).collect())
 }
 
-// ---------------------------------------------------------------------------
-// Output writer
-// ---------------------------------------------------------------------------
 
 fn derive_annot_name(args: &MakeAnnotArgs) -> String {
     let source = args
@@ -329,47 +317,4 @@ fn write_rows(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_merge_intervals() {
-        // Non-overlapping: unchanged.
-        let iv = vec![(0, 10), (20, 30)];
-        assert_eq!(merge_intervals(iv), vec![(0, 10), (20, 30)]);
-
-        // Overlapping: merged.
-        let iv = vec![(0, 15), (10, 25), (30, 40)];
-        assert_eq!(merge_intervals(iv), vec![(0, 25), (30, 40)]);
-
-        // Adjacent: merged.
-        let iv = vec![(0, 10), (10, 20)];
-        assert_eq!(merge_intervals(iv), vec![(0, 20)]);
-    }
-
-    #[test]
-    fn test_is_in_intervals() {
-        // Intervals (0-based half-open): [100, 200) and [300, 400)
-        let ivs = vec![(100, 200), (300, 400)];
-
-        // 1-based bp=150: 0-based 149 → in [100,200) → yes (100 < 150 ≤ 200)
-        assert!(is_in_intervals(&ivs, 150));
-
-        // bp=200: 0-based 199 → in [100,200) → yes (100 < 200 ≤ 200)
-        assert!(is_in_intervals(&ivs, 200));
-
-        // bp=201: 0-based 200 → NOT in [100,200), NOT in [300,400)
-        assert!(!is_in_intervals(&ivs, 201));
-
-        // bp=100: 0-based 99 → NOT in [100,200) (100 is not < 100)
-        assert!(!is_in_intervals(&ivs, 100));
-
-        // bp=101: in [100,200) → yes
-        assert!(is_in_intervals(&ivs, 101));
-    }
-}

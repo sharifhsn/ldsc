@@ -223,24 +223,40 @@ ldsc cts-annot \
 
 Native builds require Rust ≥ 1.85. The Rust implementation uses `faer` for dense linear algebra.
 
-### Optional fast-f32 build (experimental)
+### Fast f32 mode (experimental)
 
-The `fast-f32` feature compiles `l2` to run core matmuls in `f32` while accumulating
-in `f64`. This can be faster but **is not parity-safe** compared to the default `f64`
-path.
+Pass `--fast-f32` to `ldsc l2` to run core matmuls in f32 while accumulating
+in f64. This roughly halves memory for GEMM buffers and can be ~1.5x faster on CPUs
+with 256-bit SIMD. It is **not parity-safe** compared to the default f64 path.
 
 Observed differences on full 1000G (Phase 3, `--ld-wind-kb 1000`, `--chunk-size 200`):
 - Speedup: ~1.44x (f32 vs f64)
-- Output deltas: `mean_abs_diff=3.03e-4`, `rmse=5.79e-4`, `max_abs_diff=0.008`,
-  `max_rel_diff=6.51e-4` (relative to f64)
-
-Build:
+- Output deltas: `max_abs_diff=0.001` (relative to f64)
 
 ```bash
-cargo build --release --features fast-f32
+# f32 matmul (runtime flag, no rebuild needed)
+ldsc l2 --bfile … --out … --fast-f32
+
+# default f64 (parity-safe)
+ldsc l2 --bfile … --out …
 ```
 
-Default build (parity-safe f64):
+### Optional GPU acceleration (experimental)
+
+Build with `--features gpu` to enable CUDA-accelerated matrix multiplication via
+[CubeCL](https://github.com/tracel-ai/cubecl). Requires a CUDA toolkit at build time.
+
+```bash
+cargo build --release --features gpu
+ldsc l2 --bfile … --out … --gpu
+```
+
+At 1000G scale (n=2,490), GPU is transfer-bound and slower than CPU. GPU acceleration
+targets biobank-scale cohorts (n >= 50k) where each chunk's GEMM is large enough for
+compute to dominate PCIe transfer. Use `--gpu-tile-cols N` to split large window
+matrices into VRAM-fitting tiles.
+
+Default build (CPU only):
 
 ```bash
 cargo build --release
@@ -473,7 +489,12 @@ src/
 ├── main.rs          Clap dispatch — parses CLI, calls into subcommand modules.
 │
 ├── cli.rs           All argument structs (MungeArgs, L2Args, H2Args, RgArgs,
-│                    MakeAnnotArgs). No logic — pure clap derive macros.
+│                    MakeAnnotArgs, CtsAnnotArgs). No logic — pure clap derive macros.
+│
+├── gpu.rs           [cfg(feature = "gpu")] CUDA matmul via CubeCL/cubek-matmul.
+│                    · GpuContext — holds ComputeClient + Strategy
+│                    · matmul_tn — A^T × B single-shot GPU GEMM
+│                    · matmul_tn_tiled — tiled variant for VRAM-limited windows
 │
 ├── parse.rs         File I/O helpers:
 │                    · scan_sumstats / scan_ldscore  → Polars LazyFrame
@@ -495,8 +516,9 @@ src/
 │                    · load_individual_indices — --keep FID/IID file → isize indices
 │                    · WindowMode — Cm / Kb / Snp enum
 │                    · get_block_lefts_f64, get_block_lefts_snp — window boundaries
-│                    · normalize_col — impute NaN → mean, centre, unit-variance (f32)
-│                    · compute_ldscore_global — ring-buffer DGEMM loop (sequential,
+│                    · GemmBufs — enum holding f32 or f64 scratch buffers (--fast-f32)
+│                    · normalize_col — impute NaN → mean, centre, unit-variance
+│                    · compute_ldscore_global — ring-buffer GEMM loop (sequential,
 │                      scalar and partitioned paths share the same pre-alloc buffers)
 │                    · r2_unbiased — r² − (1−r²)/(n−2)
 │                    · write_ldscore_refs — gzip TSV output
@@ -563,8 +585,10 @@ make_annot.rs        BED → 0/1 annotation generator.
 | `rayon` | 1 | data-parallel jackknife blocks |
 | `statrs` | 0.18 | Normal CDF/quantile for P→Z conversion |
 | `clap` | 4 | derive-macro CLI argument parsing |
-| `anyhow` / `thiserror` | 1 / 2 | error propagation |
+| `anyhow` | 1 | error propagation |
 | `flate2` | 1 | gzip output for .sumstats.gz and .ldscore.gz |
+| `cubecl` | 0.10 | (optional, `gpu` feature) multi-backend GPU compute |
+| `cubek-matmul` | 0.2 | (optional, `gpu` feature) autotuned GPU matmul |
 
 ---
 
