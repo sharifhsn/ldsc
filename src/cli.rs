@@ -273,6 +273,12 @@ pub struct L2Args {
     #[arg(long)]
     pub gpu_tile_cols: Option<usize>,
 
+    /// Use flex32 (f32 upload, f16 in GPU shared memory, f32 accumulation) for GPU
+    /// matrix multiplication. The GPU converts f32→f16 internally with zero CPU
+    /// overhead, exploiting tensor cores for ~2× throughput. Requires --gpu.
+    #[arg(long)]
+    pub gpu_flex32: bool,
+
     /// Use f32 instead of f64 for the genotype GEMM (normalization and r2_unbiased
     /// remain f64). Roughly halves memory for the ring buffer and scratch matrices
     /// and can be ~1.5× faster on CPUs with 256-bit SIMD. Max LD score error is

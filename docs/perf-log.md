@@ -478,3 +478,36 @@ than CPU, with f16 potentially reaching ~8-10× by halving transfer overhead.
   shape [2,2]); `extract_result()` handles this correctly.
 - Build: `cargo build --release --features gpu` requires CUDA toolkit.
   Default build (`cargo build --release`) is completely unaffected.
+
+## 2026-03-06 (runtime f32, GPU f16 via half crate)
+- Change: converted `fast-f32` from compile-time feature to runtime `--fast-f32` CLI flag. Added `--gpu-f16` flag using `half::f16` for GPU matmul (f16 inputs, f32 accumulation via tensor cores, f16 output widened to f32). Added `half = "2"` as optional dep under `gpu` feature.
+- Machine: Ryzen 5 5600X (6C/12T) + NVIDIA GeForce RTX 2070 SUPER (8 GB VRAM).
+
+### chr1 whole-chromosome (137,124 SNPs, n=2,490, --ld-wind-cm 1)
+
+| Mode | Wall | User | Sys | vs CPU f64 |
+|------|------|------|-----|------------|
+| CPU f64 | **5m18s** | 54m00s | 0m18s | 1.0× |
+| CPU f32 (--fast-f32) | **3m24s** | 31m15s | 0m11s | 1.56× |
+| GPU f32 (--gpu) | 10m37s | 5m36s | 6m16s | 0.50× |
+| GPU f16 (--gpu --gpu-f16) | 12m43s | 7m47s | 6m01s | 0.42× |
+| GPU flex32 (--gpu --gpu-flex32) | 10m07s | — | — | 0.60× |
+
+### Parity (vs CPU f64 baseline, 137,124 SNPs)
+
+| Mode | max_abs_diff | mean_abs_diff | mean_rel_err |
+|------|-------------|--------------|-------------|
+| CPU f32 | 0.001 | — | — |
+| GPU f32 | 0.003 | — | — |
+| GPU f16 (removed) | 3.504 | 0.139 | 0.024% |
+| GPU flex32 | 0.003 | 0.000121 | 0.0000% |
+
+- L2 range on chr1 whole-window: [-3.7, 6040.8], median 736.9
+- GPU f16 worst SNP: rs7549549, cpu64=5277.58, gpu16=5274.08 (abs_diff=3.50, rel=0.066%)
+- GPU f16 relative error is small (median 0.024%, p95 0.065%) but absolute error grows with L2 magnitude because f16 has only ~3 decimal digits of precision
+
+### Analysis
+- **GPU f16 was slower than GPU f32 at n=2,490** (12m43s vs 10m37s). The f32→f16 conversion on CPU added ~2 min overhead. Replaced with flex32.
+- **GPU flex32 eliminates CPU-side conversion**: uploads f32, GPU converts to f16 in shared memory, accumulates in f32, outputs f32. 30s faster than old GPU f16 (607s vs 763s) with GPU f32-equivalent parity (max_abs_diff=0.003).
+- **CPU f32 is fastest** at 1000G scale (1.56× over f64) because the GEMM is compute-bound on CPU with 12-thread rayon parallelism, and f32 doubles SIMD throughput.
+- **GPU value proposition**: at biobank scale (n≥50k), GPU flex32 halves register/shared-memory usage (fitting larger tiles) and exploits tensor cores. At n=2,490, PCIe transfer dominates and GPU is slower than CPU.

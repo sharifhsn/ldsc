@@ -1,6 +1,6 @@
 [package]
 name          = "ldsc"
-version       = "0.3.0"
+version       = "0.3.1"
 edition       = "2024"
 description   = "LD Score Regression — fast Rust reimplementation of Bulik-Sullivan et al. LDSC"
 license       = "GPL-3.0-only"

@@ -324,6 +324,7 @@ fn compute_ldscore_global(
     yes_really: bool,
     _use_gpu: bool,
     _gpu_tile_cols: Option<usize>,
+    _gpu_flex32: bool,
     use_f32: bool,
 ) -> Result<(MatF, Vec<f64>)> {
     let m = all_snps.len();
@@ -546,7 +547,13 @@ fn compute_ldscore_global(
                         if let Some(ref ctx) = gpu_ctx {
                             let b_f32 = mat_to_col_major_f32_from_f32(b_slice, n_indiv, c);
                             let gpu_result = if let Some(tc) = _gpu_tile_cols {
-                                ctx.matmul_tn_tiled(&b_f32, n_indiv, c, &b_f32, c, tc)
+                                if _gpu_flex32 {
+                                    ctx.matmul_tn_tiled_flex32(&b_f32, n_indiv, c, &b_f32, c, tc)
+                                } else {
+                                    ctx.matmul_tn_tiled(&b_f32, n_indiv, c, &b_f32, c, tc)
+                                }
+                            } else if _gpu_flex32 {
+                                ctx.matmul_tn_flex32(&b_f32, n_indiv, c, &b_f32, c)
                             } else {
                                 ctx.matmul_tn(&b_f32, n_indiv, c, &b_f32, c)
                             };
@@ -577,7 +584,13 @@ fn compute_ldscore_global(
                         if let Some(ref ctx) = gpu_ctx {
                             let b_f32 = mat_to_col_major_f32_from_f64(b_slice, n_indiv, c);
                             let gpu_result = if let Some(tc) = _gpu_tile_cols {
-                                ctx.matmul_tn_tiled(&b_f32, n_indiv, c, &b_f32, c, tc)
+                                if _gpu_flex32 {
+                                    ctx.matmul_tn_tiled_flex32(&b_f32, n_indiv, c, &b_f32, c, tc)
+                                } else {
+                                    ctx.matmul_tn_tiled(&b_f32, n_indiv, c, &b_f32, c, tc)
+                                }
+                            } else if _gpu_flex32 {
+                                ctx.matmul_tn_flex32(&b_f32, n_indiv, c, &b_f32, c)
                             } else {
                                 ctx.matmul_tn(&b_f32, n_indiv, c, &b_f32, c)
                             };
@@ -713,7 +726,15 @@ fn compute_ldscore_global(
                                 let a_f32 = mat_to_col_major_f32_from_f32(a_view, n_indiv, w);
                                 let b_f32 = mat_to_col_major_f32_from_f32(b_sl, n_indiv, c);
                                 let gpu_result = if let Some(tc) = _gpu_tile_cols {
-                                    ctx.matmul_tn_tiled(&a_f32, n_indiv, w, &b_f32, c, tc)
+                                    if _gpu_flex32 {
+                                        ctx.matmul_tn_tiled_flex32(
+                                            &a_f32, n_indiv, w, &b_f32, c, tc,
+                                        )
+                                    } else {
+                                        ctx.matmul_tn_tiled(&a_f32, n_indiv, w, &b_f32, c, tc)
+                                    }
+                                } else if _gpu_flex32 {
+                                    ctx.matmul_tn_flex32(&a_f32, n_indiv, w, &b_f32, c)
                                 } else {
                                     ctx.matmul_tn(&a_f32, n_indiv, w, &b_f32, c)
                                 };
@@ -773,7 +794,15 @@ fn compute_ldscore_global(
                                 let a_f32 = mat_to_col_major_f32_from_f64(a_view, n_indiv, w);
                                 let b_f32 = mat_to_col_major_f32_from_f64(b_sl, n_indiv, c);
                                 let gpu_result = if let Some(tc) = _gpu_tile_cols {
-                                    ctx.matmul_tn_tiled(&a_f32, n_indiv, w, &b_f32, c, tc)
+                                    if _gpu_flex32 {
+                                        ctx.matmul_tn_tiled_flex32(
+                                            &a_f32, n_indiv, w, &b_f32, c, tc,
+                                        )
+                                    } else {
+                                        ctx.matmul_tn_tiled(&a_f32, n_indiv, w, &b_f32, c, tc)
+                                    }
+                                } else if _gpu_flex32 {
+                                    ctx.matmul_tn_flex32(&a_f32, n_indiv, w, &b_f32, c)
                                 } else {
                                     ctx.matmul_tn(&a_f32, n_indiv, w, &b_f32, c)
                                 };
@@ -1543,6 +1572,7 @@ pub fn run(args: L2Args) -> Result<()> {
         args.yes_really,
         args.gpu,
         args.gpu_tile_cols,
+        args.gpu_flex32,
         args.fast_f32,
     )
     .context("computing LD scores")?;
