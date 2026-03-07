@@ -21,6 +21,9 @@ exclude       = [
   "ldsc.wiki/*",
   "ldsc_py/*",
   "bed-reader/*",
+  "cubecl/*",
+  "docs/ldsc_paper.md",
+  "docs/ldsc_supplementary_note.md",
 ]
 
 [dependencies]
