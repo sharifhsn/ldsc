@@ -511,3 +511,350 @@ than CPU, with f16 potentially reaching ~8-10× by halving transfer overhead.
 - **GPU flex32 eliminates CPU-side conversion**: uploads f32, GPU converts to f16 in shared memory, accumulates in f32, outputs f32. 30s faster than old GPU f16 (607s vs 763s) with GPU f32-equivalent parity (max_abs_diff=0.003).
 - **CPU f32 is fastest** at 1000G scale (1.56× over f64) because the GEMM is compute-bound on CPU with 12-thread rayon parallelism, and f32 doubles SIMD throughput.
 - **GPU value proposition**: at biobank scale (n≥50k), GPU flex32 halves register/shared-memory usage (fitting larger tiles) and exploits tensor cores. At n=2,490, PCIe transfer dominates and GPU is slower than CPU.
+
+## 2026-03-07 (micro-optimization batch)
+- Changes applied (all bit-identical output, max_abs_diff=0):
+  1. **normalize_col_f32 scratch buffer reuse**: pre-allocate `Vec<f64>` once, reuse across all SNPs (was allocating per-SNP)
+  2. **faer copy_from for ring buffer stores**: replaced element-wise `for i in 0..n { ring[(i,slot)] = b[(i,j)] }` with `submatrix_mut().copy_from(submatrix())`
+  3. **faer copy_from for window gather**: same pattern for A-buffer assembly from ring buffer
+  4. **Pre-inverted n**: `* n_inv` instead of `/ n` in r² unbiased transform
+  5. **mat_add_in_place loop order**: swapped to column-major-friendly (j outer, i inner) in `la.rs`
+  6. **mat_copy_from**: now delegates to faer builtin `dst.copy_from(src)`
+  7. **Par::Seq for jackknife**: small matmuls in h2.rs jackknife_fast use `Par::Seq` instead of `Par::rayon(0)`
+  8. **lambda_gc quickselect**: `select_nth_unstable` (O(n)) instead of full sort (O(n log n))
+  9. **--verbose-timing flag**: lightweight `std::time::Instant` instrumentation gated behind CLI flag (no runtime cost when disabled)
+- **Rejected**: `target-cpu=native` — caused 2-4× regression because faer does runtime CPU feature detection via cpuid; compile-time native codegen interferes with faer's internal SIMD dispatch. Documented in `.cargo/config.toml`.
+- **Skipped**: double-copy elimination in column normalization — complex borrow restructuring for ~1% gain.
+
+### Hyperfine: stable vs nightly+perf (full 1000G, --ld-wind-kb 1000, --chunk-size 200)
+
+| Binary | Mean | σ | Min | Max | User |
+|--------|------|---|-----|-----|------|
+| stable (rustc 1.94.0) | **85.4s** | 1.2s | 84.2s | 86.6s | 486.7s |
+| nightly+perf (1.96.0, faer nightly, polars performant, zlib-rs) | 87.7s | 0.6s | 87.3s | 88.4s | 498.8s |
+
+- Warmup: 1 run, timed: 3 runs each.
+- **Nightly+perf is 3% slower** — faer `nightly` feature consistently regresses (confirmed both 03-04 and 03-07). Polars `nightly` feature fails to compile on current nightly (missing `LaneCount` in `simd`). Polars `performant` and flate2 `zlib-rs` had negligible effect.
+- **Recommendation: stay on stable, no nightly features.**
+
+### Hyperfine: f64 vs fast-f32 (full 1000G, --ld-wind-kb 1000, --chunk-size 200)
+
+| Mode | Mean | σ | Min | Max | User |
+|------|------|---|-----|-----|------|
+| Rust f64 | 83.8s | 12.2s | 75.9s | 97.8s | 477.7s |
+| Rust f32 (`--fast-f32`) | **66.3s** | 3.3s | 62.7s | 69.2s | 293.7s |
+
+- Warmup: 1 run, timed: 3 runs each.
+- **f32 is 1.26× faster** with notably lower variance (f64 75–98s vs f32 63–69s).
+- f64 high variance likely due to thermal throttling on longer runs; f32 finishes before throttling onset.
+- f32 is **not bit-exact** with Python: `max_abs_diff=0.008`, `mean_abs_diff=0.000303`, `max_rel_diff=0.065%` (from earlier 03-04 testing on same dataset).
+
+### Headline: Python vs Rust, full 1000G (1,664,852 SNPs, 2,490 indiv, --ld-wind-kb 1000)
+- Machine: Ryzen 5 5600X (6C/12T), 32 GB RAM
+- Python (hyperfine, 1 run): **1548.5s** (25m49s wall, 25m35s user)
+- Rust f64 (hyperfine, 3 runs): **85.4s ± 1.2s** (8m07s user) — **18× speedup**, `max_abs_diff=0` ✓
+- Rust f32 (hyperfine, 3 runs): **66.3s ± 3.3s** (4m54s user) — **23× speedup**, `max_abs_diff=0.008`
+
+## Skip MAF prefilter when --maf absent (2026-03-08)
+
+- **Change**: `if maf_pre {` → `if maf_pre && (args.maf.is_some() || pq_exp.is_some()) {` in `run_ldscore`
+- **Rationale**: Python fuses MAF filtering with the single BED load (free). Rust was doing a separate full BED pass (~4s) that removes ~0 SNPs from well-filtered data (1000G common_norel). When `--maf` is not set, the threshold is 0.0 and only monomorphic/all-het SNPs are removed — essentially none in 1000G. `normalize_col_f64` already handles zero-variance columns correctly (all-zeros after centering, no NaN).
+- **Result** (hyperfine, 1 warmup + 3 runs, full 1000G, --ld-wind-kb 1000): **77.9s ± 6.6s**
+  - vs prior baseline 85.4s ± 1.2s → improvement, but high variance (thermal); see PGO entry below for true combined baseline
+- **Correctness**: output identical for 1000G (no SNPs removed by prefilter). When `--maf` is set, prefilter still runs as before.
+
+## PGO (Profile-Guided Optimization) on MAF-fix binary (2026-03-08)
+
+- **Script**: `scripts/build_pgo.sh` — instruments binary, runs full 1000G workload to collect profiles, merges with `llvm-profdata`, rebuilds.
+- **Result** (hyperfine, 1 warmup + 3 runs, full 1000G, --ld-wind-kb 1000): **80.7s ± 1.3s**
+  - vs original 85.4s ± 1.2s → **~5.5s improvement (6.4%)** total from MAF fix + PGO combined
+  - Low variance (±1.3s) is the reliable combined baseline; 77.9s from MAF-only run was a noisy sample
+- **Analysis**: PGO impact is modest. faer matmul (48% of runtime) uses runtime SIMD dispatch with tight vectorized loops — PGO helps branches/indirect calls, not SIMD. Normalization loop (19%) has some NaN-check branches that benefit marginally. PGO is more impactful for workloads with irregular control flow (interpreters, web servers).
+- **Decision**: PGO not kept in normal `cargo build --release`. Use `scripts/build_pgo.sh` when maximum wall-time performance is needed. The ~6% gain doesn't justify the 2× compile time for routine development.
+- **New headline**: Rust f64 (MAF fix + PGO): **~80.7s** → **19× speedup** vs Python 1548.5s
+
+## Double-buffered BED reading via --prefetch-bed (2026-03-08)
+
+- **Change**: `compute_ldscore_global` now takes `bed_path: &str` instead of `&mut Bed`. When `--prefetch-bed` is set, spawns a background `std::thread` that reads BED chunks via `crossbeam_channel::bounded(1)`, one chunk ahead of the compute loop.
+- **Default path** (sequential): unchanged behavior, same performance as before.
+- **Prefetch path result** (hyperfine, 1 warmup + 3 runs, full 1000G, --ld-wind-kb 1000): **90.3s ± 1.3s** — a **~12% regression** vs sequential (83s).
+- **Root cause of regression**: On local SSD with warm OS page cache, BED reads are memory-bandwidth-bound (kernel copy), not I/O-wait-bound. The reader thread competes with rayon's 12-thread GEMM pool for CPU cores on a 6C/12T machine. Adding a 13th thread causes OS preemption of GEMM workers, increasing context switches and memory bandwidth contention. No true I/O blocking means no overlap benefit.
+- **Decision**: `--prefetch-bed` disabled by default. Expected benefit on GPFS/NFS cold storage (PMACS HPC, CentOS 7): BED `read_exact()` blocks on InfiniBand network, genuinely freeing CPU for GEMM. Recommended to test on HPC with first-run cold GPFS.
+- **io_uring investigated and ruled out**: CentOS 7 kernel 3.10 predates io_uring by 8 major versions (requires 5.1+). Even on supported kernels, io_uring shows no benefit for large sequential reads from warm page cache. tokio-uring crate is also stale (last release Nov 2022) and single-threaded only.
+- **Correctness**: both paths verified byte-exact vs baseline on bench_5k (all 22 chromosomes).
+
+## Remaining optimization opportunities (assessed 2026-03-07)
+
+### Timing breakdown (f64, full 1000G, --ld-wind-kb 1000, --chunk-size 200, ~85s total)
+
+| Section | Time | % | Description |
+|---------|------|---|-------------|
+| ab_dot | 31s | 36% | A^T×B GEMM + r2u + annot contribution |
+| norm | 16s | 19% | Per-SNP normalize (impute NaN, center, unit-variance) |
+| bed_read | 11s | 13% | Read BED chunks via file I/O |
+| bb_dot | 10s | 12% | B^T×B GEMM + r2u + annot contribution |
+| maf_prefilter | 4s | 5% | Extra full-BED pass to compute MAF/het stats |
+| write_outputs | 3s | 4% | Gzip 22 per-chr output files |
+| ring_store | 2s | 2% | Copy cols into ring buffer |
+| overhead | ~8s | 9% | BIM parse, alloc, block_left, etc. |
+
+### Candidates (ordered by expected impact)
+
+#### 1. Profile-Guided Optimization (PGO) — estimated 5-15% (~5-12s)
+- LLVM PGO uses runtime profiles to optimize branch prediction, function layout, and inlining.
+- Build process: `cargo build --release` with `-Cprofile-generate`, run benchmark, rebuild with `-Cprofile-use`.
+- No code changes, no correctness risk. Especially effective for loops with data-dependent branches (normalization, r2u accumulation).
+- Complexity: medium (build script only). Would need a separate build recipe or Makefile target.
+
+#### 2. Eliminate MAF prefilter BED pass — saves ~4s (5%)
+- Currently the BED file is read twice when `maf_pre=true` (default): once for MAF/het stats, once for LD computation.
+- The main loop's `normalize_col` already computes MAF as a side effect (it returns the MAF value).
+- When `--maf` is not set, the prefilter only removes all-het/missing SNPs (extremely rare in 1000G).
+- Option A: skip prefilter when `--maf` is not set; detect all-het/missing during normalize and zero the column.
+- Option B: fuse the two passes entirely (compute MAF + het stats during the first chunk pass, then re-derive block_left and restart — complex).
+- Complexity: low (option A), high (option B). No correctness risk for option A.
+
+#### 3. Double-buffered BED reading — saves up to ~11s (13%)
+- Read the next BED chunk in a background thread while computing GEMM on the current chunk.
+- bed_read (11s) and GEMM (41s) use different resources (I/O vs CPU); with pipelining, BED reading overlaps completely with compute.
+- Requires a second `Bed` file handle (or `Send`-safe reader) and channel-based synchronization.
+- Complexity: high. Risk: concurrency bugs, lifetime issues with borrowed buffers.
+
+#### 4. Fat LTO — maybe 1-3%
+- Change `lto = "thin"` to `lto = "fat"` in `[profile.release]`.
+- Enables more aggressive cross-crate inlining (faer internals, polars).
+- Increases link time (~2×) but zero code changes.
+- Complexity: trivial. Easy to A/B test with hyperfine.
+
+#### 5. Lower gzip compression level — saves ~1-2s
+- `Compression::default()` is level 6. Level 1 produces slightly larger files but writes much faster.
+- Output is 22 `.l2.ldscore.gz` files totaling ~3s write time; level 1 could halve this.
+- Complexity: trivial (one-line change). Trade-off: ~30% larger output files.
+
+#### 6. Bulk column copy in normalize — <1%
+- Lines 463-464 and 473-474 copy raw→col_buf→b_mat element-wise. Could use `copy_from_slice` on contiguous column data or `submatrix.copy_from()`.
+- Marginal gain since the inner loop is already auto-vectorized and the overhead is dwarfed by the actual normalization arithmetic.
+- Complexity: low.
+
+### Not worth pursuing
+- **Rayon thread tuning**: Already swept (6 threads optimal on 5600X, default 12 within noise).
+- **SIMD normalization**: norm is memory-bound (streaming 2490×200 matrices), not compute-bound; auto-vectorization sufficient.
+- **Chunk size > 200**: Tested 400, regressed due to L2/L3 cache pressure.
+- **Fusing r2u into GEMM**: Would fight faer's internal cache blocking strategy.
+- **f16 on CPU**: No native f16 arithmetic on x86-64 (pre-Sapphire Rapids). Widening to f32 adds overhead with no SIMD throughput gain.
+- **f16/fp8 on GPU**: At n=2,490, GPU is PCIe-transfer-bound (compute is 80× cheaper than transfer). Even fp8 (4× less transfer) only brings GPU to parity with CPU f32. And fp8 has ~1 decimal digit of precision — unusable for LD scores (L2 range 1-6000).
+- **target-cpu=native**: Confirmed 2-4× regression with faer (runtime CPU detection conflict).
+
+## 2026-03-08 — AWS Batch benchmarking pipeline + parallel output + gzip fast
+
+### Infrastructure
+- AWS Batch on EC2 Spot: c7a.4xlarge (AMD EPYC 7R13, 16 vCPUs, 8 GiB)
+- Build: `rust:1-bookworm` container (glibc 2.36), runtime: `debian:bookworm-slim`
+- Benchmark: `hyperfine --warmup 2 --runs 10`
+- Dataset: full 1000G (1,664,852 SNPs, 2,490 individuals), `--ld-wind-kb 1000 --chunk-size 200`
+
+### Changes measured (combined)
+1. **Parallel output writing**: `rayon::par_iter()` over 22 chromosomes for gzip output (was sequential)
+2. **Gzip fast compression**: `Compression::fast()` (level 1) instead of `Compression::default()` (level 6)
+
+### Results (parallel output + gzip fast, on AWS)
+```
+Mean: 73.196s ± 0.212s (10 runs)
+Range: 72.769s — 73.475s
+σ/μ: 0.29% (excellent stability)
+```
+
+### Verbose timing breakdown (single run, same hardware)
+```
+bed_read(stall)=10.223s  norm=19.705s  bb_dot=10.470s  ab_dot=27.290s  ring_store=2.167s
+compute_ldscore_total=70.074s
+write_outputs=1.135s  total=71.208s
+```
+
+| Phase | Time | % of total |
+|-------|------|-----------|
+| bed_read | 10.2s | 14.3% |
+| norm | 19.7s | 27.7% |
+| bb_dot | 10.5s | 14.7% |
+| ab_dot | 27.3s | 38.3% |
+| ring_store | 2.2s | 3.0% |
+| write_outputs | 1.1s | 1.6% |
+
+### Notes
+- Write phase is only 1.6% of total — parallel output + gzip fast savings are real but small (~1-2s)
+- Local baseline on Ryzen 5 5600X was ~83s; AWS EPYC 7R13 (16 vCPU) is ~73s (more cores for rayon)
+- The low variance (σ = 0.21s, 0.29%) confirms AWS Spot is suitable for reproducible benchmarking
+- Output file size: ~28.7 MB combined (gzip level 1) vs ~18.6 MB (level 6) — 55% larger
+- ab_dot dominates (38%); norm is second (28%) — these are the targets for further optimization
+
+## 2026-03-08 — Fat LTO A/B test on AWS
+
+### Setup
+- Same infrastructure as above (c7a.4xlarge, EPYC 7R13, 16 vCPUs)
+- Same code (parallel output + gzip fast), only change is `lto = "fat"` vs `lto = "thin"` in Cargo.toml
+- Both built inside `rust:1-bookworm` container, stripped
+
+### Results (hyperfine --warmup 2 --runs 10)
+
+| Config | Mean | σ | Min | Max | Binary size |
+|--------|------|---|-----|-----|-------------|
+| Thin LTO | 73.196s | 0.212s | 72.769s | 73.475s | 51.3 MB |
+| Fat LTO | **71.008s** | 0.386s | 70.680s | 71.867s | 49.1 MB |
+
+- **Fat LTO is 3.0% faster** (2.19s improvement, ranges don't overlap → statistically significant)
+- Binary is 4% smaller with fat LTO
+- Build time: ~10 min (fat) vs ~8.5 min (thin) — 18% longer
+- **Decision**: keep `lto = "thin"` for development iteration speed. Use fat LTO for release builds.
+- **New best**: **71.0s** on AWS EPYC → **~21.8× speedup** vs Python 1548.5s
+
+## 2026-03-08 — CentOS 7 (glibc 2.17) vs musl (static) portability benchmark
+
+### Motivation
+Target HPC (PMACS) runs CentOS 7 (glibc 2.17). Bookworm binaries require GLIBC_2.34+ and won't run there. Two options:
+1. **CentOS 7 build**: compile inside centos:7 container → dynamic binary linked against glibc 2.17
+2. **musl build**: compile with `x86_64-unknown-linux-musl` target → fully static binary, no glibc dependency
+
+### Build Details
+- CentOS 7: `centos:7` + vault repos + `rustup stable` (1.94.0). Max GLIBC symbol: GLIBC_2.16 (getauxval). Binary: 49.5 MB.
+- musl: `rust:1-alpine` + `--target x86_64-unknown-linux-musl`. `static-pie linked`. Binary: 49.1 MB.
+- Both stripped, thin LTO, codegen-units=1.
+
+### Results (AWS c7a.4xlarge, EPYC 7R13, 16 vCPUs, hyperfine --warmup 2 --runs 10)
+
+| Variant | Mean | σ | Min | Max | vs Bookworm |
+|---------|------|---|-----|-----|-------------|
+| Bookworm (baseline) | 73.196s | 0.212s | 72.769s | 73.475s | — |
+| CentOS 7 (glibc 2.17) | 71.825s | 0.168s | 71.560s | 72.052s | 1.9% faster |
+| musl (default alloc) | 81.878s | 0.109s | 81.638s | 82.045s | 11.9% slower |
+| **musl + mimalloc** | **69.897s** | 0.179s | 69.711s | 70.280s | **4.5% faster** |
+
+### Analysis
+- **musl + mimalloc is the fastest variant** at 69.9s — 4.5% faster than bookworm baseline, and the new overall best.
+- musl's default allocator is 12% slower due to single-threaded contention under rayon parallelism. mimalloc eliminates this entirely and then some.
+- CentOS 7 (glibc 2.17) is also fast at 71.8s — essentially identical to bookworm.
+- **Recommendation**: use musl + mimalloc (`--features mimalloc --target x86_64-unknown-linux-musl`) for HPC deployment. Fully static binary, runs on any Linux, and is the fastest option. Build with: `cargo build --release --features mimalloc --target x86_64-unknown-linux-musl`.
+- **New best**: **69.9s** on AWS EPYC → **~22.2× speedup** vs Python 1548.5s
+
+## 2026-03-09 — Normalize column optimization (AWS benchmark)
+
+### Changes
+1. **Eliminated col_buf intermediate buffer**: raw BED data is now copied directly into `b_mat` columns, then normalized in-place. Previously: `raw → col_buf → normalize → col_buf → b_mat` (two copies per column per chunk). Now: `raw → b_mat column → normalize in-place` (one copy).
+2. **Fused center + variance accumulation**: `normalize_col_f64` and `normalize_col_f32` now compute mean and variance in fewer passes. Center + sum-of-squares accumulated in a single loop (was separate passes). Reduces memory traffic over 2,490 elements × 1,664,852 SNPs.
+3. **Removed scratch Vec from f32 path**: `normalize_col_f32` previously allocated a `Vec<f64>` scratch buffer per SNP for f64-precision accumulation. Now uses f64 accumulators directly on f32 data without intermediate allocation.
+
+### Parity
+- Full 1000G (1,664,852 SNPs): **max_abs_diff=0** vs prior Rust baseline ✓ (bit-identical)
+
+### Results (AWS c7a.4xlarge, EPYC 7R13, 16 vCPUs, hyperfine --warmup 2 --runs 10, musl + mimalloc)
+
+| Variant | Mean | σ | Min | Max |
+|---------|------|---|-----|-----|
+| musl + mimalloc (baseline) | 69.897s | 0.179s | 69.711s | 70.280s |
+| **musl + mimalloc + norm opt** | **59.002s** | 0.180s | 58.811s | 59.351s |
+
+- **15.6% faster** (10.9s improvement)
+- Extremely low variance (σ = 0.18s, 0.31%) — confirms the gain is real
+- The norm phase was 27.7% of total (19.7s); this optimization likely cut it nearly in half
+- **New best**: **59.0s** on AWS EPYC → **~26.2× speedup** vs Python 1548.5s
+
+## 2026-03-09 — Hot path micro-optimizations (AWS benchmark)
+
+### Changes
+1. **NaN fast-path in normalize**: When no NaN in column (common for 1000G), bypass NaN branch in center+variance loop — enables SIMD auto-vectorization.
+2. **Fused raw copy + mean pass**: Combine BED→b_mat copy with mean accumulation into single pass (eliminates one full traversal per SNP).
+3. **Raw column slices**: Replace `raw[(i,j)]` (2 bounds checks/element) with `raw.col(j).as_slice()` (1 check/column).
+4. **Linearized r2_unbiased**: Pre-compute constants `r2u_a`, `r2u_b` for fixed n; inline as `r*r*a + b` (eliminate branch + function call).
+5. **Hoisted per-chunk allocations**: `bb`, `contrib_bb`, `contrib_left`, `contrib_right` allocated once before loop instead of every chunk.
+6. **Bulk ring store**: Single `submatrix_mut.copy_from` for all c columns when ring slots are contiguous.
+7. **Par::Seq for small contrib matmuls**: 6 annotation contribution matmuls (c×c @ c×n_annot) switched from `Par::rayon(0)` to `Par::Seq` — eliminates rayon thread-pool overhead on tiny matrices.
+8. **Generic fill_r2u_bb**: Replaced `&dyn Fn` (vtable dispatch per element, 166M calls) with generic `fn<F: Fn>` for monomorphization.
+
+### Parity
+- Full 1000G (1,664,852 SNPs): **max_abs_diff=0** vs Python ✓ (bit-identical)
+- Local section timing: norm **19.7s → 7.1s** (-64%)
+
+### Results (AWS c7a.4xlarge, EPYC 7R13, 16 vCPUs, hyperfine --warmup 2 --runs 10, musl + mimalloc)
+
+| Variant | Mean | σ | Min | Max |
+|---------|------|---|-----|-----|
+| musl + mimalloc + norm opt (prev) | 59.002s | 0.180s | 58.811s | 59.351s |
+| **musl + mimalloc + hot path opt** | **56.012s** | 0.177s | 55.725s | 56.284s |
+
+- **5.1% faster** (3.0s improvement), extremely low variance (σ = 0.18s)
+- Par::Seq for small matmuls was the biggest contributor (~2.4s saved from eliminating rayon overhead on 8324 × 6 tiny matmuls per run)
+- **New best**: **56.0s** on AWS EPYC → **~27.7× speedup** vs Python 1548.5s
+
+## 2026-03-09 — BED decode + normalization fusion (AWS benchmark)
+
+### Changes
+1. **BED decode 4-per-byte**: When all individuals are used (no `--keep`), process 4 individuals per byte in `decode_column` with fixed shift pattern instead of per-element `IidPos` lookup. Also uses direct slice output (`out.col_mut().as_slice_mut()`) instead of per-element matrix indexing (2→0 bounds checks/element).
+2. **Vectorizable copy+sum loop**: Removed per-element NaN branch from BED→b_mat copy loop. Unconditional sum enables auto-vectorization; NaN detected via `sum.is_nan()` after the loop (rare slow path).
+3. **Fused single-pass normalization**: Compute variance from raw moments (`var = E[X²] - E[X]²`) using sum_sq accumulated during copy. Center + scale in a single pass instead of two (center+sum_sq, then scale). Eliminates one full 20KB column traversal per SNP (1.66M SNPs).
+4. **ChunkReader (zero-alloc BED reads)**: Pre-compute iid positions, LUT, and all_iids flag once. Reuse pre-allocated `Mat<f32>` output buffer across all chunks. Eliminates per-chunk `Mat::from_fn(n_iid, c, |_,_| NAN)` allocation (2MB × 8324 chunks = 16.5GB of memset).
+
+### Parity
+- 5k extract: **max_abs_diff=0** ✓
+- 50k extract: **max_abs_diff=0** ✓
+
+### Local section timing (Ryzen 5 5600X)
+| Section | Before | After | Saved |
+|---------|--------|-------|-------|
+| bed_read | 11.6s | 8.2s | 3.4s |
+| norm | 7.1s | 4.1s | 3.0s |
+| bb_dot | 11.1s | 11.5s | — |
+| ab_dot | 32.2s | 33.0s | — |
+| ring_store | 2.0s | 2.2s | — |
+
+### Results (AWS c7a.4xlarge, EPYC 7R13, 16 vCPUs, hyperfine --warmup 2 --runs 10, musl + mimalloc)
+
+| Variant | Mean | σ | Min | Max |
+|---------|------|---|-----|-----|
+| hot path opt (prev) | 56.012s | 0.177s | 55.725s | 56.284s |
+| **+ BED decode + norm fusion** | **52.804s** | 0.144s | 52.585s | 53.021s |
+
+- **5.7% faster** (3.2s improvement)
+
+## 2026-03-09 — Sequential BED reads + column-major r2u loops (AWS benchmark)
+
+### Changes
+1. **Sequential BED reads (no per-chunk seek)**: `BufReader::seek(SeekFrom::Start)` discards its entire 8MB internal buffer — even when the target is within the buffer. For 8324 sequential chunks of 124KB each, this caused 64× read amplification (8MB filled per 124KB used = 66GB total reads for a 1GB file). Fix: seek once at start, then use `read_exact` without seeking. BufReader now works as designed.
+2. **Column-major r2u_ab loop order**: The r2u_ab fill loop iterated row-major (`for wi .. for j ..`) but faer matrices are column-major. With w=5000, c=200, each inner iteration jumped 40KB in memory (stride = 5000×8 bytes). Swapped to `for j .. for wi ..` for stride-1 sequential access. Sub-timing confirmed: r2u fill went from dominating to 0.64s of the 30.8s ab_dot section.
+3. **Column-major zeroing in fill_r2u_bb**: Same loop order fix for the r2u_bb zero-initialization.
+4. **chunks_exact_mut(4) for BED decode**: Proves to compiler that chunk is exactly 4 elements, eliminating per-element bounds checks in the 4-per-byte decode loop.
+
+### Parity
+- 5k extract: **max_abs_diff=0** ✓
+- 50k extract: **max_abs_diff=0** ✓
+
+### Local section timing (Ryzen 5 5600X)
+| Section | Before | After | Saved |
+|---------|--------|-------|-------|
+| bed_read | 8.2s | 2.0s | 6.2s |
+| norm | 4.1s | 4.1s | — |
+| bb_dot | 11.5s | 11.5s | — |
+| ab_dot | 33.0s | 30.8s | 2.2s |
+| ring_store | 2.2s | 2.1s | — |
+
+### Results (AWS c7a.4xlarge, EPYC 7R13, 16 vCPUs, hyperfine --warmup 2 --runs 10, musl + mimalloc)
+
+| Variant | Mean | σ | Min | Max |
+|---------|------|---|-----|-----|
+| BED decode + norm fusion (prev) | 52.804s | 0.144s | 52.585s | 53.021s |
+| **+ sequential reads + col-major** | **43.635s** | 0.109s | 43.476s | 43.797s |
+
+- **17.4% faster** (9.2s improvement)
+- **New best**: **43.6s** on AWS EPYC → **~35.5× speedup** vs Python 1548.5s
+- System time dropped from 20.7s → 13.2s (confirming reduced I/O syscalls from sequential read fix)
+
+## 2026-03-09 (later) — Scalar l2 fast path (REVERTED)
+
+### Change
+Replaced `matmul_to(..., Par::Seq)` for tiny c×c @ c×1 matmuls with manual scalar loops when `n_annot == 1`. The idea was to skip faer's matmul dispatch overhead (~25K calls per run). Applied to 3 sites: BB accumulation, AB-left, AB-right.
+
+### Result: REGRESSED
+- AWS: 44.526s ± 0.171s (was 43.635s ± 0.109s) → **+0.9s, 2% slower**
+- faer's `Par::Seq` matmul is SIMD-optimized even for tiny matrices; scalar indexed loops with bounds checks can't compete
+- **Reverted** — faer's internal small-matrix path is already optimal
+
+### Lesson
+Do not replace faer `Par::Seq` matmul with manual loops for small matrices. faer uses SIMD even in sequential mode.

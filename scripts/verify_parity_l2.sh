@@ -3,13 +3,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="$ROOT/perf/parity_l2"
-PY3_PROJECT="$ROOT/ldsc_py3"
 RUST_BIN="$ROOT/target/release/ldsc"
-PY3_PYTHON="${PY3_PYTHON:-3.9}"
-BFILE="${BFILE:-$ROOT/data/1000G.EUR.QC}"
+BFILE="${BFILE:-$ROOT/data/1000G_phase3_common_norel}"
 EXTRACT_N="${EXTRACT_N:-50000}"
-LD_WIND_CM="${LD_WIND_CM:-1}"
-CHUNK_SIZE="${CHUNK_SIZE:-50}"
+LD_WIND_KB="${LD_WIND_KB:-1000}"
+CHUNK_SIZE="${CHUNK_SIZE:-200}"
 
 mkdir -p "$OUT_DIR"
 
@@ -24,12 +22,6 @@ if [[ ! -x "$RUST_BIN" ]]; then
   exit 1
 fi
 
-PY_WRAPPER="$ROOT/scripts/_ldsc_wrapper.py"
-if [[ ! -f "$PY_WRAPPER" ]]; then
-  echo "Missing Python wrapper: $PY_WRAPPER" >&2
-  exit 1
-fi
-
 EXTRACT_FILE=""
 if [[ "$EXTRACT_N" != "0" ]]; then
   EXTRACT_FILE="$OUT_DIR/extract.snps"
@@ -41,14 +33,16 @@ RS_OUT="$OUT_DIR/rust_l2"
 rm -f "${PY_OUT}.l2.ldscore.gz" "${PY_OUT}.l2.M" "${PY_OUT}.l2.M_5_50"
 rm -f "${RS_OUT}"*.l2.ldscore.gz "${RS_OUT}"*.l2.M "${RS_OUT}"*.l2.M_5_50
 
-PY_CMD=(env LDSC_SCRIPT="$PY3_PROJECT/ldsc.py" uv run --python "$PY3_PYTHON" --script "$PY_WRAPPER" --l2 --bfile "$BFILE" --out "$PY_OUT" --ld-wind-cm "$LD_WIND_CM" --chunk-size "$CHUNK_SIZE")
-RS_CMD=("$RUST_BIN" l2 --bfile "$BFILE" --out "$RS_OUT" --ld-wind-cm "$LD_WIND_CM" --chunk-size "$CHUNK_SIZE")
+PY_CMD=(uv run --project "$ROOT/ldsc_py" --with "bitarray==2" python "$ROOT/ldsc_py/ldsc.py" --l2 --bfile "$BFILE" --out "$PY_OUT" --ld-wind-kb "$LD_WIND_KB" --chunk-size "$CHUNK_SIZE")
+RS_CMD=("$RUST_BIN" l2 --bfile "$BFILE" --out "$RS_OUT" --ld-wind-kb "$LD_WIND_KB" --chunk-size "$CHUNK_SIZE")
 if [[ -n "$EXTRACT_FILE" ]]; then
   PY_CMD+=(--extract "$EXTRACT_FILE")
   RS_CMD+=(--extract "$EXTRACT_FILE")
 fi
 
+echo "Running Python LDSC..."
 "${PY_CMD[@]}" >"$OUT_DIR/py3_l2.stdout" 2>&1
+echo "Running Rust LDSC..."
 "${RS_CMD[@]}" >"$OUT_DIR/rust_l2.stdout" 2>&1
 
 CMP_SCRIPT="$OUT_DIR/_compare_l2.py"
@@ -116,6 +110,6 @@ else
   fi
 fi
 
-uv run --python "$PY3_PYTHON" --script "$CMP_SCRIPT" "${PY_OUT}.l2.ldscore.gz" "${RUST_FILES[@]}"
+uv run --script "$CMP_SCRIPT" "${PY_OUT}.l2.ldscore.gz" "${RUST_FILES[@]}"
 
 echo "L2 parity check passed."

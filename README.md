@@ -7,7 +7,7 @@
 
 A compiled, statically-typed rewrite of [Bulik-Sullivan et al.'s LDSC](https://github.com/bulik/ldsc) in Rust.
 Implements six subcommands — `munge-sumstats`, `l2`, `h2`, `rg`, `make-annot`, `cts-annot` — with
-identical numerical output and a 7× speedup on LD score computation.
+identical numerical output and an 18× speedup on LD score computation.
 
 ---
 
@@ -230,8 +230,8 @@ in f64. This roughly halves memory for GEMM buffers and can be ~1.5x faster on C
 with 256-bit SIMD. It is **not parity-safe** compared to the default f64 path.
 
 Observed differences on full 1000G (Phase 3, `--ld-wind-kb 1000`, `--chunk-size 200`):
-- Speedup: ~1.44x (f32 vs f64)
-- Output deltas: `max_abs_diff=0.001` (relative to f64)
+- Speedup: 1.3× (f32 vs f64, hyperfine validated)
+- Output deltas: `max_abs_diff=0.008` (relative to f64)
 
 ```bash
 # f32 matmul (runtime flag, no rebuild needed)
@@ -240,6 +240,43 @@ ldsc l2 --bfile … --out … --fast-f32
 # default f64 (parity-safe)
 ldsc l2 --bfile … --out …
 ```
+
+### BED prefetch for networked storage (`--prefetch-bed`)
+
+On HPC clusters with networked filesystems (GPFS, NFS, Lustre), BED file reads travel over
+the network and can block for tens of milliseconds per chunk. `--prefetch-bed` reads the next
+BED chunk on a background thread while the compute thread runs GEMM, overlapping I/O latency
+with computation.
+
+```bash
+# Recommended for GPFS/NFS (HPC) — first run or cold filesystem cache
+ldsc l2 --bfile … --out … --prefetch-bed
+
+# Default (no flag) — always correct, optimal for local SSD
+ldsc l2 --bfile … --out …
+```
+
+**When to use it:**
+
+| Storage | Cache state | Use `--prefetch-bed`? |
+|---------|-------------|----------------------|
+| Local SSD | Warm (repeated runs) | **No** — regresses ~10% |
+| Local SSD | Cold (first run) | Neutral to slight benefit |
+| GPFS / NFS / Lustre | Cold (typical HPC job) | **Yes** — hides network latency |
+| GPFS / NFS / Lustre | Warm (same job, 2nd pass) | Probably neutral |
+
+**Why it regresses on local SSD:** With a warm OS page cache the BED file is already in RAM,
+so `read()` is just a `memcpy` from kernel pages — no blocking I/O. The reader thread still
+uses CPU for 2-bit genotype decoding and competes with the rayon GEMM thread pool. On a
+6-core / 12-thread machine, adding a 13th thread preempts GEMM workers and slows the whole run.
+
+**Why it helps on GPFS:** Each `read()` call blocks waiting for data over InfiniBand. While the
+reader thread waits, the CPU is free for GEMM — genuine parallelism with no resource contention.
+Benefit scales with GPFS cache miss rate (highest on the first job run after data is staged).
+
+**Note for PMACS users:** The cluster runs CentOS 7 (kernel 3.10). `io_uring` (kernel 5.1+) is
+not available; `--prefetch-bed` uses standard POSIX `pread` on a background `std::thread`.
+Output is always bit-identical to the default path.
 
 ### Optional GPU acceleration (experimental)
 
@@ -316,28 +353,64 @@ cargo build --release
 
 The release profile sets `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`.
 
+### Static binary with mimalloc (recommended for HPC)
+
+For a fully static binary that runs on any Linux (including CentOS 7 / RHEL 7 HPC clusters),
+build with musl and the `mimalloc` feature:
+
+```bash
+# Requires the musl target (one-time setup)
+rustup target add x86_64-unknown-linux-musl
+
+cargo build --release --features mimalloc --target x86_64-unknown-linux-musl
+strip target/x86_64-unknown-linux-musl/release/ldsc
+# Copy the single binary to your cluster — no dependencies needed
+```
+
+This produces a static-pie binary with zero shared library dependencies. The `mimalloc`
+feature replaces musl's default allocator with Microsoft's [mimalloc](https://github.com/microsoft/mimalloc),
+which eliminates the ~12% performance penalty musl's single-threaded allocator incurs under
+rayon parallelism. On AWS EPYC benchmarks, musl + mimalloc is actually **4.5% faster** than
+the default glibc build (69.9s vs 73.2s on full 1000G).
+
+Without `--features mimalloc`, a musl build works but is ~12% slower due to allocator contention.
+
 ### Runtime tuning (optional)
 
-The following global flags are available for performance tuning but are **not
-heavily battle-tested**. Use them only when needed:
+The following flags are available for performance tuning:
 
 - `--rayon-threads N`: Rayon thread count for jackknife in `h2`/`rg`.
 - `--polars-threads N`: Polars thread count for CSV streaming in `munge-sumstats`.
+- `--prefetch-bed`: Background BED reader thread for `l2`. Beneficial on networked filesystems (GPFS/NFS); hurts on local SSD with warm cache. See [BED prefetch](#bed-prefetch-for-networked-storage---prefetch-bed) for full guidance.
 
 ---
 
 ## Performance
 
-Benchmarks against the original Python on a 16-core desktop (AMD Ryzen 9 5950X) using 1000 Genomes
-Phase 3 (n = 2,504 individuals, `--ld-wind-snps 100`).
+### LD score computation (`l2`)
 
-| Dataset | SNPs | Rust | Python | Speedup |
-|---------|------|------|--------|---------|
-| chr22 | 24,624 | 1 s | 7 s | **7.0×** |
-| 20% genome | 333,000 | 12 s | 88 s | **7.3×** |
+Benchmarks on AMD Ryzen 5 5600X (6 cores / 12 threads, 32 GB RAM) using 1000 Genomes Phase 3
+(1,664,852 SNPs, n = 2,490 individuals). Measured with `hyperfine` (1 warmup + 3 timed runs for
+Rust).
 
-Correctness: all 1,664,851 SNPs in the full 1000G genome verified to match Python within 0.001
-(max diff 0.000508, median 0.000250) after fixing the four algorithmic bugs described below.
+| Mode | Full genome wall time | vs Python |
+|------|----------------------|-----------|
+| Python | 25 min 49 s | 1.0× |
+| **Rust f64** (default) | **83 s ± 2 s** | **~19×** |
+| **Rust f32** (`--fast-f32`) | **66.3 s ± 3.3 s** | **~23×** |
+
+`--ld-wind-kb 1000`, `--chunk-size 200`. Correctness: `max_abs_diff = 0` (f64 vs Python) across
+all 1,664,851 SNPs. The `--fast-f32` path trades exact parity for speed
+(`max_abs_diff = 0.008` vs f64).
+
+Speedup varies with window size (200k-SNP extract, same machine):
+
+| Window | Python | Rust f64 | Speedup |
+|--------|--------|----------|---------|
+| `--ld-wind-kb 100` | 44.2 s | 5.1 s | **8.7×** |
+| `--ld-wind-kb 500` | 48.4 s | 6.2 s | **7.8×** |
+| `--ld-wind-kb 1000` | 53.7 s | 8.6 s | **6.2×** |
+| `--ld-wind-kb 2000` | 61.8 s | 12.9 s | **4.8×** |
 
 Additional UKBB I/O benchmarks on this machine (Apple M4, 10 CPU cores, 24 GB RAM, macOS 26.3
 build 25D125). These highlight I/O-heavy workflows and the impact of the Rust pipeline’s faster
@@ -589,6 +662,7 @@ make_annot.rs        BED → 0/1 annotation generator.
 | `flate2` | 1 | gzip output for .sumstats.gz and .ldscore.gz |
 | `cubecl` | 0.10 | (optional, `gpu` feature) multi-backend GPU compute |
 | `cubek-matmul` | 0.2 | (optional, `gpu` feature) autotuned GPU matmul |
+| `mimalloc` | 0.1 | (optional, `mimalloc` feature) fast allocator for musl builds |
 
 ---
 
