@@ -228,6 +228,13 @@ pub struct L2Args {
     #[arg(long, default_value_t = true)]
     pub maf_pre: bool,
 
+    /// Read BED chunks on a background thread while compute runs on the main thread.
+    /// Useful on slow networked storage (GPFS/NFS) where I/O blocks waiting for the
+    /// network. On local SSD with warm page cache this hurts (extra thread competes
+    /// with rayon for CPU cores); leave it off for local benchmarks.
+    #[arg(long)]
+    pub prefetch_bed: bool,
+
     /// File containing SNP IDs (one per line) to print LD scores for.
     /// Unlike --extract, all SNPs are still used in LD windows; only output is filtered.
     #[arg(long)]
@@ -285,6 +292,10 @@ pub struct L2Args {
     /// ~0.001 at 1000G scale.
     #[arg(long)]
     pub fast_f32: bool,
+
+    /// Print per-section timing breakdown to stderr.
+    #[arg(long)]
+    pub verbose_timing: bool,
 }
 
 #[derive(Args)]
@@ -408,6 +419,10 @@ pub struct H2Args {
     /// accepted for CLI parity).
     #[arg(long)]
     pub invert_anyway: bool,
+
+    /// Print per-section timing breakdown to stderr.
+    #[arg(long)]
+    pub verbose_timing: bool,
 }
 
 #[derive(Args)]
@@ -504,6 +519,10 @@ pub struct RgArgs {
     /// Force matrix inversion even when ill-conditioned (accepted for CLI parity).
     #[arg(long)]
     pub invert_anyway: bool,
+
+    /// Print per-section timing breakdown to stderr.
+    #[arg(long)]
+    pub verbose_timing: bool,
 }
 
 #[derive(Args)]

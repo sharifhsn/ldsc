@@ -13,6 +13,10 @@ mod munge;
 mod parse;
 mod regressions;
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::Result;
 use clap::Parser;
 use rayon::ThreadPoolBuilder;
