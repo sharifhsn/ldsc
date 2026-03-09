@@ -919,3 +919,33 @@ Note: compute environment pinned to c6a.4xlarge for reproducible benchmarks goin
 
 ### Conclusion
 **No measurable speedup.** The r2u fill loops are only ~4% of total runtime (74% is faer GEMM), so even eliminating all bounds checks and one multiply per iteration saves <1s — within SPOT variance. The change is still correct (exact parity, cleaner code) and the pre-computed constant is a strict improvement, just not measurable at this scale.
+
+## 2026-03-09 — Rayon-Parallel Column Normalization (REVERTED)
+
+### Changes
+Replaced the sequential `for j in 0..c` normalization loop in `compute_ldscore_global` with `(0..c).into_par_iter()` using rayon. Each column of `b_mat` is independent — the loop copies raw BED data into `b_mat`, computes sum/sum_sq, and normalizes. Used unsafe disjoint column pointer access (column-major layout with col_stride == n_indiv guarantees no overlap).
+
+### Parity
+- 5k SNPs: `max_abs_diff=0` (exact match)
+- 50k SNPs: `max_abs_diff=0` (exact match)
+
+### Benchmark (AWS c6a.4xlarge, EPYC 7R13, 16 vCPU)
+
+| Metric | Before (baseline) | After (par norm) | Delta |
+|--------|-------------------|------------------|-------|
+| Mean | 43.659s ± 0.141s | 45.057s ± 1.813s | +3.2% (regression) |
+| Median | ~43.659s | 45.072s | +3.2% |
+| Min | ~43.4s | 41.852s | — |
+| Max | ~43.9s | 48.370s | — |
+| User time | ~600s | 489.968s | — |
+| System time | ~2s | 89.812s | +90s (!) |
+
+Individual run times: 44.28, 45.53, 43.54, 41.85, 48.37, 45.99, 46.75, 44.06, 45.59, 44.61s.
+
+### Analysis
+The optimization **regressed** performance by ~3.2% with much higher variance (σ=1.8s vs 0.14s). The root cause is excessive system time (90s vs ~2s baseline) from rayon thread management overhead. Each rayon task processes only ~2490 float operations (one column of n_indiv=2490 elements). With chunk_size=200, that's 200 rayon tasks per chunk across ~8300 chunks = 1.66M total rayon tasks. Rayon's per-task overhead (~1-10μs) dominates the actual compute at this granularity.
+
+Additionally, the parallel normalization **competes with rayon threads used by faer GEMM** (which accounts for 74% of runtime). The rayon thread pool is shared — normalization tasks steal work slots that would otherwise be available for the immediately-following matmul.
+
+### Conclusion
+**Reverted.** Column normalization (~8% of runtime, ~3.5s) is not parallelizable at the per-column granularity used here. The per-column work (~2490 ops) is far below the rayon task overhead threshold. The sequential loop already auto-vectorizes well (tight copy+sum+scale). To improve normalization, a better approach would be SIMD intrinsics or fusing normalization into the BED decode pass — not task parallelism.
