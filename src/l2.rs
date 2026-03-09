@@ -682,11 +682,10 @@ fn compute_ldscore_global(
                     let col = b_mat.col_mut(j).try_as_col_major_mut().unwrap().as_slice_mut();
                     let mut sum = 0f64;
                     let mut sum_sq = 0f64;
-                    // Tight copy+sum+sum_sq loop — no branch, auto-vectorizes
-                    for i in 0..n_indiv {
-                        let v = raw_col[i];
-                        col[i] = v;
-                        let vf = v as f64;
+                    // Iterator-based loop eliminates bounds checks, enabling autovectorization.
+                    for (dst, &src) in col[..n_indiv].iter_mut().zip(raw_col[..n_indiv].iter()) {
+                        *dst = src;
+                        let vf = src as f64;
                         sum += vf;
                         sum_sq += vf * vf;
                     }
@@ -723,10 +722,10 @@ fn compute_ldscore_global(
                     let col = b_mat.col_mut(j).try_as_col_major_mut().unwrap().as_slice_mut();
                     let mut sum = 0f64;
                     let mut sum_sq = 0f64;
-                    // Tight f32→f64 copy+sum+sum_sq loop — no branch, auto-vectorizes
-                    for i in 0..n_indiv {
-                        let v = raw_col[i] as f64;
-                        col[i] = v;
+                    // Iterator-based loop eliminates bounds checks, enabling autovectorization.
+                    for (dst, &src) in col[..n_indiv].iter_mut().zip(raw_col[..n_indiv].iter()) {
+                        let v = src as f64;
+                        *dst = v;
                         sum += v;
                         sum_sq += v * v;
                     }

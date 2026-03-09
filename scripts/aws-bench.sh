@@ -73,6 +73,7 @@ if [ "$SKIP_BUILD" = false ]; then
         -v "$(pwd)/src:/build/src:ro" \
         -v "$(pwd)/Cargo.toml:/build/Cargo.toml:ro" \
         -v "$(pwd)/Cargo.lock:/build/Cargo.lock:ro" \
+        -v "$(pwd)/.cargo/config.toml:/build/.cargo/config.toml:ro" \
         -w /build \
         -e CARGO_INCREMENTAL=0 \
         "$DEPS_IMAGE" \

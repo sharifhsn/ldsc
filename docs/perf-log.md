@@ -949,3 +949,56 @@ Additionally, the parallel normalization **competes with rayon threads used by f
 
 ### Conclusion
 **Reverted.** Column normalization (~8% of runtime, ~3.5s) is not parallelizable at the per-column granularity used here. The per-column work (~2490 ops) is far below the rayon task overhead threshold. The sequential loop already auto-vectorizes well (tight copy+sum+scale). To improve normalization, a better approach would be SIMD intrinsics or fusing normalization into the BED decode pass — not task parallelism.
+
+## 2026-03-09 — AVX2+FMA Target Features + Iterator-Based Hot Loops
+
+### Changes
+1. **`.cargo/config.toml`**: Added `[target.x86_64-unknown-linux-musl]` / `rustflags = ["-C", "target-feature=+avx2,+fma"]`. Enables 256-bit SIMD for all non-faer code. Does NOT trigger AVX-512 (which caused 2-4× regression with `target-cpu=native`). faer uses runtime CPU detection so its GEMM kernels are unaffected.
+
+2. **Iterator-based copy+sum+sum_sq** (`src/l2.rs`): Replaced index-based `raw_col[i]`/`col[i]` with `zip` iterators to eliminate bounds checks. Both f32 and f64 paths.
+
+3. **Column-slice iterators for AB r2u fill** (`src/l2.rs`): Replaced `(i,j)` tuple indexing with `.col(j).try_as_col_major().unwrap().as_slice()` + `zip`. Eliminates per-access faer bounds checks.
+
+### Assembly Analysis (objdump of musl binary)
+
+| Hot Loop | Vectorized? | Width | FMA? |
+|----------|------------|-------|------|
+| copy+sum+sum_sq (f32) | **NO** — scalar | 1 f32/iter | No |
+| copy+sum+sum_sq (f64) | **NO** — scalar | 1 f64/iter | No |
+| r2u_ab fill (f32→f64) | **YES** — AVX2 | 16 f64/iter (4× ymm unrolled) | No (2× vmulpd + vsubpd) |
+| r2u_ab fill (f64) | **YES** — AVX2 | 16 f64/iter | No |
+| r2u_bb fill (triangular) | **NO** — scalar | 1 f64/iter | No |
+| normalize f32 (fast) | **YES** — AVX2 | 32 f32/iter (4× ymm unrolled) | N/A (vsubps + vmulps) |
+| normalize f64 (fast) | **YES** — AVX2 | 16 f64/iter (4× ymm unrolled) | N/A (vsubpd + vmulpd) |
+| normalize NaN path | **YES** — AVX2 | Same widths | N/A (branchless vcmpord + vand) |
+| faer GEMM (bb_dot, ab_dot) | **YES** — AVX2+FMA | ymm throughout | YES — 30,793 vfmadd instances |
+
+Key findings:
+- **copy+sum+sum_sq stays scalar** despite iterator rewrite — LLVM can't auto-vectorize a reduction interleaved with a copy+widening conversion (f32→f64). Would need manual SIMD or loop splitting.
+- **normalize jumps from SSE2 (128-bit) to AVX2 (256-bit)** — 2× throughput improvement.
+- **r2u_ab fill also jumps to AVX2** — 4× unrolled, 16 f64/iteration.
+- **faer GEMM already used FMA** via runtime detection — no change from +avx2,+fma flags.
+
+### Parity
+- Local 5k SNPs: `max_abs_diff=0` (exact match)
+- Parity verified before AWS submission.
+
+### Benchmark (AWS c6a.4xlarge, EPYC 7R13, 16 vCPU)
+
+| Metric | Before (SSE2 baseline) | After (+avx2,+fma + iterators) | Delta |
+|--------|----------------------|-------------------------------|-------|
+| Mean | 43.659s ± 0.141s | 42.621s ± 0.258s | **-2.4%** |
+| Median | ~43.659s | 42.621s | **-2.4%** |
+| Min | ~43.4s | 42.244s | -2.7% |
+| Max | ~43.9s | 43.192s | — |
+
+Individual run times: 43.19, 42.67, 42.57, 42.57, 42.24, 42.72, 42.30, 42.70, 42.59, 42.66s.
+Low variance (σ=0.26s) confirms stable improvement.
+
+### Analysis
+The 2.4% improvement (~1.04s) comes primarily from AVX2-vectorized normalize loops (previously SSE2 128-bit, now AVX2 256-bit). Normalize is ~8% of runtime (~3.5s) and the 2× SIMD width saves ~1s. The r2u fill also benefits but is only ~4% of runtime.
+
+The copy+sum+sum_sq loop remains a scalar bottleneck (~8% of runtime). To vectorize it would require either: (a) manual SIMD intrinsics, (b) splitting into separate memcpy + reduction passes, or (c) unsafe `#[target_feature(enable="avx2")]` with hand-rolled accumulator. For n_indiv=2490 (~10KB), the data fits in L1 — a 2-pass approach would be feasible.
+
+### Conclusion
+**+avx2,+fma target features provide a real 2.4% improvement** without regressing faer GEMM. The key insight is that `+avx2,+fma` (specific features) is safe while `target-cpu=native` (which enables AVX-512 on EPYC) causes faer GEMM regression. New best: **42.62s** on EPYC 7R13 (was 43.66s), **~36.4× speedup** vs Python (1548.5s).
