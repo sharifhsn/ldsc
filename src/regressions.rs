@@ -504,6 +504,9 @@ pub fn run_h2(args: H2Args) -> Result<()> {
         println!("  WARNING: --frqfile is ignored without --overlap-annot");
     }
 
+    let verbose_timing = args.verbose_timing;
+    let t_start = std::time::Instant::now();
+
     let h2_path = args
         .h2
         .as_ref()
@@ -531,6 +534,13 @@ pub fn run_h2(args: H2Args) -> Result<()> {
         .context("merging sumstats with reference LD scores")?;
     let w_ld_df = w_ld.collect().context("loading weight LD scores")?;
     let merged = smart_merge_on_snp(merged, w_ld_df).context("merging with weight LD scores")?;
+
+    if verbose_timing {
+        eprintln!(
+            "[perf] h2 data_load={:.3}s",
+            t_start.elapsed().as_secs_f64()
+        );
+    }
 
     let n_total = merged.height();
     anyhow::ensure!(
@@ -755,6 +765,12 @@ pub fn run_h2(args: H2Args) -> Result<()> {
         println!("Liability-scale h2: {:.4}", res.h2 * c);
     }
 
+    if verbose_timing {
+        eprintln!(
+            "[perf] h2 total={:.3}s",
+            t_start.elapsed().as_secs_f64()
+        );
+    }
     Ok(())
 }
 
@@ -2034,6 +2050,9 @@ fn run_gencov_ldsc(
 }
 
 pub fn run_rg(args: RgArgs) -> Result<()> {
+    let verbose_timing = args.verbose_timing;
+    let t_start = std::time::Instant::now();
+
     anyhow::ensure!(
         args.rg.len() >= 2,
         "--rg requires at least 2 sumstats files"
@@ -2419,6 +2438,12 @@ To match Python, provide {} values (first ignored).",
         }
     }
 
+    if verbose_timing {
+        eprintln!(
+            "[perf] rg total={:.3}s",
+            t_start.elapsed().as_secs_f64()
+        );
+    }
     Ok(())
 }
 

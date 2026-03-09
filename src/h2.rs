@@ -129,13 +129,13 @@ pub(crate) fn jackknife_fast(
         let yb = mat_slice(y.as_ref(), lo..hi, 0..1);
 
         let mut xty = MatF::zeros(p, 1);
-        matmul_tn_to(xty.as_mut(), xb, yb, 1.0, Accum::Replace, Par::rayon(0));
+        matmul_tn_to(xty.as_mut(), xb, yb, 1.0, Accum::Replace, Par::Seq);
         for j in 0..p {
             xty_blocks[(i, j)] = xty[(j, 0)];
         }
 
         let mut xtx = MatF::zeros(p, p);
-        matmul_tn_to(xtx.as_mut(), xb, xb, 1.0, Accum::Replace, Par::rayon(0));
+        matmul_tn_to(xtx.as_mut(), xb, xb, 1.0, Accum::Replace, Par::Seq);
         xtx_blocks.push(xtx);
     }
 
@@ -391,20 +391,24 @@ pub fn run_h2_ldsc(
 
     let mean_chi2 = col_mean(chi2);
     let lambda_gc = {
-        let mut vals = Vec::with_capacity(n);
-        for i in 0..n {
-            vals.push(chi2[(i, 0)]);
-        }
-        vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut vals: Vec<f64> = (0..n).map(|i| chi2[(i, 0)]).collect();
         let n = vals.len();
         let mid = if n == 0 {
             f64::NAN
-        } else if n % 2 == 1 {
-            vals[n / 2]
         } else {
-            let hi = vals[n / 2];
-            let lo = vals[n / 2 - 1];
-            (lo + hi) / 2.0
+            let hi_idx = n / 2;
+            vals.select_nth_unstable_by(hi_idx, |a, b| a.partial_cmp(b).unwrap());
+            if n % 2 == 1 {
+                vals[hi_idx]
+            } else {
+                let hi = vals[hi_idx];
+                let lo = vals[..hi_idx]
+                    .iter()
+                    .copied()
+                    .max_by(|a, b| a.partial_cmp(b).unwrap())
+                    .unwrap();
+                (lo + hi) / 2.0
+            }
         };
         mid / 0.4549
     };
