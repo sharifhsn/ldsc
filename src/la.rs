@@ -53,8 +53,8 @@ pub fn col_mean(col: &ColF) -> f64 {
 pub fn mat_add_in_place(mut dst: MatMut<'_, f64>, src: MatRef<'_, f64>) {
     let nrows = dst.nrows();
     let ncols = dst.ncols();
-    for i in 0..nrows {
-        for j in 0..ncols {
+    for j in 0..ncols {
+        for i in 0..nrows {
             dst[(i, j)] += src[(i, j)];
         }
     }
@@ -62,13 +62,7 @@ pub fn mat_add_in_place(mut dst: MatMut<'_, f64>, src: MatRef<'_, f64>) {
 
 #[inline]
 pub fn mat_copy_from(mut dst: MatMut<'_, f64>, src: MatRef<'_, f64>) {
-    let nrows = dst.nrows();
-    let ncols = dst.ncols();
-    for i in 0..nrows {
-        for j in 0..ncols {
-            dst[(i, j)] = src[(i, j)];
-        }
-    }
+    dst.copy_from(src);
 }
 
 #[inline]

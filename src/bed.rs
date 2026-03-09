@@ -116,6 +116,32 @@ impl Bed {
             .with_context(|| format!("reading BED block start {} count {}", sid_start, count))?;
         Ok(())
     }
+
+    /// Seek to the start of a SNP. Use before sequential `read_next_block` calls.
+    pub fn seek_to_snp(&mut self, sid: usize) -> Result<()> {
+        let offset = (sid as u64)
+            .checked_mul(self.bytes_per_snp as u64)
+            .and_then(|v| v.checked_add(BED_HEADER_LEN))
+            .context("seek_to_snp offset overflow")?;
+        self.reader.seek(SeekFrom::Start(offset))?;
+        Ok(())
+    }
+
+    /// Read the next `count` SNPs sequentially (no seek — BufReader stays warm).
+    /// Caller must ensure the file pointer is at the correct position.
+    pub fn read_next_block(&mut self, count: usize, buf: &mut [u8]) -> Result<()> {
+        let expected = count * self.bytes_per_snp;
+        anyhow::ensure!(
+            buf.len() >= expected,
+            "read_next_block buffer too small ({} < {})",
+            buf.len(),
+            expected
+        );
+        self.reader
+            .read_exact(&mut buf[..expected])
+            .context("sequential BED read")?;
+        Ok(())
+    }
 }
 
 impl BedBuilder {
@@ -258,6 +284,10 @@ impl<T: BedVal> ReadOptionsTyped<T> {
         let lut = build_lut(self.count_a1, self.missing_value);
         let bytes_per_snp = bed.bytes_per_snp;
 
+        // Detect if all individuals are used in order (0..n) — enables fast 4-per-byte decode
+        let all_iids = iid_indices.len() == bed.iid_count
+            && iid_indices.iter().enumerate().all(|(i, &v)| v == i);
+
         let is_contiguous = sid_indices
             .iter()
             .enumerate()
@@ -277,7 +307,7 @@ impl<T: BedVal> ReadOptionsTyped<T> {
                 for j in 0..block_sids {
                     let start = j * bytes_per_snp;
                     let bytes = &block_buf[start..start + bytes_per_snp];
-                    decode_column(bytes, &iid_positions, &lut, out, col_offset + j);
+                    decode_column(bytes, &iid_positions, &lut, out, col_offset + j, all_iids);
                 }
                 col_offset += block_sids;
             }
@@ -287,7 +317,7 @@ impl<T: BedVal> ReadOptionsTyped<T> {
         let mut buf = vec![0u8; bytes_per_snp];
         for (col_idx, &sid) in sid_indices.iter().enumerate() {
             bed.read_snp_bytes(sid, &mut buf)?;
-            decode_column(&buf, &iid_positions, &lut, out, col_idx);
+            decode_column(&buf, &iid_positions, &lut, out, col_idx, all_iids);
         }
 
         Ok(())
@@ -359,11 +389,128 @@ fn decode_column<T: BedVal>(
     lut: &[T; 4],
     out: &mut Mat<T>,
     col: usize,
+    all_iids: bool,
 ) {
-    for (row_idx, pos) in iid_positions.iter().enumerate() {
-        let byte = bytes[pos.byte_idx];
-        let bits = (byte >> pos.shift) & 0b11;
-        out[(row_idx, col)] = lut[bits as usize];
+    // Get column as contiguous slice (1 bounds check instead of 2 per element)
+    let out_col = out.col_mut(col).try_as_col_major_mut().unwrap().as_slice_mut();
+
+    if all_iids {
+        // Fast path: all individuals, sequential layout — process 4 per byte.
+        // chunks_exact_mut(4) proves to the compiler each chunk is exactly 4 elements,
+        // eliminating per-element bounds checks.
+        let n_iid = iid_positions.len();
+        let full_bytes = n_iid / 4;
+        let remainder = n_iid % 4;
+        let (bulk, tail) = out_col[..n_iid].split_at_mut(full_bytes * 4);
+        for (chunk, &byte) in bulk.chunks_exact_mut(4).zip(&bytes[..full_bytes]) {
+            chunk[0] = lut[(byte & 0b11) as usize];
+            chunk[1] = lut[((byte >> 2) & 0b11) as usize];
+            chunk[2] = lut[((byte >> 4) & 0b11) as usize];
+            chunk[3] = lut[((byte >> 6) & 0b11) as usize];
+        }
+        if remainder > 0 {
+            let byte = bytes[full_bytes];
+            for r in 0..remainder {
+                tail[r] = lut[((byte >> (r * 2)) & 0b11) as usize];
+            }
+        }
+    } else {
+        // Subset of individuals: use precomputed positions
+        for (row_idx, pos) in iid_positions.iter().enumerate() {
+            let byte = bytes[pos.byte_idx];
+            let bits = (byte >> pos.shift) & 0b11;
+            out_col[row_idx] = lut[bits as usize];
+        }
+    }
+}
+
+/// Pre-computed state for fast repeated chunk reads.
+/// Avoids per-call overhead of index resolution, LUT building, and iid position computation.
+pub(crate) struct ChunkReader<T: BedVal> {
+    iid_positions: Vec<IidPos>,
+    lut: [T; 4],
+    all_iids: bool,
+    bytes_per_snp: usize,
+    block_buf: Vec<u8>,
+    out: Mat<T>,
+    sequential: bool,
+}
+
+impl<T: BedVal> ChunkReader<T> {
+    /// Create a chunk reader that can decode up to `max_cols` SNPs at a time.
+    pub fn new(
+        bed: &Bed,
+        iid_indices: Option<&[isize]>,
+        max_cols: usize,
+        count_a1: bool,
+        missing_value: T,
+    ) -> Result<Self> {
+        let iid_idx = resolve_indices(iid_indices, bed.iid_count)?;
+        let n_iid = iid_idx.len();
+        let all_iids =
+            n_iid == bed.iid_count && iid_idx.iter().enumerate().all(|(i, &v)| v == i);
+        let iid_positions = precompute_iid_positions(&iid_idx);
+        let lut = build_lut(count_a1, missing_value);
+        let bytes_per_snp = bed.bytes_per_snp;
+        // Pre-allocate output buffer and byte buffer for max chunk size
+        let out = Mat::from_fn(n_iid, max_cols, |_, _| missing_value);
+        let block_buf = vec![0u8; max_cols * bytes_per_snp];
+        Ok(Self {
+            iid_positions,
+            lut,
+            all_iids,
+            bytes_per_snp,
+            block_buf,
+            out,
+            sequential: false,
+        })
+    }
+
+    /// Begin sequential mode: seek once, then use `read_next` without seeking.
+    /// This avoids BufReader buffer invalidation that causes 64× read amplification
+    /// (8MB buffer discarded on each SeekFrom::Start, only 124KB used per chunk).
+    pub fn start_sequential(&mut self, bed: &mut Bed, first_sid: usize) -> Result<()> {
+        bed.seek_to_snp(first_sid)?;
+        self.sequential = true;
+        Ok(())
+    }
+
+    /// Read the next contiguous block of `count` SNPs (sequential mode — no seek).
+    /// Returns a reference to the internal output matrix (valid for first `count` columns).
+    pub fn read_next(&mut self, bed: &mut Bed, count: usize) -> Result<&Mat<T>> {
+        let total_bytes = count * self.bytes_per_snp;
+        bed.read_next_block(count, &mut self.block_buf[..total_bytes])?;
+        self.decode_block(count);
+        Ok(&self.out)
+    }
+
+    /// Read a contiguous block of `count` SNPs starting at `start_sid` (with seek).
+    /// Returns a reference to the internal output matrix (valid for first `count` columns).
+    pub fn read_contiguous(
+        &mut self,
+        bed: &mut Bed,
+        start_sid: usize,
+        count: usize,
+    ) -> Result<&Mat<T>> {
+        let total_bytes = count * self.bytes_per_snp;
+        bed.read_snp_block(start_sid, count, &mut self.block_buf[..total_bytes])?;
+        self.decode_block(count);
+        Ok(&self.out)
+    }
+
+    fn decode_block(&mut self, count: usize) {
+        for j in 0..count {
+            let start = j * self.bytes_per_snp;
+            let bytes = &self.block_buf[start..start + self.bytes_per_snp];
+            decode_column(
+                bytes,
+                &self.iid_positions,
+                &self.lut,
+                &mut self.out,
+                j,
+                self.all_iids,
+            );
+        }
     }
 }
 

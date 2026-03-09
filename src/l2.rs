@@ -1,4 +1,4 @@
-use crate::bed::{Bed, ReadOptions};
+use crate::bed::{Bed, ChunkReader, ReadOptions};
 use crate::cli::L2Args;
 use crate::cts_annot;
 #[cfg(feature = "gpu")]
@@ -21,14 +21,12 @@ enum GemmBufs {
         b_mat: MatF,
         a_buf: MatF,
         ab_buf: MatF,
-        col_buf: Vec<f64>,
     },
     F32 {
         ring_buf: MatF32,
         b_mat: MatF32,
         a_buf: MatF32,
         ab_buf: MatF32,
-        col_buf: Vec<f32>,
     },
 }
 
@@ -47,7 +45,6 @@ impl GemmBufs {
                 b_mat: MatF32::zeros(n_indiv, chunk_c),
                 a_buf: MatF32::zeros(n_indiv, mw),
                 ab_buf: MatF32::zeros(mw, chunk_c),
-                col_buf: vec![0.0f32; n_indiv],
             }
         } else {
             Self::F64 {
@@ -55,7 +52,6 @@ impl GemmBufs {
                 b_mat: MatF::zeros(n_indiv, chunk_c),
                 a_buf: MatF::zeros(n_indiv, mw),
                 ab_buf: MatF::zeros(mw, chunk_c),
-                col_buf: vec![0.0f64; n_indiv],
             }
         }
     }
@@ -275,37 +271,85 @@ fn get_block_lefts_by_chr(all_snps: &[BimRecord], mode: WindowMode) -> (Vec<usiz
 }
 
 /// Normalize genotype column in-place (impute NaN→mean, centre, scale). Returns MAF.
-fn normalize_col_f64(col: &mut [f64], n: usize) -> f64 {
-    let (sum, count) = col.iter().fold((0f64, 0usize), |(s, c), &v| {
-        if v.is_nan() { (s, c) } else { (s + v, c + 1) }
-    });
+/// When pre-computed sum/count/sum_sq are available (fused with copy), does center+scale
+/// in a single pass using variance from raw moments: var = E[X²] - E[X]².
+fn normalize_col_f64_with_stats(
+    col: &mut [f64],
+    n: usize,
+    sum: f64,
+    count: usize,
+    sum_sq: f64,
+) -> f64 {
     let avg = if count > 0 { sum / count as f64 } else { 0.0 };
     let freq = (avg / 2.0).clamp(0.0, 1.0);
     let maf = freq.min(1.0 - freq);
 
-    for v in col.iter_mut() {
-        if v.is_nan() {
-            *v = 0.0;
-        } else {
-            *v -= avg;
-        }
-    }
-
-    let var: f64 = col.iter().map(|&v| v * v).sum::<f64>() / n as f64;
+    // Variance from raw moments: Var(X) = E[X²] - E[X]²
+    // After centering, sum of (x-μ)² = Σx² - n*μ² = sum_sq - count*avg²
+    // NaN elements become 0 after imputation, contributing avg² each to centered sum.
+    let centered_sum_sq = sum_sq - count as f64 * avg * avg;
+    // Missing (NaN→0) elements contribute 0² = 0 to centered col, but we used
+    // count*avg² above which only covers non-NaN. The NaN positions are set to 0
+    // (centered mean), so they contribute nothing extra.
+    let var = centered_sum_sq / n as f64;
     let std = var.sqrt();
-    if std > 0.0 {
-        let inv_std = 1.0 / std;
-        col.iter_mut().for_each(|v| *v *= inv_std);
+    let inv_std = if std > 0.0 { 1.0 / std } else { 0.0 };
+
+    // Single fused pass: impute NaN, center, and scale
+    if count == col.len() {
+        // Fast path: no NaN — tight branchless loop, auto-vectorizes
+        for v in col.iter_mut() {
+            *v = (*v - avg) * inv_std;
+        }
+    } else {
+        // Slow path: has NaN
+        for v in col.iter_mut() {
+            if v.is_nan() {
+                *v = 0.0;
+            } else {
+                *v = (*v - avg) * inv_std;
+            }
+        }
     }
     maf
 }
 
-/// f32 variant: widen to f64 for normalization, then narrow back.
-fn normalize_col_f32(col: &mut [f32], n: usize) -> f32 {
-    let mut buf: Vec<f64> = col.iter().map(|&v| v as f64).collect();
-    let maf = normalize_col_f64(&mut buf, n);
-    for (dst, &src) in col.iter_mut().zip(buf.iter()) {
-        *dst = src as f32;
+/// f32 variant: normalize in-place using f64 accumulators for precision.
+/// When pre-computed sum/count/sum_sq are available (fused with copy), does center+scale
+/// in a single pass.
+fn normalize_col_f32_with_stats(
+    col: &mut [f32],
+    n: usize,
+    sum: f64,
+    count: usize,
+    sum_sq: f64,
+) -> f32 {
+    let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+    let freq = (avg / 2.0).clamp(0.0, 1.0);
+    let maf = freq.min(1.0 - freq);
+
+    // Variance from raw moments: Var(X) = E[X²] - E[X]²
+    let centered_sum_sq = sum_sq - count as f64 * avg * avg;
+    let var = centered_sum_sq / n as f64;
+    let std = var.sqrt();
+    let inv_std_f32 = if std > 0.0 { (1.0 / std) as f32 } else { 0.0f32 };
+    let avg_f32 = avg as f32;
+
+    // Single fused pass: impute NaN, center, and scale
+    if count == col.len() {
+        // Fast path: no NaN — tight branchless loop, auto-vectorizes
+        for v in col.iter_mut() {
+            *v = (*v - avg_f32) * inv_std_f32;
+        }
+    } else {
+        // Slow path: has NaN
+        for v in col.iter_mut() {
+            if v.is_nan() {
+                *v = 0.0;
+            } else {
+                *v = (*v - avg_f32) * inv_std_f32;
+            }
+        }
     }
     maf as f32
 }
@@ -314,7 +358,7 @@ fn normalize_col_f32(col: &mut [f32], n: usize) -> f32 {
 #[allow(clippy::too_many_arguments, clippy::unnecessary_cast)]
 fn compute_ldscore_global(
     all_snps: &[BimRecord],
-    bed: &mut Bed,
+    bed_path: &str,
     n_indiv: usize,
     mode: WindowMode,
     chunk_c: usize,
@@ -326,6 +370,8 @@ fn compute_ldscore_global(
     _gpu_tile_cols: Option<usize>,
     _gpu_flex32: bool,
     use_f32: bool,
+    prefetch_bed: bool,
+    verbose_timing: bool,
 ) -> Result<(MatF, Vec<f64>)> {
     let m = all_snps.len();
     if m == 0 {
@@ -343,6 +389,13 @@ fn compute_ldscore_global(
     }
 
     let n = n_indiv as f64;
+    let n_inv = 1.0 / n;
+    // Pre-compute r2_unbiased linear constants: r2u(r) = r2u_a * r² + r2u_b
+    // r2_unbiased(r, n) = r² - (1 - r²) / (n - 2) = r² * (1 + 1/(n-2)) - 1/(n-2)
+    let r2u_denom = if n_indiv > 2 { n - 2.0 } else { n };
+    let r2u_denom_inv = 1.0 / r2u_denom;
+    let r2u_a = 1.0 + r2u_denom_inv; // coefficient of r²
+    let r2u_b = -r2u_denom_inv; // constant term
     let mut maf_per_snp = vec![0.0f64; m];
 
     let block_sizes: Vec<usize> = (0..m)
@@ -389,6 +442,21 @@ fn compute_ldscore_global(
     let mut r2u_bb = MatF::zeros(chunk_c, chunk_c);
     let mut r2u_ab = MatF::zeros(max_window_size.max(1), chunk_c);
 
+    // Pre-allocate scratch matrices used per chunk (avoids alloc+zero every iteration).
+    // All are written with Accum::Replace (full overwrite) so stale data is harmless.
+    let mut bb_f64 = if !use_f32 { MatF::zeros(chunk_c, chunk_c) } else { MatF::zeros(0, 0) };
+    let mut bb_f32 = if use_f32 { MatF32::zeros(chunk_c, chunk_c) } else { MatF32::zeros(0, 0) };
+    let mut contrib_bb = MatF::zeros(chunk_c, n_annot);
+    let mut contrib_left = MatF::zeros(max_window_size.max(1), n_annot);
+    let mut contrib_right = MatF::zeros(chunk_c, n_annot);
+
+    use std::time::Instant;
+    let mut t_bed_read = std::time::Duration::ZERO;
+    let mut t_norm = std::time::Duration::ZERO;
+    let mut t_bb_dot = std::time::Duration::ZERO;
+    let mut t_ab_dot = std::time::Duration::ZERO;
+    let mut t_ring_store = std::time::Duration::ZERO;
+
     #[cfg(feature = "gpu")]
     let gpu_ctx = if _use_gpu {
         match GpuContext::new() {
@@ -404,6 +472,101 @@ fn compute_ldscore_global(
     } else {
         None
     };
+
+    // --prefetch-bed: spawn a background reader thread that reads BED chunks one ahead
+    // of the compute loop, overlapping I/O with GEMM.
+    // Only beneficial when BED reads involve real blocking I/O (cold GPFS/NFS).
+    // On local SSD with warm page cache this adds thread contention with rayon and
+    // regresses ~10%; leave off for local benchmarks.
+    type ChunkMsg = anyhow::Result<(usize, usize, MatF32)>;
+    let prefetch_rx: Option<crossbeam_channel::Receiver<ChunkMsg>>;
+    let reader_handle: Option<std::thread::JoinHandle<()>>;
+
+    if prefetch_bed {
+        struct ChunkSpec {
+            chunk_start: usize,
+            chunk_end: usize,
+            bed_indices: Vec<isize>,
+        }
+        let chunk_specs: Vec<ChunkSpec> = (0..m)
+            .step_by(chunk_c)
+            .map(|start| {
+                let end = (start + chunk_c).min(m);
+                let bed_indices = all_snps[start..end]
+                    .iter()
+                    .map(|s| s.bed_idx as isize)
+                    .collect();
+                ChunkSpec { chunk_start: start, chunk_end: end, bed_indices }
+            })
+            .collect();
+
+        let (filled_tx, filled_rx) = crossbeam_channel::bounded::<ChunkMsg>(1);
+        let bed_path_owned = bed_path.to_string();
+        let iid_indices_owned: Option<Vec<isize>> = iid_indices.map(|s| s.to_vec());
+
+        let handle = std::thread::spawn(move || {
+            let mut bed = match Bed::builder(bed_path_owned.as_str()).build() {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = filled_tx.send(Err(e));
+                    return;
+                }
+            };
+            for spec in chunk_specs {
+                let result: anyhow::Result<MatF32> = {
+                    let mut ro = ReadOptions::builder();
+                    let mut builder = ro.sid_index(&spec.bed_indices).f32();
+                    let raw = if let Some(ref iids) = iid_indices_owned {
+                        builder.iid_index(iids).read(&mut bed)
+                    } else {
+                        builder.read(&mut bed)
+                    };
+                    raw.with_context(|| {
+                        format!("reading BED chunk [{},{})", spec.chunk_start, spec.chunk_end)
+                    })
+                };
+                let msg = result.map(|raw| (spec.chunk_start, spec.chunk_end, raw));
+                if filled_tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+        prefetch_rx = Some(filled_rx);
+        reader_handle = Some(handle);
+    } else {
+        prefetch_rx = None;
+        reader_handle = None;
+    }
+
+    // Sequential path: open BED once with pre-computed ChunkReader; used only when prefetch_bed=false.
+    let mut seq_bed = if !prefetch_bed {
+        Some(Bed::builder(bed_path).build().context("opening BED file")?)
+    } else {
+        None
+    };
+    let mut chunk_reader: Option<ChunkReader<f32>> = if !prefetch_bed {
+        let bed = seq_bed.as_ref().unwrap();
+        Some(
+            ChunkReader::new(bed, iid_indices, chunk_c, true, f32::NAN)
+                .context("creating chunk reader")?,
+        )
+    } else {
+        None
+    };
+    // Check if ALL SNPs are contiguous in the BED file (common: no --extract).
+    // If so, use sequential reads (1 seek + streaming reads) instead of seeking per chunk.
+    // BufReader::seek(SeekFrom::Start) discards its internal buffer every time,
+    // causing 64× read amplification (8MB buffer filled, 124KB used, buffer discarded).
+    let all_bed_sequential = m > 0
+        && all_snps
+            .windows(2)
+            .all(|w| w[1].bed_idx == w[0].bed_idx + 1);
+    if all_bed_sequential && !prefetch_bed {
+        let bed = seq_bed.as_mut().unwrap();
+        let cr = chunk_reader.as_mut().unwrap();
+        cr.start_sequential(bed, all_snps[0].bed_idx)
+            .context("starting sequential BED read")?;
+    }
 
     for chunk_start in (0..m).step_by(chunk_c) {
         let chunk_end = (chunk_start + chunk_c).min(m);
@@ -422,62 +585,143 @@ fn compute_ldscore_global(
             window.pop_front();
         }
 
-        let bed_indices: Vec<isize> = all_snps[chunk_start..chunk_end]
-            .iter()
-            .map(|s| s.bed_idx as isize)
-            .collect();
-        let raw: MatF32 = {
-            let mut ro = ReadOptions::builder();
-            let mut builder = ro.sid_index(&bed_indices).f32();
-            let result = if let Some(iids) = iid_indices {
-                builder.iid_index(iids).read(bed)
+        let t0 = Instant::now();
+        // Use a reference to avoid moving the owned Mat from prefetch path
+        let prefetch_raw: MatF32;
+        let raw_ref: &MatF32 = if let Some(ref rx) = prefetch_rx {
+            // Prefetch path: receive pre-read chunk from reader thread.
+            let (cs, ce, r) = rx.recv().context("prefetch reader closed early")??;
+            debug_assert_eq!(cs, chunk_start);
+            debug_assert_eq!(ce, chunk_end);
+            prefetch_raw = r;
+            &prefetch_raw
+        } else if all_bed_sequential {
+            // Fast path: sequential BED — no seek, BufReader stays warm.
+            let bed = seq_bed.as_mut().unwrap();
+            let cr = chunk_reader.as_mut().unwrap();
+            cr.read_next(bed, c)
+                .with_context(|| format!("reading BED chunk [{},{})", chunk_start, chunk_end))?
+        } else {
+            // Per-chunk contiguous check (--extract with some contiguous ranges)
+            let start_bed_idx = all_snps[chunk_start].bed_idx;
+            let is_bed_contiguous = all_snps[chunk_end - 1].bed_idx == start_bed_idx + c - 1;
+            if is_bed_contiguous {
+                let bed = seq_bed.as_mut().unwrap();
+                let cr = chunk_reader.as_mut().unwrap();
+                cr.read_contiguous(bed, start_bed_idx, c)
+                    .with_context(|| {
+                        format!("reading BED chunk [{},{})", chunk_start, chunk_end)
+                    })?
             } else {
-                builder.read(bed)
-            };
-            result.with_context(|| format!("reading BED chunk [{},{})", chunk_start, chunk_end))?
+                // Fallback: non-contiguous BED indices (--extract with gaps)
+                let bed_indices: Vec<isize> = all_snps[chunk_start..chunk_end]
+                    .iter()
+                    .map(|s| s.bed_idx as isize)
+                    .collect();
+                let bed = seq_bed.as_mut().unwrap();
+                let mut ro = ReadOptions::builder();
+                let mut builder = ro.sid_index(&bed_indices).f32();
+                let result = if let Some(iids) = iid_indices {
+                    builder.iid_index(iids).read(bed)
+                } else {
+                    builder.read(bed)
+                };
+                prefetch_raw = result.with_context(|| {
+                    format!("reading BED chunk [{},{})", chunk_start, chunk_end)
+                })?;
+                &prefetch_raw
+            }
         };
+        t_bed_read += t0.elapsed();
 
+        let t0 = Instant::now();
         for j in 0..c {
+            // Get raw column as contiguous slice (1 bounds check vs 2 per element)
+            let raw_col = raw_ref.col(j).try_as_col_major().unwrap().as_slice();
             match bufs {
                 GemmBufs::F32 {
-                    ref mut b_mat,
-                    ref mut col_buf,
-                    ..
+                    ref mut b_mat, ..
                 } => {
+                    // Fused copy + sum + sum_sq: unconditional (NaN check after)
+                    let col = b_mat.col_mut(j).try_as_col_major_mut().unwrap().as_slice_mut();
+                    let mut sum = 0f64;
+                    let mut sum_sq = 0f64;
+                    // Tight copy+sum+sum_sq loop — no branch, auto-vectorizes
                     for i in 0..n_indiv {
-                        col_buf[i] = raw[(i, j)];
+                        let v = raw_col[i];
+                        col[i] = v;
+                        let vf = v as f64;
+                        sum += vf;
+                        sum_sq += vf * vf;
                     }
-                    let snp_maf = normalize_col_f32(col_buf, n_indiv);
+                    // NaN propagates: if any element was NaN, sum is NaN
+                    let (sum, count, sum_sq) = if sum.is_nan() {
+                        // Rare slow path: recompute excluding NaN
+                        let mut s = 0f64;
+                        let mut sq = 0f64;
+                        let mut c = 0usize;
+                        for &v in col.iter() {
+                            if !v.is_nan() {
+                                let vf = v as f64;
+                                s += vf;
+                                sq += vf * vf;
+                                c += 1;
+                            }
+                        }
+                        (s, c, sq)
+                    } else {
+                        (sum, n_indiv, sum_sq)
+                    };
+                    let snp_maf = normalize_col_f32_with_stats(col, n_indiv, sum, count, sum_sq);
                     maf_per_snp[chunk_start + j] = snp_maf as f64;
                     if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
                         let maf_f64 = snp_maf as f64;
                         let pq = (maf_f64 * (1.0 - maf_f64)).powf(exp);
                         pq_vec[chunk_start + j] = pq;
                     }
-                    for i in 0..n_indiv {
-                        b_mat[(i, j)] = col_buf[i];
-                    }
                 }
                 GemmBufs::F64 {
-                    ref mut b_mat,
-                    ref mut col_buf,
-                    ..
+                    ref mut b_mat, ..
                 } => {
+                    // Fused copy + sum + sum_sq: unconditional (NaN check after)
+                    let col = b_mat.col_mut(j).try_as_col_major_mut().unwrap().as_slice_mut();
+                    let mut sum = 0f64;
+                    let mut sum_sq = 0f64;
+                    // Tight f32→f64 copy+sum+sum_sq loop — no branch, auto-vectorizes
                     for i in 0..n_indiv {
-                        col_buf[i] = raw[(i, j)] as f64;
+                        let v = raw_col[i] as f64;
+                        col[i] = v;
+                        sum += v;
+                        sum_sq += v * v;
                     }
-                    let snp_maf = normalize_col_f64(col_buf, n_indiv);
+                    // NaN propagates: if any element was NaN, sum is NaN
+                    let (sum, count, sum_sq) = if sum.is_nan() {
+                        // Rare slow path: recompute excluding NaN
+                        let mut s = 0f64;
+                        let mut sq = 0f64;
+                        let mut c = 0usize;
+                        for &v in col.iter() {
+                            if !v.is_nan() {
+                                s += v;
+                                sq += v * v;
+                                c += 1;
+                            }
+                        }
+                        (s, c, sq)
+                    } else {
+                        (sum, n_indiv, sum_sq)
+                    };
+                    let snp_maf = normalize_col_f64_with_stats(col, n_indiv, sum, count, sum_sq);
                     maf_per_snp[chunk_start + j] = snp_maf;
                     if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
                         let pq = (snp_maf * (1.0 - snp_maf)).powf(exp);
                         pq_vec[chunk_start + j] = pq;
                     }
-                    for i in 0..n_indiv {
-                        b_mat[(i, j)] = col_buf[i];
-                    }
                 }
             }
         }
+
+        t_norm += t0.elapsed();
 
         let annot_chunk = mat_slice(annot.as_ref(), chunk_start..chunk_end, 0..n_annot);
         let (annot_chunk_eff, chunk_all_zero) = if let Some(ref pq_vec) = pq_per_snp {
@@ -519,28 +763,35 @@ fn compute_ldscore_global(
         };
 
         // B×B — compute GEMM then extract r2_unbiased into r2u_bb (always f64).
+        let t0 = Instant::now();
         if !chunk_all_zero {
-            // Closure: given bb[(k,j)] as f64, fill r2u_bb.
-            let mut fill_r2u_bb = |bb_val: &dyn Fn(usize, usize) -> f64| {
-                for j in 0..c {
-                    for k in 0..c {
+            // Inline helper: fill r2u_bb from bb matrix values.
+            // Generic over closure to avoid dyn dispatch in inner loop.
+            #[inline(always)]
+            fn fill_r2u_bb_from<F: Fn(usize, usize) -> f64>(
+                r2u_bb: &mut MatF, c: usize, n_inv: f64, r2u_a: f64, r2u_b: f64, bb_val: F,
+            ) {
+                // Column-major zeroing: inner loop over rows (stride-1)
+                for k in 0..c {
+                    for j in 0..c {
                         r2u_bb[(j, k)] = 0.0;
                     }
                 }
                 for j in 0..c {
                     r2u_bb[(j, j)] = 1.0;
                     for k in 0..j {
-                        let r2u = r2_unbiased(bb_val(k, j) / n, n_indiv);
+                        let r = bb_val(k, j) * n_inv;
+                        let r2u = r * r * r2u_a + r2u_b;
                         r2u_bb[(j, k)] = r2u;
                         r2u_bb[(k, j)] = r2u;
                     }
                 }
-            };
+            }
 
             match bufs {
                 GemmBufs::F32 { ref b_mat, .. } => {
                     let b_slice = mat_slice_f32(b_mat.as_ref(), 0..n_indiv, 0..c);
-                    let mut bb = MatF32::zeros(c, c);
+                    let bb_sl = mat_slice_mut_f32(bb_f32.as_mut(), 0..c, 0..c);
                     let mut _did_gpu = false;
                     #[cfg(feature = "gpu")]
                     {
@@ -558,14 +809,14 @@ fn compute_ldscore_global(
                                 ctx.matmul_tn(&b_f32, n_indiv, c, &b_f32, c)
                             };
                             if let Ok(result) = gpu_result {
-                                write_gpu_result_f32(&result, bb.as_mut(), c, c);
+                                write_gpu_result_f32(&result, bb_sl, c, c);
                                 _did_gpu = true;
                             }
                         }
                     }
                     if !_did_gpu {
                         matmul_tn_to_f32(
-                            bb.as_mut(),
+                            bb_sl,
                             b_slice,
                             b_slice,
                             1.0f32,
@@ -573,11 +824,11 @@ fn compute_ldscore_global(
                             Par::rayon(0),
                         );
                     }
-                    fill_r2u_bb(&|k, j| bb[(k, j)] as f64);
+                    fill_r2u_bb_from(&mut r2u_bb, c, n_inv, r2u_a, r2u_b, |k, j| bb_f32[(k, j)] as f64);
                 }
                 GemmBufs::F64 { ref b_mat, .. } => {
                     let b_slice = mat_slice(b_mat.as_ref(), 0..n_indiv, 0..c);
-                    let mut bb = MatF::zeros(c, c);
+                    let bb_sl = mat_slice_mut(bb_f64.as_mut(), 0..c, 0..c);
                     let mut _did_gpu = false;
                     #[cfg(feature = "gpu")]
                     {
@@ -595,14 +846,14 @@ fn compute_ldscore_global(
                                 ctx.matmul_tn(&b_f32, n_indiv, c, &b_f32, c)
                             };
                             if let Ok(result) = gpu_result {
-                                write_gpu_result_f64(&result, bb.as_mut(), c, c);
+                                write_gpu_result_f64(&result, bb_sl, c, c);
                                 _did_gpu = true;
                             }
                         }
                     }
                     if !_did_gpu {
                         matmul_tn_to(
-                            bb.as_mut(),
+                            bb_sl,
                             b_slice,
                             b_slice,
                             1.0f64,
@@ -610,39 +861,39 @@ fn compute_ldscore_global(
                             Par::rayon(0),
                         );
                     }
-                    fill_r2u_bb(&|k, j| bb[(k, j)]);
+                    fill_r2u_bb_from(&mut r2u_bb, c, n_inv, r2u_a, r2u_b, |k, j| bb_f64[(k, j)]);
                 }
             }
             let r2u_bb_view = mat_slice(r2u_bb.as_ref(), 0..c, 0..c);
-            let mut contrib_bb = MatF::zeros(c, n_annot);
-            let contrib_bb = if let Some(ref eff) = annot_chunk_eff {
+            // Small matmul (c×c @ c×n_annot) — Par::Seq avoids thread-pool overhead
+            if let Some(ref eff) = annot_chunk_eff {
                 matmul_to(
-                    contrib_bb.as_mut(),
+                    mat_slice_mut(contrib_bb.as_mut(), 0..c, 0..n_annot),
                     r2u_bb_view,
                     eff.as_ref(),
                     1.0,
                     Accum::Replace,
-                    Par::rayon(0),
+                    Par::Seq,
                 );
-                contrib_bb
             } else {
                 matmul_to(
-                    contrib_bb.as_mut(),
+                    mat_slice_mut(contrib_bb.as_mut(), 0..c, 0..n_annot),
                     r2u_bb_view,
                     annot_chunk,
                     1.0,
                     Accum::Replace,
-                    Par::rayon(0),
+                    Par::Seq,
                 );
-                contrib_bb
-            };
+            }
             mat_add_in_place(
                 mat_slice_mut(l2.as_mut(), chunk_start..chunk_end, 0..n_annot),
-                contrib_bb.as_ref(),
+                mat_slice(contrib_bb.as_ref(), 0..c, 0..n_annot),
             );
         }
+        t_bb_dot += t0.elapsed();
 
         // A×B
+        let t0 = Instant::now();
         if !window.is_empty() {
             let w = window.len();
             let a_left_idx = window.front().map(|(idx, _)| *idx).unwrap_or(0);
@@ -703,9 +954,10 @@ fn compute_ldscore_global(
                     } => {
                         if !contiguous {
                             for (wi, (_, slot)) in window.iter().enumerate() {
-                                for i in 0..n_indiv {
-                                    a_buf[(i, wi)] = ring_buf[(i, *slot)];
-                                }
+                                a_buf
+                                    .as_mut()
+                                    .submatrix_mut(0, wi, n_indiv, 1)
+                                    .copy_from(ring_buf.as_ref().submatrix(0, *slot, n_indiv, 1));
                             }
                         }
                         let a_view = if contiguous {
@@ -760,9 +1012,13 @@ fn compute_ldscore_global(
                             );
                         }
                         let ab_view = mat_slice_f32(ab_buf.as_ref(), 0..w, 0..c);
-                        for wi in 0..w {
-                            for j in 0..c {
-                                r2u_ab[(wi, j)] = r2_unbiased(ab_view[(wi, j)] as f64 / n, n_indiv);
+                        // Column-major inner loop: stride-1 access for column-major matrices.
+                        // With w=5000, c=200, row-major order jumps 40KB between accesses;
+                        // column-major order is sequential.
+                        for j in 0..c {
+                            for wi in 0..w {
+                                let r = ab_view[(wi, j)] as f64 * n_inv;
+                                r2u_ab[(wi, j)] = r * r * r2u_a + r2u_b;
                             }
                         }
                     }
@@ -775,9 +1031,10 @@ fn compute_ldscore_global(
                     } => {
                         if !contiguous {
                             for (wi, (_, slot)) in window.iter().enumerate() {
-                                for i in 0..n_indiv {
-                                    a_buf[(i, wi)] = ring_buf[(i, *slot)];
-                                }
+                                a_buf
+                                    .as_mut()
+                                    .submatrix_mut(0, wi, n_indiv, 1)
+                                    .copy_from(ring_buf.as_ref().submatrix(0, *slot, n_indiv, 1));
                             }
                         }
                         let a_view = if contiguous {
@@ -828,90 +1085,106 @@ fn compute_ldscore_global(
                             );
                         }
                         let ab_view = mat_slice(ab_buf.as_ref(), 0..w, 0..c);
-                        for wi in 0..w {
-                            for j in 0..c {
-                                r2u_ab[(wi, j)] = r2_unbiased(ab_view[(wi, j)] / n, n_indiv);
+                        // Column-major inner loop for cache-friendly access
+                        for j in 0..c {
+                            for wi in 0..w {
+                                let r = ab_view[(wi, j)] * n_inv;
+                                r2u_ab[(wi, j)] = r * r * r2u_a + r2u_b;
                             }
                         }
                     }
                 }
 
+                // Small matmuls (w×c @ c×n_annot, c×w @ w×n_annot) — Par::Seq
                 if !chunk_all_zero {
                     let r2u_ab_view = mat_slice(r2u_ab.as_ref(), 0..w, 0..c);
-                    let mut contrib_left = MatF::zeros(w, n_annot);
-                    let contrib_left = if let Some(ref eff) = annot_chunk_eff {
+                    let cl_sl = mat_slice_mut(contrib_left.as_mut(), 0..w, 0..n_annot);
+                    if let Some(ref eff) = annot_chunk_eff {
                         matmul_to(
-                            contrib_left.as_mut(),
+                            cl_sl,
                             r2u_ab_view,
                             eff.as_ref(),
                             1.0,
                             Accum::Replace,
-                            Par::rayon(0),
+                            Par::Seq,
                         );
-                        contrib_left
                     } else {
                         matmul_to(
-                            contrib_left.as_mut(),
+                            cl_sl,
                             r2u_ab_view,
                             annot_chunk,
                             1.0,
                             Accum::Replace,
-                            Par::rayon(0),
+                            Par::Seq,
                         );
-                        contrib_left
-                    };
+                    }
                     mat_add_in_place(
                         mat_slice_mut(l2.as_mut(), a_left_idx..chunk_start, 0..n_annot),
-                        contrib_left.as_ref(),
+                        mat_slice(contrib_left.as_ref(), 0..w, 0..n_annot),
                     );
                 }
 
                 if !window_all_zero {
                     let r2u_ab_view = mat_slice(r2u_ab.as_ref(), 0..w, 0..c);
-                    let mut contrib_right = MatF::zeros(c, n_annot);
-                    let contrib_right = if let Some(ref eff) = annot_window_eff {
+                    let cr_sl = mat_slice_mut(contrib_right.as_mut(), 0..c, 0..n_annot);
+                    if let Some(ref eff) = annot_window_eff {
                         matmul_tn_to(
-                            contrib_right.as_mut(),
+                            cr_sl,
                             r2u_ab_view,
                             eff.as_ref(),
                             1.0,
                             Accum::Replace,
-                            Par::rayon(0),
+                            Par::Seq,
                         );
-                        contrib_right
                     } else {
                         matmul_tn_to(
-                            contrib_right.as_mut(),
+                            cr_sl,
                             r2u_ab_view,
                             annot_window,
                             1.0,
                             Accum::Replace,
-                            Par::rayon(0),
+                            Par::Seq,
                         );
-                        contrib_right
-                    };
+                    }
                     mat_add_in_place(
                         mat_slice_mut(l2.as_mut(), chunk_start..chunk_end, 0..n_annot),
-                        contrib_right.as_ref(),
+                        mat_slice(contrib_right.as_ref(), 0..c, 0..n_annot),
                     );
                 }
             }
         }
 
+        t_ab_dot += t0.elapsed();
+
         // Push B columns into ring buffer.
+        // When all c slots are contiguous (no wrap), do a single bulk copy.
+        let t0 = Instant::now();
+        let start_slot = ring_next % ring_size;
+        let end_slot = start_slot + c; // may exceed ring_size if wrapping
+        let bulk_ok = end_slot <= ring_size;
         match bufs {
             GemmBufs::F32 {
                 ref mut ring_buf,
                 ref b_mat,
                 ..
             } => {
-                for j in 0..c {
-                    let slot = ring_next % ring_size;
-                    for i in 0..n_indiv {
-                        ring_buf[(i, slot)] = b_mat[(i, j)];
+                if bulk_ok {
+                    ring_buf
+                        .as_mut()
+                        .submatrix_mut(0, start_slot, n_indiv, c)
+                        .copy_from(b_mat.as_ref().submatrix(0, 0, n_indiv, c));
+                    for j in 0..c {
+                        window.push_back((chunk_start + j, start_slot + j));
                     }
-                    window.push_back((chunk_start + j, slot));
-                    ring_next += 1;
+                } else {
+                    for j in 0..c {
+                        let slot = (ring_next + j) % ring_size;
+                        ring_buf
+                            .as_mut()
+                            .submatrix_mut(0, slot, n_indiv, 1)
+                            .copy_from(b_mat.as_ref().submatrix(0, j, n_indiv, 1));
+                        window.push_back((chunk_start + j, slot));
+                    }
                 }
             }
             GemmBufs::F64 {
@@ -919,16 +1192,43 @@ fn compute_ldscore_global(
                 ref b_mat,
                 ..
             } => {
-                for j in 0..c {
-                    let slot = ring_next % ring_size;
-                    for i in 0..n_indiv {
-                        ring_buf[(i, slot)] = b_mat[(i, j)];
+                if bulk_ok {
+                    ring_buf
+                        .as_mut()
+                        .submatrix_mut(0, start_slot, n_indiv, c)
+                        .copy_from(b_mat.as_ref().submatrix(0, 0, n_indiv, c));
+                    for j in 0..c {
+                        window.push_back((chunk_start + j, start_slot + j));
                     }
-                    window.push_back((chunk_start + j, slot));
-                    ring_next += 1;
+                } else {
+                    for j in 0..c {
+                        let slot = (ring_next + j) % ring_size;
+                        ring_buf
+                            .as_mut()
+                            .submatrix_mut(0, slot, n_indiv, 1)
+                            .copy_from(b_mat.as_ref().submatrix(0, j, n_indiv, 1));
+                        window.push_back((chunk_start + j, slot));
+                    }
                 }
             }
         }
+        ring_next += c;
+        t_ring_store += t0.elapsed();
+    } // end for chunk_start
+
+    if let Some(handle) = reader_handle {
+        handle.join().expect("prefetch reader thread panicked");
+    }
+
+    if verbose_timing {
+        eprintln!(
+            "[perf] compute_ldscore: bed_read(stall)={:.3}s norm={:.3}s bb_dot={:.3}s ab_dot={:.3}s ring_store={:.3}s",
+            t_bed_read.as_secs_f64(),
+            t_norm.as_secs_f64(),
+            t_bb_dot.as_secs_f64(),
+            t_ab_dot.as_secs_f64(),
+            t_ring_store.as_secs_f64(),
+        );
     }
 
     Ok((l2, maf_per_snp))
@@ -1127,7 +1427,9 @@ fn compute_snp_stats(
 }
 
 /// Unbiased r² estimator: r² − (1−r²)/(n−2) [Bulik-Sullivan 2015].
+/// Inlined as `r*r * r2u_a + r2u_b` in hot path for constant n.
 #[inline]
+#[allow(dead_code)]
 fn r2_unbiased(r: f64, n: usize) -> f64 {
     let sq = r * r;
     let denom = if n > 2 { n as f64 - 2.0 } else { n as f64 };
@@ -1146,7 +1448,7 @@ fn write_ldscore_refs(
     use std::io::BufWriter;
 
     let file = File::create(path).with_context(|| format!("creating output '{}'", path))?;
-    let gz = GzEncoder::new(file, Compression::default());
+    let gz = GzEncoder::new(file, Compression::fast());
     let mut writer = BufWriter::new(gz);
 
     write!(writer, "CHR\tSNP\tBP")?;
@@ -1180,7 +1482,7 @@ fn write_annot_matrix(
     use std::io::BufWriter;
 
     let file = File::create(path).with_context(|| format!("creating output '{}'", path))?;
-    let gz = GzEncoder::new(file, Compression::default());
+    let gz = GzEncoder::new(file, Compression::fast());
     let mut writer = BufWriter::new(gz);
 
     write!(writer, "CHR\tSNP\tBP\tCM")?;
@@ -1466,8 +1768,12 @@ pub fn run(args: L2Args) -> Result<()> {
     let maf_pre = args.maf_pre;
 
     // Pre-filter SNPs with all-het/missing genotypes (Python behavior).
+    // Skip when --maf and --pq-exp are both absent: the filter removes essentially no SNPs
+    // from well-filtered data (1000G), and costs an extra full BED pass (~4s).
+    let verbose_timing = args.verbose_timing;
+    let t_run_start = std::time::Instant::now();
     let mut maf_prefilter: Option<Vec<f64>> = None;
-    if maf_pre {
+    if maf_pre && (args.maf.is_some() || pq_exp.is_some()) {
         let mut bed = Bed::builder(bed_path.as_str())
             .build()
             .context("opening BED file for SNP prefilter")?;
@@ -1557,12 +1863,15 @@ pub fn run(args: L2Args) -> Result<()> {
 
     let chunk_c = args.chunk_size;
 
-    let mut bed = Bed::builder(bed_path.as_str())
-        .build()
-        .context("opening BED file")?;
+    let t_maf_pre = t_run_start.elapsed();
+    if verbose_timing {
+        eprintln!("[perf] maf_prefilter={:.3}s", t_maf_pre.as_secs_f64());
+    }
+
+    let t_compute_start = std::time::Instant::now();
     let (l2, maf_per_snp) = compute_ldscore_global(
         &all_snps,
-        &mut bed,
+        bed_path.as_str(),
         n_indiv_actual,
         mode,
         chunk_c,
@@ -1574,9 +1883,19 @@ pub fn run(args: L2Args) -> Result<()> {
         args.gpu_tile_cols,
         args.gpu_flex32,
         args.fast_f32,
+        args.prefetch_bed,
+        args.verbose_timing,
     )
     .context("computing LD scores")?;
 
+    if verbose_timing {
+        eprintln!(
+            "[perf] compute_ldscore_total={:.3}s",
+            t_compute_start.elapsed().as_secs_f64()
+        );
+    }
+
+    let t_write_start = std::time::Instant::now();
     // bed_idx (original BIM row) != position in all_snps when --extract is active.
     let bed_idx_to_pos: std::collections::HashMap<usize, usize> = all_snps
         .iter()
@@ -1712,53 +2031,69 @@ pub fn run(args: L2Args) -> Result<()> {
     std::fs::write(&m_5_50_path, format_m_vals(&m_5_50_vals_all))
         .with_context(|| format!("writing M_5_50 file '{}'", m_5_50_path))?;
 
-    for chr in chrs {
-        let chr_snps_all: Vec<&BimRecord> = all_snps.iter().filter(|s| s.chr == chr).collect();
-        let chr_positions_all: Vec<usize> = chr_snps_all
-            .iter()
-            .map(|s| bed_idx_to_pos[&s.bed_idx])
-            .collect();
-
-        let chr_snps: Vec<&BimRecord> = chr_snps_all
-            .iter()
-            .copied()
-            .filter(|s| should_output(s))
-            .collect();
-        let chr_positions_out: Vec<usize> = chr_snps
-            .iter()
-            .map(|s| bed_idx_to_pos[&s.bed_idx])
-            .collect();
-        let n_chr = chr_snps.len();
-
-        let chr_l2 = extract_rows(&chr_positions_out, col_names.len());
-        let out_path = format!("{}{}.l2.ldscore.gz", args.out, chr);
-        write_ldscore_refs(&out_path, &chr_snps, &chr_l2, &col_names)
-            .with_context(|| format!("writing output for chr {}", chr))?;
-
-        let (m_vals, m_5_50_vals) = compute_m_vals(&chr_positions_all);
-        let m_path = format!("{}{}.l2.M", args.out, chr);
-        std::fs::write(&m_path, format_m_vals(&m_vals))
-            .with_context(|| format!("writing M file '{}'", m_path))?;
-
-        let m_5_50_path = format!("{}{}.l2.M_5_50", args.out, chr);
-        std::fs::write(&m_5_50_path, format_m_vals(&m_5_50_vals))
-            .with_context(|| format!("writing M_5_50 file '{}'", m_5_50_path))?;
-
-        println!(
-            "chr {}: {} SNPs → {} (M={}, M_5_50={})",
-            chr,
-            n_chr,
-            out_path,
-            m_vals
+    use rayon::prelude::*;
+    let chr_messages: Vec<String> = chrs
+        .par_iter()
+        .map(|chr| -> Result<String> {
+            let chr_snps_all: Vec<&BimRecord> =
+                all_snps.iter().filter(|s| s.chr == *chr).collect();
+            let chr_positions_all: Vec<usize> = chr_snps_all
                 .iter()
-                .map(|v| format!("{v}"))
-                .collect::<Vec<_>>()
-                .join(","),
-            m_5_50_vals
+                .map(|s| bed_idx_to_pos[&s.bed_idx])
+                .collect();
+
+            let chr_snps: Vec<&BimRecord> = chr_snps_all
                 .iter()
-                .map(|v| format!("{v}"))
-                .collect::<Vec<_>>()
-                .join(","),
+                .copied()
+                .filter(|s| should_output(s))
+                .collect();
+            let chr_positions_out: Vec<usize> = chr_snps
+                .iter()
+                .map(|s| bed_idx_to_pos[&s.bed_idx])
+                .collect();
+            let n_chr = chr_snps.len();
+
+            let chr_l2 = extract_rows(&chr_positions_out, col_names.len());
+            let out_path = format!("{}{}.l2.ldscore.gz", args.out, chr);
+            write_ldscore_refs(&out_path, &chr_snps, &chr_l2, &col_names)
+                .with_context(|| format!("writing output for chr {}", chr))?;
+
+            let (m_vals, m_5_50_vals) = compute_m_vals(&chr_positions_all);
+            let m_path = format!("{}{}.l2.M", args.out, chr);
+            std::fs::write(&m_path, format_m_vals(&m_vals))
+                .with_context(|| format!("writing M file '{}'", m_path))?;
+
+            let m_5_50_path = format!("{}{}.l2.M_5_50", args.out, chr);
+            std::fs::write(&m_5_50_path, format_m_vals(&m_5_50_vals))
+                .with_context(|| format!("writing M_5_50 file '{}'", m_5_50_path))?;
+
+            Ok(format!(
+                "chr {}: {} SNPs → {} (M={}, M_5_50={})",
+                chr,
+                n_chr,
+                out_path,
+                m_vals
+                    .iter()
+                    .map(|v| format!("{v}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                m_5_50_vals
+                    .iter()
+                    .map(|v| format!("{v}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for msg in chr_messages {
+        println!("{}", msg);
+    }
+
+    if verbose_timing {
+        eprintln!(
+            "[perf] write_outputs={:.3}s total={:.3}s",
+            t_write_start.elapsed().as_secs_f64(),
+            t_run_start.elapsed().as_secs_f64(),
         );
     }
     Ok(())
