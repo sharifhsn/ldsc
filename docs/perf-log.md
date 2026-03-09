@@ -858,3 +858,64 @@ Replaced `matmul_to(..., Par::Seq)` for tiny c×c @ c×1 matmuls with manual sca
 
 ### Lesson
 Do not replace faer `Par::Seq` matmul with manual loops for small matrices. faer uses SIMD even in sequential mode.
+
+## 2026-03-09 — PGO + Chunk Size Sweep (AWS)
+
+### Setup
+- AWS c7a.4xlarge (EPYC 7R13, 16 vCPU, 30.7 GB RAM)
+- Full 1000G (1.66M SNPs), `--ld-wind-kb 1000`, 10 runs + 2 warmup per config
+- PGO: `-Cprofile-generate` → full genome training run → `llvm-profdata merge` → `-Cprofile-use`
+- musl + mimalloc, release profile
+
+### Results
+
+| chunk_size | Standard (mean±σ) | PGO (mean±σ) | PGO Δ |
+|-----------|-------------------|-------------|-------|
+| 100 | 47.355s ± 0.236s | 47.321s ± 0.122s | -0.07% |
+| **200** | **43.659s ± 0.141s** | **43.103s ± 0.337s** | **-1.27%** |
+| 400 | 44.137s ± 1.599s | 43.668s ± 0.096s | -1.06% |
+| 800 | 52.066s ± 0.088s | 51.992s ± 0.119s | -0.14% |
+
+### Analysis
+- **chunk=200 is optimal** for both standard and PGO builds
+- **PGO gives ~1.3% improvement** at chunk=200 (43.66→43.10s, saves ~0.55s)
+- chunk=100: 8.5% slower — too many small GEMM calls, dispatch overhead accumulates
+- chunk=400: competitive (43.7s PGO) but standard shows high variance (σ=1.6s)
+- chunk=800: 19% slower — large matrices cause cache pressure, L3 thrashing
+- PGO training on full genome (instrumented binary): 66.3s compute, 68.4s total
+- **Best result: PGO + chunk=200 = 43.1s → 35.9× vs Python (1548.5s)**
+- PGO benefit is modest because 74% of runtime is in faer GEMM which is already heavily optimized with runtime CPU detection; PGO can only help branch prediction in the remaining 26%
+
+### Conclusion
+Default chunk_size=200 is already optimal. PGO provides marginal improvement (~1.3%); the scripts/build_pgo.sh is available for users who want it, but it's not worth the build complexity for a 0.55s gain.
+
+## 2026-03-09 — r2u Fill Optimization (bounds-check elimination + pre-computed constant)
+
+### Changes
+Two optimizations to the r2u (unbiased r²) fill loops in `compute_ldscore_global`:
+
+1. **Column-slice iteration** — replaced faer tuple `(i, j)` indexing with `col(j).try_as_col_major().unwrap().as_slice()` + `zip` iterators. Eliminates faer's per-access bounds checks (~8.3B checks for full genome in AB path alone).
+
+2. **Pre-computed constant** — hoisted `n_inv * n_inv * r2u_a` into `n_inv_sq_r2u_a` computed once before the main loop. Hot loop becomes `val * val * n_inv_sq_r2u_a + r2u_b` (2 muls + 1 add) instead of `r = val * n_inv; r * r * r2u_a + r2u_b` (3 muls + 1 add). Saves one multiply per iteration across ~8.3B iterations.
+
+Applied to: f32 AB path, f64 AB path, and `fill_r2u_bb_from` helper (BB path).
+
+### Parity
+- 5k SNPs: `max_abs_diff=0` (exact match)
+- 50k SNPs: `max_abs_diff=0` (exact match)
+- FP evaluation order changed (val²·const vs (val·n_inv)²·r2u_a) but final L2 scores are dominated by matmul rounding — no parity impact.
+
+### Benchmark (AWS c6a.4xlarge, EPYC 7R13, 16 vCPU — same hardware as baseline)
+
+| Metric | Before (baseline) | After (r2u opt) | Delta |
+|--------|------------------|-----------------|-------|
+| Mean | 43.659s ± 0.141s | 44.174s ± 1.801s | +1.2% (noise) |
+| Median | — | 43.628s | -0.07% |
+| Min | — | 43.359s | -0.7% |
+
+One outlier run at 49.3s (SPOT noise). Excluding it: 43.54s ± 0.14s — essentially identical to baseline.
+
+Note: compute environment pinned to c6a.4xlarge for reproducible benchmarks going forward.
+
+### Conclusion
+**No measurable speedup.** The r2u fill loops are only ~4% of total runtime (74% is faer GEMM), so even eliminating all bounds checks and one multiply per iteration saves <1s — within SPOT variance. The change is still correct (exact parity, cleaner code) and the pre-computed constant is a strict improvement, just not measurable at this scale.

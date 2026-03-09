@@ -119,6 +119,33 @@ fn write_gpu_result_f64(
     }
 }
 
+/// Extract column-major f64 data from an f64 faer matrix for native f64 GPU upload.
+#[cfg(feature = "gpu")]
+fn mat_to_col_major_f64(mat: faer::MatRef<'_, f64>, nrows: usize, ncols: usize) -> Vec<f64> {
+    let mut data = Vec::with_capacity(nrows * ncols);
+    for j in 0..ncols {
+        for i in 0..nrows {
+            data.push(mat[(i, j)]);
+        }
+    }
+    data
+}
+
+/// Write native f64 GPU result (row-major f64) back into an f64 faer matrix.
+#[cfg(feature = "gpu")]
+fn write_gpu_result_f64_native(
+    result: &[f64],
+    mut dst: faer::MatMut<'_, f64>,
+    nrows: usize,
+    ncols: usize,
+) {
+    for i in 0..nrows {
+        for j in 0..ncols {
+            dst[(i, j)] = result[i * ncols + j];
+        }
+    }
+}
+
 pub use crate::parse::{BimRecord, parse_bim};
 
 /// Count the number of individuals in a PLINK .fam file (one row per individual).
@@ -369,6 +396,7 @@ fn compute_ldscore_global(
     _use_gpu: bool,
     _gpu_tile_cols: Option<usize>,
     _gpu_flex32: bool,
+    _gpu_f64: bool,
     use_f32: bool,
     prefetch_bed: bool,
     verbose_timing: bool,
@@ -396,6 +424,9 @@ fn compute_ldscore_global(
     let r2u_denom_inv = 1.0 / r2u_denom;
     let r2u_a = 1.0 + r2u_denom_inv; // coefficient of r²
     let r2u_b = -r2u_denom_inv; // constant term
+    // Pre-compute n_inv² · r2u_a so hot loop does 2 muls instead of 3:
+    // r2u(val) = val² · n_inv² · r2u_a + r2u_b  (was: r = val·n_inv; r²·r2u_a + r2u_b)
+    let n_inv_sq_r2u_a = n_inv * n_inv * r2u_a;
     let mut maf_per_snp = vec![0.0f64; m];
 
     let block_sizes: Vec<usize> = (0..m)
@@ -459,9 +490,14 @@ fn compute_ldscore_global(
 
     #[cfg(feature = "gpu")]
     let gpu_ctx = if _use_gpu {
-        match GpuContext::new() {
+        match GpuContext::new(_gpu_flex32) {
             Ok(ctx) => {
-                eprintln!("GPU: initialized CUDA device for matmul acceleration");
+                if _gpu_f64 && !ctx.capabilities.has_f64 {
+                    eprintln!(
+                        "GPU: warning: --gpu-f64 requested but f64 arithmetic not supported; \
+                         falling back to f32 conversion"
+                    );
+                }
                 Some(ctx)
             }
             Err(e) => {
@@ -767,9 +803,10 @@ fn compute_ldscore_global(
         if !chunk_all_zero {
             // Inline helper: fill r2u_bb from bb matrix values.
             // Generic over closure to avoid dyn dispatch in inner loop.
+            // Uses pre-computed n_inv²·r2u_a to save one multiply per iteration.
             #[inline(always)]
             fn fill_r2u_bb_from<F: Fn(usize, usize) -> f64>(
-                r2u_bb: &mut MatF, c: usize, n_inv: f64, r2u_a: f64, r2u_b: f64, bb_val: F,
+                r2u_bb: &mut MatF, c: usize, n_inv_sq_r2u_a: f64, r2u_b: f64, bb_val: F,
             ) {
                 // Column-major zeroing: inner loop over rows (stride-1)
                 for k in 0..c {
@@ -780,8 +817,8 @@ fn compute_ldscore_global(
                 for j in 0..c {
                     r2u_bb[(j, j)] = 1.0;
                     for k in 0..j {
-                        let r = bb_val(k, j) * n_inv;
-                        let r2u = r * r * r2u_a + r2u_b;
+                        let val = bb_val(k, j);
+                        let r2u = val * val * n_inv_sq_r2u_a + r2u_b;
                         r2u_bb[(j, k)] = r2u;
                         r2u_bb[(k, j)] = r2u;
                     }
@@ -791,7 +828,8 @@ fn compute_ldscore_global(
             match bufs {
                 GemmBufs::F32 { ref b_mat, .. } => {
                     let b_slice = mat_slice_f32(b_mat.as_ref(), 0..n_indiv, 0..c);
-                    let bb_sl = mat_slice_mut_f32(bb_f32.as_mut(), 0..c, 0..c);
+                    #[allow(unused_mut)]
+                    let mut bb_sl = mat_slice_mut_f32(bb_f32.as_mut(), 0..c, 0..c);
                     let mut _did_gpu = false;
                     #[cfg(feature = "gpu")]
                     {
@@ -808,9 +846,12 @@ fn compute_ldscore_global(
                             } else {
                                 ctx.matmul_tn(&b_f32, n_indiv, c, &b_f32, c)
                             };
-                            if let Ok(result) = gpu_result {
-                                write_gpu_result_f32(&result, bb_sl, c, c);
-                                _did_gpu = true;
+                            match gpu_result {
+                                Ok(result) => {
+                                    write_gpu_result_f32(&result, bb_sl.as_mut(), c, c);
+                                    _did_gpu = true;
+                                }
+                                Err(e) => eprintln!("GPU: f32 B×B matmul failed ({e}), falling back to CPU"),
                             }
                         }
                     }
@@ -824,30 +865,52 @@ fn compute_ldscore_global(
                             Par::rayon(0),
                         );
                     }
-                    fill_r2u_bb_from(&mut r2u_bb, c, n_inv, r2u_a, r2u_b, |k, j| bb_f32[(k, j)] as f64);
+                    fill_r2u_bb_from(&mut r2u_bb, c, n_inv_sq_r2u_a, r2u_b, |k, j| bb_f32[(k, j)] as f64);
                 }
                 GemmBufs::F64 { ref b_mat, .. } => {
                     let b_slice = mat_slice(b_mat.as_ref(), 0..n_indiv, 0..c);
-                    let bb_sl = mat_slice_mut(bb_f64.as_mut(), 0..c, 0..c);
+                    #[allow(unused_mut)]
+                    let mut bb_sl = mat_slice_mut(bb_f64.as_mut(), 0..c, 0..c);
                     let mut _did_gpu = false;
                     #[cfg(feature = "gpu")]
                     {
                         if let Some(ref ctx) = gpu_ctx {
-                            let b_f32 = mat_to_col_major_f32_from_f64(b_slice, n_indiv, c);
-                            let gpu_result = if let Some(tc) = _gpu_tile_cols {
-                                if _gpu_flex32 {
-                                    ctx.matmul_tn_tiled_flex32(&b_f32, n_indiv, c, &b_f32, c, tc)
+                            if _gpu_f64 && ctx.capabilities.has_f64 {
+                                // Native f64 path — no precision loss
+                                let b_f64 = mat_to_col_major_f64(b_slice, n_indiv, c);
+                                let gpu_result = if let Some(tc) = _gpu_tile_cols {
+                                    ctx.matmul_tn_tiled_f64(&b_f64, n_indiv, c, &b_f64, c, tc)
                                 } else {
-                                    ctx.matmul_tn_tiled(&b_f32, n_indiv, c, &b_f32, c, tc)
+                                    ctx.matmul_tn_f64(&b_f64, n_indiv, c, &b_f64, c)
+                                };
+                                match gpu_result {
+                                    Ok(result) => {
+                                        write_gpu_result_f64_native(&result, bb_sl.as_mut(), c, c);
+                                        _did_gpu = true;
+                                    }
+                                    Err(e) => eprintln!("GPU: f64 B×B matmul failed ({e}), falling back to CPU"),
                                 }
-                            } else if _gpu_flex32 {
-                                ctx.matmul_tn_flex32(&b_f32, n_indiv, c, &b_f32, c)
                             } else {
-                                ctx.matmul_tn(&b_f32, n_indiv, c, &b_f32, c)
-                            };
-                            if let Ok(result) = gpu_result {
-                                write_gpu_result_f64(&result, bb_sl, c, c);
-                                _did_gpu = true;
+                                // f32 conversion path
+                                let b_f32 = mat_to_col_major_f32_from_f64(b_slice, n_indiv, c);
+                                let gpu_result = if let Some(tc) = _gpu_tile_cols {
+                                    if _gpu_flex32 {
+                                        ctx.matmul_tn_tiled_flex32(&b_f32, n_indiv, c, &b_f32, c, tc)
+                                    } else {
+                                        ctx.matmul_tn_tiled(&b_f32, n_indiv, c, &b_f32, c, tc)
+                                    }
+                                } else if _gpu_flex32 {
+                                    ctx.matmul_tn_flex32(&b_f32, n_indiv, c, &b_f32, c)
+                                } else {
+                                    ctx.matmul_tn(&b_f32, n_indiv, c, &b_f32, c)
+                                };
+                                match gpu_result {
+                                    Ok(result) => {
+                                        write_gpu_result_f64(&result, bb_sl.as_mut(), c, c);
+                                        _did_gpu = true;
+                                    }
+                                    Err(e) => eprintln!("GPU: B×B matmul failed ({e}), falling back to CPU"),
+                                }
                             }
                         }
                     }
@@ -861,7 +924,7 @@ fn compute_ldscore_global(
                             Par::rayon(0),
                         );
                     }
-                    fill_r2u_bb_from(&mut r2u_bb, c, n_inv, r2u_a, r2u_b, |k, j| bb_f64[(k, j)]);
+                    fill_r2u_bb_from(&mut r2u_bb, c, n_inv_sq_r2u_a, r2u_b, |k, j| bb_f64[(k, j)]);
                 }
             }
             let r2u_bb_view = mat_slice(r2u_bb.as_ref(), 0..c, 0..c);
@@ -990,14 +1053,17 @@ fn compute_ldscore_global(
                                 } else {
                                     ctx.matmul_tn(&a_f32, n_indiv, w, &b_f32, c)
                                 };
-                                if let Ok(result) = gpu_result {
-                                    write_gpu_result_f32(
-                                        &result,
-                                        mat_slice_mut_f32(ab_buf.as_mut(), 0..w, 0..c),
-                                        w,
-                                        c,
-                                    );
-                                    _did_gpu = true;
+                                match gpu_result {
+                                    Ok(result) => {
+                                        write_gpu_result_f32(
+                                            &result,
+                                            mat_slice_mut_f32(ab_buf.as_mut(), 0..w, 0..c),
+                                            w,
+                                            c,
+                                        );
+                                        _did_gpu = true;
+                                    }
+                                    Err(e) => eprintln!("GPU: f32 A×B matmul failed ({e}), falling back to CPU"),
                                 }
                             }
                         }
@@ -1012,13 +1078,15 @@ fn compute_ldscore_global(
                             );
                         }
                         let ab_view = mat_slice_f32(ab_buf.as_ref(), 0..w, 0..c);
-                        // Column-major inner loop: stride-1 access for column-major matrices.
-                        // With w=5000, c=200, row-major order jumps 40KB between accesses;
-                        // column-major order is sequential.
+                        // Column-major inner loop with column slices: eliminates faer
+                        // tuple-indexing bounds checks (~8.3B checks for full genome).
+                        // Pre-computed n_inv²·r2u_a saves one multiply per iteration.
                         for j in 0..c {
-                            for wi in 0..w {
-                                let r = ab_view[(wi, j)] as f64 * n_inv;
-                                r2u_ab[(wi, j)] = r * r * r2u_a + r2u_b;
+                            let ab_col = ab_view.col(j).try_as_col_major().unwrap().as_slice();
+                            let r2u_col = r2u_ab.col_mut(j).try_as_col_major_mut().unwrap().as_slice_mut();
+                            for (ab_val, r2u_val) in ab_col[..w].iter().zip(r2u_col[..w].iter_mut()) {
+                                let val = *ab_val as f64;
+                                *r2u_val = val * val * n_inv_sq_r2u_a + r2u_b;
                             }
                         }
                     }
@@ -1048,29 +1116,60 @@ fn compute_ldscore_global(
                         #[cfg(feature = "gpu")]
                         {
                             if let Some(ref ctx) = gpu_ctx {
-                                let a_f32 = mat_to_col_major_f32_from_f64(a_view, n_indiv, w);
-                                let b_f32 = mat_to_col_major_f32_from_f64(b_sl, n_indiv, c);
-                                let gpu_result = if let Some(tc) = _gpu_tile_cols {
-                                    if _gpu_flex32 {
-                                        ctx.matmul_tn_tiled_flex32(
-                                            &a_f32, n_indiv, w, &b_f32, c, tc,
+                                if _gpu_f64 && ctx.capabilities.has_f64 {
+                                    // Native f64 path
+                                    let a_f64_data = mat_to_col_major_f64(a_view, n_indiv, w);
+                                    let b_f64_data = mat_to_col_major_f64(b_sl, n_indiv, c);
+                                    let gpu_result = if let Some(tc) = _gpu_tile_cols {
+                                        ctx.matmul_tn_tiled_f64(
+                                            &a_f64_data, n_indiv, w, &b_f64_data, c, tc,
                                         )
                                     } else {
-                                        ctx.matmul_tn_tiled(&a_f32, n_indiv, w, &b_f32, c, tc)
+                                        ctx.matmul_tn_f64(
+                                            &a_f64_data, n_indiv, w, &b_f64_data, c,
+                                        )
+                                    };
+                                    match gpu_result {
+                                        Ok(result) => {
+                                            write_gpu_result_f64_native(
+                                                &result,
+                                                mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
+                                                w,
+                                                c,
+                                            );
+                                            _did_gpu = true;
+                                        }
+                                        Err(e) => eprintln!("GPU: f64 A×B matmul failed ({e}), falling back to CPU"),
                                     }
-                                } else if _gpu_flex32 {
-                                    ctx.matmul_tn_flex32(&a_f32, n_indiv, w, &b_f32, c)
                                 } else {
-                                    ctx.matmul_tn(&a_f32, n_indiv, w, &b_f32, c)
-                                };
-                                if let Ok(result) = gpu_result {
-                                    write_gpu_result_f64(
-                                        &result,
-                                        mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
-                                        w,
-                                        c,
-                                    );
-                                    _did_gpu = true;
+                                    // f32 conversion path
+                                    let a_f32 = mat_to_col_major_f32_from_f64(a_view, n_indiv, w);
+                                    let b_f32 = mat_to_col_major_f32_from_f64(b_sl, n_indiv, c);
+                                    let gpu_result = if let Some(tc) = _gpu_tile_cols {
+                                        if _gpu_flex32 {
+                                            ctx.matmul_tn_tiled_flex32(
+                                                &a_f32, n_indiv, w, &b_f32, c, tc,
+                                            )
+                                        } else {
+                                            ctx.matmul_tn_tiled(&a_f32, n_indiv, w, &b_f32, c, tc)
+                                        }
+                                    } else if _gpu_flex32 {
+                                        ctx.matmul_tn_flex32(&a_f32, n_indiv, w, &b_f32, c)
+                                    } else {
+                                        ctx.matmul_tn(&a_f32, n_indiv, w, &b_f32, c)
+                                    };
+                                    match gpu_result {
+                                        Ok(result) => {
+                                            write_gpu_result_f64(
+                                                &result,
+                                                mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
+                                                w,
+                                                c,
+                                            );
+                                            _did_gpu = true;
+                                        }
+                                        Err(e) => eprintln!("GPU: A×B matmul failed ({e}), falling back to CPU"),
+                                    }
                                 }
                             }
                         }
@@ -1085,11 +1184,13 @@ fn compute_ldscore_global(
                             );
                         }
                         let ab_view = mat_slice(ab_buf.as_ref(), 0..w, 0..c);
-                        // Column-major inner loop for cache-friendly access
+                        // Column-major inner loop with column slices: eliminates faer
+                        // tuple-indexing bounds checks. Pre-computed constant saves 1 mul.
                         for j in 0..c {
-                            for wi in 0..w {
-                                let r = ab_view[(wi, j)] * n_inv;
-                                r2u_ab[(wi, j)] = r * r * r2u_a + r2u_b;
+                            let ab_col = ab_view.col(j).try_as_col_major().unwrap().as_slice();
+                            let r2u_col = r2u_ab.col_mut(j).try_as_col_major_mut().unwrap().as_slice_mut();
+                            for (ab_val, r2u_val) in ab_col[..w].iter().zip(r2u_col[..w].iter_mut()) {
+                                *r2u_val = *ab_val * *ab_val * n_inv_sq_r2u_a + r2u_b;
                             }
                         }
                     }
@@ -1882,6 +1983,7 @@ pub fn run(args: L2Args) -> Result<()> {
         args.gpu,
         args.gpu_tile_cols,
         args.gpu_flex32,
+        args.gpu_f64,
         args.fast_f32,
         args.prefetch_bed,
         args.verbose_timing,
