@@ -286,6 +286,12 @@ pub struct L2Args {
     #[arg(long)]
     pub gpu_flex32: bool,
 
+    /// Use native f64 GPU matmul (slower but full precision, no f64→f32 conversion).
+    /// Requires GPU f64 support; falls back to f32 conversion if unsupported.
+    /// Ignored without --gpu. Incompatible with --gpu-flex32 and --fast-f32.
+    #[arg(long, conflicts_with_all = ["gpu_flex32", "fast_f32"])]
+    pub gpu_f64: bool,
+
     /// Use f32 instead of f64 for the genotype GEMM (normalization and r2_unbiased
     /// remain f64). Roughly halves memory for the ring buffer and scratch matrices
     /// and can be ~1.5× faster on CPUs with 256-bit SIMD. Max LD score error is
