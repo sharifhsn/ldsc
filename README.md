@@ -7,7 +7,7 @@
 
 A compiled, statically-typed rewrite of [Bulik-Sullivan et al.'s LDSC](https://github.com/bulik/ldsc) in Rust.
 Implements six subcommands — `munge-sumstats`, `l2`, `h2`, `rg`, `make-annot`, `cts-annot` — with
-identical numerical output and a 38× speedup on LD score computation.
+identical numerical output and a 38× speedup on LD score computation (43× with `--stochastic 50`).
 
 ---
 
@@ -241,6 +241,41 @@ ldsc l2 --bfile … --out … --fast-f32
 ldsc l2 --bfile … --out …
 ```
 
+### Stochastic trace estimation (`--stochastic`, experimental)
+
+Pass `--stochastic T` to `ldsc l2` to use Hutchinson's stochastic trace estimator
+with T random Rademacher probe vectors instead of exact GEMM. This approximates
+`diag(R²)` without forming the full correlation matrix, trading precision for speed.
+
+**This is an approximation.** Per-SNP LD scores will differ from the exact (default)
+path. The expected relative error per SNP is ~sqrt(2/T). Downstream h2/rg estimates
+are typically robust to this noise, but users should validate on their specific
+application before relying on stochastic scores.
+
+| T (probes) | Mean relative error | Median |rel| error | Wall time (1.66M SNPs) |
+|-----------|--------------------|--------------------|----------------------|
+| 50        | ~2%                | ~7%                | 36.2s (13% faster)   |
+| 100       | ~1%                | ~5%                | not recommended*     |
+| 1000      | ~0.4%              | ~1.5%              | slower than exact    |
+
+\*T=100 currently exhibits a memory performance regression on some hardware. Use T=50
+for the speed benefit, or omit the flag for exact computation.
+
+```bash
+# Stochastic (faster, approximate)
+ldsc l2 --bfile … --out … --stochastic 50
+
+# Exact (default, numerically identical to Python)
+ldsc l2 --bfile … --out …
+```
+
+**Limitations:**
+- Scalar (non-partitioned) LD scores only. If `--annot` is provided with multiple
+  annotation columns, the flag is ignored and exact GEMM is used.
+- Incompatible with `--gpu`.
+- Results are deterministic (fixed PRNG seed) but not identical across runs with
+  different T values.
+
 ### BED prefetch for networked storage (`--prefetch-bed`)
 
 On HPC clusters with networked filesystems (GPFS, NFS, Lustre), BED file reads travel over
@@ -393,15 +428,16 @@ Benchmarks on AWS c6a.4xlarge (AMD EPYC 7R13, 16 vCPU) using 1000 Genomes Phase 
 (1,664,852 SNPs, n = 2,490 individuals). Measured with `hyperfine` (1 warmup + 3 timed runs).
 Static musl binary with mimalloc, AVX2+FMA target features.
 
-| Mode | Full genome wall time | vs Python |
-|------|----------------------|-----------|
-| Python | 25 min 49 s | 1.0× |
-| **Rust f64** (default) | **41.1 s** | **~38×** |
-| **Rust f32** (`--fast-f32`) | **~33 s** | **~47×** |
+| Mode | Full genome wall time | vs Python | Accuracy |
+|------|----------------------|-----------|----------|
+| Python | 25 min 49 s | 1.0× | reference |
+| **Rust f64** (default) | **41.1 s** | **~38×** | exact (`max_abs_diff = 0`) |
+| **Rust stochastic** (`--stochastic 50`) | **36.2 s** | **~43×** | ~7% median per-SNP error |
+| **Rust f32** (`--fast-f32`) | **~33 s** | **~47×** | `max_abs_diff = 0.008` |
 
-`--ld-wind-kb 1000`, `--chunk-size 200`. Correctness: `max_abs_diff = 0` (f64 vs Python) across
-all 1,664,852 SNPs. The `--fast-f32` path trades exact parity for speed
-(`max_abs_diff = 0.008` vs f64).
+`--ld-wind-kb 1000`, `--chunk-size 200`. The `--stochastic` and `--fast-f32` paths trade
+exact parity for speed; the default f64 path is numerically identical to Python across
+all 1,664,852 SNPs.
 
 Speedup varies with window size (200k-SNP extract, same machine):
 
@@ -682,6 +718,7 @@ make_annot.rs        BED → 0/1 annotation generator.
 | `flate2` | 1 | gzip output for .sumstats.gz and .ldscore.gz |
 | `cubecl` | 0.10 | (optional, `gpu` feature) multi-backend GPU compute |
 | `cubek-matmul` | 0.2 | (optional, `gpu` feature) autotuned GPU matmul |
+| `fastrand` | 2 | Rademacher probe generation for `--stochastic` mode |
 | `mimalloc` | 0.1 | (optional, `mimalloc` feature) fast allocator for musl builds |
 
 ---

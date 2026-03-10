@@ -21,6 +21,7 @@ S3_BUCKET="${PREFIX}-data-${ACCOUNT_ID}"
 DNS_SERVER="10.64.0.1"
 
 AWS="aws --profile $PROFILE --region $REGION --no-cli-pager"
+LOG_GROUPS=("/aws/batch/${PREFIX}" "/aws/batch/job")  # try custom first, then default
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 SKIP_BUILD=false
@@ -130,10 +131,10 @@ EOF
 
 # Add custom command override if specified
 if [ -n "$CUSTOM_CMD" ]; then
-    OVERRIDES=$(echo "$OVERRIDES" | python3 -c "
-import json, sys, shlex
+    OVERRIDES=$(echo "$OVERRIDES" | CUSTOM_CMD="$CUSTOM_CMD" python3 -c "
+import json, sys, shlex, os
 o = json.load(sys.stdin)
-o['command'] = shlex.split('''$CUSTOM_CMD''')
+o['command'] = shlex.split(os.environ['CUSTOM_CMD'])
 json.dump(o, sys.stdout)
 ")
 fi
@@ -190,6 +191,25 @@ if [ -n "$LOG_STREAM" ]; then
     echo "=== Streaming logs (${LOG_STREAM}) ==="
     echo ""
 
+    # Auto-detect which log group contains this stream
+    LOG_GROUP=""
+    for g in "${LOG_GROUPS[@]}"; do
+        if $AWS logs get-log-events \
+            --log-group-name "$g" \
+            --log-stream-name "$LOG_STREAM" \
+            --start-from-head --limit 1 \
+            --output json >/dev/null 2>&1; then
+            LOG_GROUP="$g"
+            break
+        fi
+    done
+    if [ -z "$LOG_GROUP" ]; then
+        echo "WARNING: Could not find log stream in any log group (tried: ${LOG_GROUPS[*]})"
+        LOG_GROUP="/aws/batch/${PREFIX}"  # fall back
+    else
+        echo "Using log group: $LOG_GROUP"
+    fi
+
     NEXT_TOKEN=""
     while true; do
         CUR_STATUS=$($AWS batch describe-jobs --jobs "$JOB_ID" \
@@ -197,13 +217,13 @@ if [ -n "$LOG_STREAM" ]; then
 
         if [ -z "$NEXT_TOKEN" ]; then
             LOG_OUTPUT=$($AWS logs get-log-events \
-                --log-group-name "/aws/batch/${PREFIX}" \
+                --log-group-name "$LOG_GROUP" \
                 --log-stream-name "$LOG_STREAM" \
                 --start-from-head \
                 --output json 2>/dev/null || echo '{"events":[],"nextForwardToken":""}')
         else
             LOG_OUTPUT=$($AWS logs get-log-events \
-                --log-group-name "/aws/batch/${PREFIX}" \
+                --log-group-name "$LOG_GROUP" \
                 --log-stream-name "$LOG_STREAM" \
                 --next-token "$NEXT_TOKEN" \
                 --start-from-head \
