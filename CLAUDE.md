@@ -17,12 +17,20 @@ cargo test --release           # Unit tests (no inline tests currently; this run
 bash test_rust.sh --build      # Integration smoke tests (needs data/1000G_phase3_common_norel.{bed,bim,fam})
 ```
 
+Production/benchmark build (musl + mimalloc, AVX2+FMA via `.cargo/config.toml`):
+```bash
+cargo build --release --features mimalloc --target x86_64-unknown-linux-musl
+```
+**Assembly analysis must use the musl target** — this is the production binary shipped to AWS HPC.
+The native (glibc) build may produce different codegen. Always use `--target x86_64-unknown-linux-musl`
+when inspecting assembly or benchmarking.
+
 GPU build (optional, requires CUDA toolkit):
 ```bash
 cargo build --release --features gpu
 ```
 
-The release binary is at `target/release/ldsc`.
+The release binary is at `target/release/ldsc` (native) or `target/x86_64-unknown-linux-musl/release/ldsc` (musl).
 
 ## CI
 
@@ -120,6 +128,21 @@ Parity/benchmark scripts in `scripts/`:
 - `docs/hpc.md`: Example of an HPC that `ldsc` is intended to run on, in this case UPenn.
 - `ldsc.wiki/`: The wiki for the Bulik's LDSC implementation, has example workflows.
 - `ldsc_py/`: Bulik's LDSC implementation.
+
+## GPU
+
+There's an experimental GPU option, code is available in `src/gpu.rs`, based on the CubeCL library for now using CUDA backend.
+Documentation at `docs/gpu-feasibility.md`.
+
+## Optimization Workflow
+- **Verification**: Start with verifying that the optimization makes sense logically.
+- **Implementation**: Then implement it in code.
+- **Adversarial Pass**: Then run an adversarial pass over your code to ensure there are no bugs. If you see any, fix them and run the adversarial pass until there are none.
+- **Local Parity/Perf**: Test with a smaller dataset parity with Python, and check for any obvious perf wins.
+- **HPC Perf Test**: Run a proper perf benchmark with hyperfine on the AWS HPC.
+- **Document**: Document all findings in `docs/perf-log.md`.
+- **Commit**: Commit all changes with an informative commit message in Conventional Commits syntax.ß
+
 
 ## Release Process
 
