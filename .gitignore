@@ -13,3 +13,6 @@ data/
 
 generated_docs/
 perf/
+target-asm/
+target-musl/
+target-v3/
