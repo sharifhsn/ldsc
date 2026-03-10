@@ -252,8 +252,12 @@ RUN cargo build --release --target x86_64-unknown-linux-musl && \
 ```
 
 > **Performance note**: musl's allocator is slower than glibc's for multi-threaded
-> workloads. If you see a regression, add `jemallocator` as a dependency and set it as
-> the global allocator. Benchmark both before deciding.
+> workloads. If you see a regression, add `jemallocator` or `mimalloc` as a dependency
+> and set it as the global allocator. Benchmark both before deciding.
+
+> **Alpine runtime gotchas**: If your entrypoint needs AWS CLI or other tools at
+> runtime, see **section 12** for Alpine-specific pitfalls (AWS CLI v2 doesn't work on
+> musl, `docker cp` nesting, bind mounts not surviving `docker commit`).
 
 ### 4b. Python Application (uv-managed)
 
@@ -585,3 +589,103 @@ Replace `10.64.0.1` with your host's DNS server (`cat /etc/resolv.conf`).
 | High variance (>2% CV) | Burstable instance or too few runs | Use `c7a`/`c6a` family; increase `--runs` |
 | Docker DNS failure | BuildKit DNS bug | Use `--network=host` or `--dns` flag (see section 10) |
 | Container OOM killed | Memory limit too low | Increase `--memory` in job overrides |
+| Exit code 127 / `aws: not found` | AWS CLI v2 on Alpine/musl | See section 12 |
+| Exit code 101, no logs | Container crash at startup | See section 12 |
+| Log stream not found | Wrong log group | See section 12 |
+
+## 12. Alpine / musl Pitfalls
+
+When using `rust:1-alpine` for musl static builds with a container-commit workflow (section 10, Option B), several issues arise that don't affect glibc-based images.
+
+### 12a. AWS CLI v2 Does Not Work on Alpine
+
+**Problem**: The official [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) ships pre-compiled x86_64 ELF binaries linked against glibc. On Alpine (musl libc), the installer appears to succeed (`You can now run: /usr/local/bin/aws --version`) but the binary silently fails with `not found` at runtime because the dynamic linker (`/lib/ld-linux-x86-64.so.2`) doesn't exist.
+
+**Symptom**: Container exits with code 127. `aws --version` inside the container produces `sh: aws: not found`.
+
+**Fix**: Install AWS CLI v1 via pip, which is pure Python and works on any libc:
+
+```bash
+apk add --no-cache python3 py3-pip
+pip install --break-system-packages awscli
+```
+
+AWS CLI v1 is functionally equivalent for S3 operations (`aws s3 cp`, `aws s3 sync`). If you need v2-only features, switch to a glibc base image (Debian/Ubuntu).
+
+### 12b. `docker cp` Creates Nested Directories
+
+**Problem**: If a directory already exists in the container at the destination path, `docker cp src container:/build/src` copies the host `src/` directory **inside** the existing `/build/src/`, creating `/build/src/src/` instead of replacing the contents.
+
+This commonly happens with deps-caching workflows where `src/` already contains a dummy `main.rs` from the dependency pre-compilation step.
+
+**Symptom**: The container has a 13-byte `main.rs` (`fn main() {}`) instead of your real source. Cargo build succeeds but produces a no-op binary. Exit code 101 or immediate crash with no log output.
+
+**Fix**: Use a tar pipe to overlay the directory contents:
+
+```bash
+# WRONG — creates /build/src/src/ if /build/src/ exists:
+docker cp "$(pwd)/src" my-container:/build/src
+
+# RIGHT — overlays contents into /build/:
+tar -cf - -C "$(pwd)" src Cargo.toml Cargo.lock | docker cp - my-container:/build/
+```
+
+The `docker cp -` form reads a tar archive from stdin and extracts it at the destination, properly replacing existing files.
+
+### 12c. Bind Mounts Are Not Included in `docker commit`
+
+**Problem**: Files mounted via `-v host/path:/container/path:ro` are visible inside the running container but are **not part of the container's filesystem layer**. When you `docker commit`, the resulting image does not contain bind-mounted files — only files written to the container's writable layer.
+
+**Symptom**: Image builds and pushes successfully. Container starts on AWS Batch but immediately fails because expected files (source code, configs) are missing. Exit code 101 with no logs (crash before any output).
+
+**Fix**: Use `docker create` + `docker cp` + `docker start` instead of `docker run -v`:
+
+```bash
+# WRONG — files disappear after commit:
+docker run -v "$(pwd)/src:/build/src:ro" --name build my-image cargo build
+docker commit build my-image:built
+
+# RIGHT — files persist in committed image:
+docker create --name build my-image cargo build
+tar -cf - -C "$(pwd)" src Cargo.toml Cargo.lock | docker cp - build:/build/
+docker start -a build
+docker commit build my-image:built
+```
+
+### 12d. CloudWatch Log Group Mismatch
+
+**Problem**: When you register a new job definition revision **without** a `logConfiguration` block, Batch uses the default log driver (`awslogs`) with the default log group `/aws/batch/job`. Previous revisions that specified a custom log group (e.g., `/aws/batch/ldsc-bench`) wrote to a different location. The log-streaming script looks in the wrong log group and finds nothing.
+
+**Symptom**: Job runs successfully but log streaming shows no output. `ResourceNotFoundException: The specified log stream does not exist.`
+
+**Fix**: Either always specify `logConfiguration` in the job definition, or check both log groups:
+
+```bash
+# Check both possible log groups
+for GROUP in "/aws/batch/${PREFIX}" "/aws/batch/job"; do
+    aws logs get-log-events \
+        --log-group-name "$GROUP" \
+        --log-stream-name "$LOG_STREAM" \
+        --start-from-head 2>/dev/null && break
+done
+```
+
+Or explicitly set the log configuration when registering:
+
+```bash
+aws batch register-job-definition \
+    --job-definition-name "${PREFIX}-job" \
+    --type container \
+    --container-properties '{
+        "image": "...",
+        "resourceRequirements": [...],
+        "logConfiguration": {
+            "logDriver": "awslogs",
+            "options": {
+                "awslogs-group": "/aws/batch/'${PREFIX}'",
+                "awslogs-region": "'${REGION}'",
+                "awslogs-stream-prefix": "bench"
+            }
+        }
+    }'
+```
