@@ -1,0 +1,50 @@
+# PGO builder + benchmark image for ldsc.
+#
+# Fat image: includes Rust toolchain + llvm-profdata + hyperfine + awscli.
+# The entrypoint does the full PGO cycle at runtime (with real 1000G data from S3):
+#   1. Build instrumented binary
+#   2. Run PGO training on full 1.66M genome
+#   3. Merge profiles → rebuild with PGO
+#   4. Run benchmark sweep
+#
+# Build: docker buildx build --network=host -f Dockerfile.bench-pgo -t ldsc-bench-pgo .
+
+# ── Pre-compile deps (cargo build with dummy main.rs) ────────────────────────
+FROM rust:1-alpine AS builder
+RUN apk add --no-cache musl-dev llvm
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+# Pre-compile all dependencies
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs && \
+    cargo build --release --features mimalloc --target x86_64-unknown-linux-musl && \
+    rm -rf src/
+
+# Copy actual source (incremental rebuild: only src/ changes)
+COPY src/ src/
+
+# ── Runtime image with Rust toolchain for PGO rebuild at runtime ─────────────
+FROM rust:1-alpine AS runtime
+
+RUN apk add --no-cache musl-dev llvm curl bash python3
+
+# Install hyperfine
+ARG HYPERFINE_VERSION=1.19.0
+RUN curl -sL "https://github.com/sharkdp/hyperfine/releases/download/v${HYPERFINE_VERSION}/hyperfine-v${HYPERFINE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    | tar xz -C /usr/local/bin --strip-components=1 hyperfine-v${HYPERFINE_VERSION}-x86_64-unknown-linux-musl/hyperfine
+
+# Install AWS CLI v2
+RUN curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip && \
+    cd /tmp && python3 -c "import zipfile; zipfile.ZipFile('awscli.zip').extractall()" && \
+    /tmp/aws/install && rm -rf /tmp/aws /tmp/awscli.zip
+
+WORKDIR /app
+# Copy pre-compiled deps (target/) and source
+COPY --from=builder /app/target target
+COPY --from=builder /app/Cargo.toml /app/Cargo.lock ./
+COPY src/ src/
+
+COPY scripts/pgo-sweep-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
