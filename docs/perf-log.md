@@ -1002,3 +1002,69 @@ The copy+sum+sum_sq loop remains a scalar bottleneck (~8% of runtime). To vector
 
 ### Conclusion
 **+avx2,+fma target features provide a real 2.4% improvement** without regressing faer GEMM. The key insight is that `+avx2,+fma` (specific features) is safe while `target-cpu=native` (which enables AVX-512 on EPYC) causes faer GEMM regression. New best: **42.62s** on EPYC 7R13 (was 43.66s), **~36.4× speedup** vs Python (1548.5s).
+
+## 2026-03-09 — AVX2 Intrinsics for sum/sum_sq Reduction
+
+### Changes
+Replaced the scalar copy+sum+sum_sq loop with:
+1. `copy_from_slice` (vectorized memcpy) for the f32→f32 copy
+2. `sum_sumsq_f32()` — hand-written AVX2+FMA intrinsics (`std::arch::x86_64`) for the sum and sum-of-squares reduction
+3. Widening copy loop (f32→f64, `vcvtps2pd`) for the F64 path
+
+The intrinsics function uses:
+- `_mm256_loadu_ps`: 8-wide f32 load into ymm
+- `_mm256_add_ps`: 8-wide f32 sum accumulation
+- `_mm256_fmadd_ps`: FMA for `v*v + sq_acc` (one instruction instead of multiply + add)
+- Horizontal reduction via `_mm256_extractf128_ps` + `_mm_add_ps` + `_mm_movehl_ps` + `_mm_shuffle_ps`
+- LLVM 4× unrolled the loop: **32 f32 elements per iteration**
+
+BED values are {0,1,2,NaN}; f32 accumulation is exact (max partial sum < 2^23).
+
+### Why intrinsics were necessary
+LLVM's autovectorizer and SLP vectorizer both refuse to use ymm (256-bit) for f32 reductions in safe Rust:
+- **Autovectorizer**: Won't reorder FP additions (IEEE 754 non-associativity). No `-ffast-math` equivalent in Rust.
+- **SLP vectorizer**: Combines sum+sq into 2-element xmm per element (wrong axis — operation-parallel instead of data-parallel).
+- Tested: `chunks_exact(8)` with separate inner loops, array accumulators, two-pass — all produced only xmm (128-bit) or scalar code.
+
+### Assembly verification (native + musl builds)
+```
+.LBB1456_689:
+    vmovups  -96(%rbx,%rcx,4), %ymm2     ; load 8 f32
+    vmovups  -64(%rbx,%rcx,4), %ymm3     ; load 8 f32
+    vmovups  -32(%rbx,%rcx,4), %ymm4     ; load 8 f32
+    vmovups  (%rbx,%rcx,4), %ymm5        ; load 8 f32
+    vaddps   %ymm2, %ymm1, %ymm1        ; sum_v += v
+    vfmadd231ps %ymm2, %ymm2, %ymm0     ; sq_v += v*v (FMA)
+    vaddps   %ymm3, %ymm1, %ymm1        ; (unrolled ×4)
+    vfmadd231ps %ymm3, %ymm3, %ymm0
+    vaddps   %ymm4, %ymm1, %ymm1
+    vfmadd231ps %ymm4, %ymm4, %ymm0
+    vaddps   %ymm5, %ymm1, %ymm1
+    vfmadd231ps %ymm5, %ymm5, %ymm0
+    addq     $32, %rcx
+```
+
+### Parity
+- Rust AVX2 vs Rust baseline (f64 accumulation): **max_abs_diff=0.0** (verified on 5k SNPs)
+- f32 and f64 sums are identical for BED integer values (verified with debug comparison on first SNP)
+
+### Benchmark (AWS c6a.4xlarge, EPYC 7R13, 16 vCPU)
+
+| Metric | Before (AVX2 target, scalar sum) | After (AVX2 intrinsics sum) | Delta |
+|--------|--------------------------------|---------------------------|-------|
+| Mean | 42.621s ± 0.258s | 42.226s ± 3.406s | -0.9% |
+| Median | 42.621s | **41.092s** | **-3.6%** |
+| Min | 42.244s | **40.711s** | -3.6% |
+
+One outlier at 51.9s (SPOT noise; system time 34s vs normal 13s). Excluding it: 41.15s ± 0.35s.
+Individual run times: 41.62, 41.28, 41.73, 41.00, 41.01, **51.88**, 40.92, 40.95, 41.18, 40.71s.
+
+### Analysis
+The ~1.5s improvement comes from replacing the scalar copy+sum+sum_sq loop with:
+- `memcpy` for the copy (was interleaved with scalar accumulation)
+- 8-wide AVX2+FMA for sum/sum_sq (was 1-element-at-a-time scalar)
+
+The sum/sum_sq reduction was ~8% of runtime (~3.5s). The AVX2 intrinsics process 32 f32 per iteration vs 1 per iteration (scalar), giving ~8× throughput for the reduction portion. Combined with the separated memcpy (which LLVM already vectorized), the total norm phase is now dominated by the normalize pass (already AVX2-vectorized) rather than the reduction.
+
+### Conclusion
+**AVX2 intrinsics provide a real ~3.6% improvement** (median 41.09s, was 42.62s). New best: **~41.1s** on EPYC 7R13, **~37.7× speedup** vs Python (1548.5s). Safe Rust cannot produce ymm-width f32 reductions on stable — intrinsics are necessary for this pattern.

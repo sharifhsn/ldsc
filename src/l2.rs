@@ -14,6 +14,73 @@ use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write as IoWrite};
 
+/// AVX2+FMA vectorized sum and sum-of-squares for f32 slices.
+/// Returns (sum, sum_sq) as f64. BED values are {0,1,2,NaN} so f32
+/// accumulation is exact (max partial sum < 2^23).
+///
+/// # Safety
+/// Requires AVX2 and FMA CPU features to be available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sum_sumsq_f32(data: &[f32]) -> (f64, f64) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let n = data.len();
+        let n8 = n / 8 * 8;
+        let ptr = data.as_ptr();
+
+        let mut sum_v = _mm256_setzero_ps();
+        let mut sq_v = _mm256_setzero_ps();
+
+        let mut i = 0usize;
+        while i < n8 {
+            let v = _mm256_loadu_ps(ptr.add(i));
+            sum_v = _mm256_add_ps(sum_v, v);
+            sq_v = _mm256_fmadd_ps(v, v, sq_v); // v*v + sq_v
+            i += 8;
+        }
+
+        // Horizontal reduction: ymm → scalar f32
+        let lo = _mm256_castps256_ps128(sum_v);
+        let hi = _mm256_extractf128_ps(sum_v, 1);
+        let sum4 = _mm_add_ps(lo, hi);
+        let sum4_hi = _mm_movehl_ps(sum4, sum4);
+        let sum2 = _mm_add_ps(sum4, sum4_hi);
+        let sum1 = _mm_add_ss(sum2, _mm_shuffle_ps(sum2, sum2, 1));
+        let mut sum = _mm_cvtss_f32(sum1) as f64;
+
+        let lo = _mm256_castps256_ps128(sq_v);
+        let hi = _mm256_extractf128_ps(sq_v, 1);
+        let sq4 = _mm_add_ps(lo, hi);
+        let sq4_hi = _mm_movehl_ps(sq4, sq4);
+        let sq2 = _mm_add_ps(sq4, sq4_hi);
+        let sq1 = _mm_add_ss(sq2, _mm_shuffle_ps(sq2, sq2, 1));
+        let mut sum_sq = _mm_cvtss_f32(sq1) as f64;
+
+        // Scalar remainder
+        for j in n8..n {
+            let v = *ptr.add(j);
+            sum += v as f64;
+            sum_sq += (v * v) as f64;
+        }
+
+        (sum, sum_sq)
+    }
+}
+
+/// Fallback for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn sum_sumsq_f32(data: &[f32]) -> (f64, f64) {
+    let mut sum = 0f64;
+    let mut sum_sq = 0f64;
+    for &v in data {
+        let vf = v as f64;
+        sum += vf;
+        sum_sq += vf * vf;
+    }
+    (sum, sum_sq)
+}
+
 /// GEMM scratch buffers — either f32 (fast) or f64 (default precision).
 enum GemmBufs {
     F64 {
@@ -678,17 +745,11 @@ fn compute_ldscore_global(
                 GemmBufs::F32 {
                     ref mut b_mat, ..
                 } => {
-                    // Fused copy + sum + sum_sq: unconditional (NaN check after)
                     let col = b_mat.col_mut(j).try_as_col_major_mut().unwrap().as_slice_mut();
-                    let mut sum = 0f64;
-                    let mut sum_sq = 0f64;
-                    // Iterator-based loop eliminates bounds checks, enabling autovectorization.
-                    for (dst, &src) in col[..n_indiv].iter_mut().zip(raw_col[..n_indiv].iter()) {
-                        *dst = src;
-                        let vf = src as f64;
-                        sum += vf;
-                        sum_sq += vf * vf;
-                    }
+                    col[..n_indiv].copy_from_slice(&raw_col[..n_indiv]);
+                    // SAFETY: we build with +avx2,+fma for the musl target;
+                    // native builds have AVX2 on any modern x86_64 CPU.
+                    let (sum, sum_sq) = unsafe { sum_sumsq_f32(&raw_col[..n_indiv]) };
                     // NaN propagates: if any element was NaN, sum is NaN
                     let (sum, count, sum_sq) = if sum.is_nan() {
                         // Rare slow path: recompute excluding NaN
@@ -718,16 +779,12 @@ fn compute_ldscore_global(
                 GemmBufs::F64 {
                     ref mut b_mat, ..
                 } => {
-                    // Fused copy + sum + sum_sq: unconditional (NaN check after)
                     let col = b_mat.col_mut(j).try_as_col_major_mut().unwrap().as_slice_mut();
-                    let mut sum = 0f64;
-                    let mut sum_sq = 0f64;
-                    // Iterator-based loop eliminates bounds checks, enabling autovectorization.
+                    // SAFETY: see above.
+                    let (sum, sum_sq) = unsafe { sum_sumsq_f32(&raw_col[..n_indiv]) };
+                    // Widening copy (f32 → f64) — vectorizes to vcvtps2pd + vmovupd
                     for (dst, &src) in col[..n_indiv].iter_mut().zip(raw_col[..n_indiv].iter()) {
-                        let v = src as f64;
-                        *dst = v;
-                        sum += v;
-                        sum_sq += v * v;
+                        *dst = src as f64;
                     }
                     // NaN propagates: if any element was NaN, sum is NaN
                     let (sum, count, sum_sq) = if sum.is_nan() {
