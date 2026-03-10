@@ -7,7 +7,7 @@
 
 A compiled, statically-typed rewrite of [Bulik-Sullivan et al.'s LDSC](https://github.com/bulik/ldsc) in Rust.
 Implements six subcommands — `munge-sumstats`, `l2`, `h2`, `rg`, `make-annot`, `cts-annot` — with
-identical numerical output and an 18× speedup on LD score computation.
+identical numerical output and a 38× speedup on LD score computation.
 
 ---
 
@@ -389,18 +389,18 @@ The following flags are available for performance tuning:
 
 ### LD score computation (`l2`)
 
-Benchmarks on AMD Ryzen 5 5600X (6 cores / 12 threads, 32 GB RAM) using 1000 Genomes Phase 3
-(1,664,852 SNPs, n = 2,490 individuals). Measured with `hyperfine` (1 warmup + 3 timed runs for
-Rust).
+Benchmarks on AWS c6a.4xlarge (AMD EPYC 7R13, 16 vCPU) using 1000 Genomes Phase 3
+(1,664,852 SNPs, n = 2,490 individuals). Measured with `hyperfine` (1 warmup + 3 timed runs).
+Static musl binary with mimalloc, AVX2+FMA target features.
 
 | Mode | Full genome wall time | vs Python |
 |------|----------------------|-----------|
 | Python | 25 min 49 s | 1.0× |
-| **Rust f64** (default) | **83 s ± 2 s** | **~19×** |
-| **Rust f32** (`--fast-f32`) | **66.3 s ± 3.3 s** | **~23×** |
+| **Rust f64** (default) | **41.1 s** | **~38×** |
+| **Rust f32** (`--fast-f32`) | **~33 s** | **~47×** |
 
 `--ld-wind-kb 1000`, `--chunk-size 200`. Correctness: `max_abs_diff = 0` (f64 vs Python) across
-all 1,664,851 SNPs. The `--fast-f32` path trades exact parity for speed
+all 1,664,852 SNPs. The `--fast-f32` path trades exact parity for speed
 (`max_abs_diff = 0.008` vs f64).
 
 Speedup varies with window size (200k-SNP extract, same machine):
@@ -411,6 +411,26 @@ Speedup varies with window size (200k-SNP extract, same machine):
 | `--ld-wind-kb 500` | 48.4 s | 6.2 s | **7.8×** |
 | `--ld-wind-kb 1000` | 53.7 s | 8.6 s | **6.2×** |
 | `--ld-wind-kb 2000` | 61.8 s | 12.9 s | **4.8×** |
+
+#### Scaling to larger reference panels
+
+LDSC computes LD scores from a reference panel (typically ~2,500 individuals), not from the
+full biobank. Larger datasets arise from imputed or whole-genome sequencing panels with more
+SNPs. The chunked ring-buffer algorithm processes SNPs in fixed-size chunks with bounded
+working memory (ring buffer + GEMM scratch sized by the LD window, not total SNP count), so
+runtime scales linearly with M while peak memory stays constant:
+
+| M (SNPs) | Est. wall time (AWS EPYC 16v) | BED size (N = 2,490) | Peak memory |
+|----------|-------------------------------|----------------------|-------------|
+| 1.66M | 41 s *(measured)* | 1 GB | ~100 MB |
+| 5M | ~124 s | 3 GB | ~100 MB |
+| 10M | ~247 s | 6 GB | ~100 MB |
+| 50M | ~1,235 s (~21 min) | 30 GB | ~100 MB |
+
+Projections extrapolate linearly from the measured 1.66M-SNP runtime. Per-chunk GEMM cost is
+O(N × window × chunk) and independent of total SNP count; the loop simply runs more
+iterations. BED I/O is sequential and throughput-bound (~2–5 GB/s on SSD, 5–7 GB/s on NVMe),
+contributing < 5% of runtime even at 50M SNPs.
 
 Additional UKBB I/O benchmarks on this machine (Apple M4, 10 CPU cores, 24 GB RAM, macOS 26.3
 build 25D125). These highlight I/O-heavy workflows and the impact of the Rust pipeline’s faster
