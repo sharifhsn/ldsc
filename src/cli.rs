@@ -299,6 +299,13 @@ pub struct L2Args {
     #[arg(long)]
     pub fast_f32: bool,
 
+    /// Use Hutchinson's stochastic trace estimator with T random probes instead
+    /// of exact GEMM for LD score computation. Trades precision for speed:
+    /// ~sqrt(2/T) relative error per SNP. Only effective for scalar (non-partitioned)
+    /// LD scores; partitioned mode falls back to exact computation.
+    #[arg(long, value_name = "PROBES", conflicts_with = "gpu")]
+    pub stochastic: Option<usize>,
+
     /// Print per-section timing breakdown to stderr.
     #[arg(long)]
     pub verbose_timing: bool,

@@ -81,6 +81,26 @@ unsafe fn sum_sumsq_f32(data: &[f32]) -> (f64, f64) {
     (sum, sum_sq)
 }
 
+/// Fill a slice with Rademacher random values (+1.0 or -1.0) using bits from `rng`.
+fn fill_rademacher_f64(rng: &mut fastrand::Rng, buf: &mut [f64]) {
+    for chunk in buf.chunks_mut(64) {
+        let bits = rng.u64(..);
+        for (j, v) in chunk.iter_mut().enumerate() {
+            *v = if (bits >> j) & 1 == 0 { 1.0 } else { -1.0 };
+        }
+    }
+}
+
+/// Fill a slice with Rademacher random values (+1.0 or -1.0) using bits from `rng`.
+fn fill_rademacher_f32(rng: &mut fastrand::Rng, buf: &mut [f32]) {
+    for chunk in buf.chunks_mut(64) {
+        let bits = rng.u64(..);
+        for (j, v) in chunk.iter_mut().enumerate() {
+            *v = if (bits >> j) & 1 == 0 { 1.0 } else { -1.0 };
+        }
+    }
+}
+
 /// GEMM scratch buffers — either f32 (fast) or f64 (default precision).
 enum GemmBufs {
     F64 {
@@ -426,7 +446,11 @@ fn normalize_col_f32_with_stats(
     let centered_sum_sq = sum_sq - count as f64 * avg * avg;
     let var = centered_sum_sq / n as f64;
     let std = var.sqrt();
-    let inv_std_f32 = if std > 0.0 { (1.0 / std) as f32 } else { 0.0f32 };
+    let inv_std_f32 = if std > 0.0 {
+        (1.0 / std) as f32
+    } else {
+        0.0f32
+    };
     let avg_f32 = avg as f32;
 
     // Single fused pass: impute NaN, center, and scale
@@ -467,6 +491,7 @@ fn compute_ldscore_global(
     use_f32: bool,
     prefetch_bed: bool,
     verbose_timing: bool,
+    stochastic: Option<usize>,
 ) -> Result<(MatF, Vec<f64>)> {
     let m = all_snps.len();
     if m == 0 {
@@ -537,13 +562,96 @@ fn compute_ldscore_global(
     );
     let n_annot = annot.ncols();
     let mut l2 = MatF::zeros(m, n_annot);
+
+    // Determine if stochastic Hutchinson mode is usable.
+    let stochastic_probes: Option<usize> = stochastic.and_then(|t| {
+        if t == 0 {
+            return None;
+        }
+        if n_annot > 1 {
+            eprintln!(
+                "WARNING: --stochastic not supported for partitioned LD scores; using exact GEMM"
+            );
+            return None;
+        }
+        if pq_exp.is_some() {
+            eprintln!("WARNING: --stochastic not supported with --pq-exp; using exact GEMM");
+            return None;
+        }
+        Some(t)
+    });
+
+    // Stochastic Hutchinson scratch buffers — batched probe matrices.
+    // Instead of T separate mat-vecs, batch all probes into a single GEMM:
+    //   Z (c×T random), Y = B*Z (n×T), Q = B'*Y (c×T), hutch[j] = sum_t Q[j,t]^2
+    let mut rng = stochastic_probes.map(|_| fastrand::Rng::with_seed(42));
+    let n_probes_alloc = stochastic_probes.unwrap_or(0);
+    let mut hutch_z_c_f64 = if n_probes_alloc > 0 && !use_f32 {
+        MatF::zeros(chunk_c, n_probes_alloc)
+    } else {
+        MatF::zeros(0, 0)
+    };
+    let mut hutch_z_c_f32 = if n_probes_alloc > 0 && use_f32 {
+        MatF32::zeros(chunk_c, n_probes_alloc)
+    } else {
+        MatF32::zeros(0, 0)
+    };
+    let mut hutch_z_w_f64 = if n_probes_alloc > 0 && !use_f32 {
+        MatF::zeros(max_window_size.max(1), n_probes_alloc)
+    } else {
+        MatF::zeros(0, 0)
+    };
+    let mut hutch_z_w_f32 = if n_probes_alloc > 0 && use_f32 {
+        MatF32::zeros(max_window_size.max(1), n_probes_alloc)
+    } else {
+        MatF32::zeros(0, 0)
+    };
+    let mut hutch_y_f64 = if n_probes_alloc > 0 && !use_f32 {
+        MatF::zeros(n_indiv, n_probes_alloc)
+    } else {
+        MatF::zeros(0, 0)
+    };
+    let mut hutch_y_f32 = if n_probes_alloc > 0 && use_f32 {
+        MatF32::zeros(n_indiv, n_probes_alloc)
+    } else {
+        MatF32::zeros(0, 0)
+    };
+    let mut hutch_q_f64 = if n_probes_alloc > 0 && !use_f32 {
+        MatF::zeros(chunk_c, n_probes_alloc)
+    } else {
+        MatF::zeros(0, 0)
+    };
+    let mut hutch_q_f32 = if n_probes_alloc > 0 && use_f32 {
+        MatF32::zeros(chunk_c, n_probes_alloc)
+    } else {
+        MatF32::zeros(0, 0)
+    };
+    let mut hutch_p_f64 = if n_probes_alloc > 0 && !use_f32 {
+        MatF::zeros(max_window_size.max(1), n_probes_alloc)
+    } else {
+        MatF::zeros(0, 0)
+    };
+    let mut hutch_p_f32 = if n_probes_alloc > 0 && use_f32 {
+        MatF32::zeros(max_window_size.max(1), n_probes_alloc)
+    } else {
+        MatF32::zeros(0, 0)
+    };
+
     let mut r2u_bb = MatF::zeros(chunk_c, chunk_c);
     let mut r2u_ab = MatF::zeros(max_window_size.max(1), chunk_c);
 
     // Pre-allocate scratch matrices used per chunk (avoids alloc+zero every iteration).
     // All are written with Accum::Replace (full overwrite) so stale data is harmless.
-    let mut bb_f64 = if !use_f32 { MatF::zeros(chunk_c, chunk_c) } else { MatF::zeros(0, 0) };
-    let mut bb_f32 = if use_f32 { MatF32::zeros(chunk_c, chunk_c) } else { MatF32::zeros(0, 0) };
+    let mut bb_f64 = if !use_f32 {
+        MatF::zeros(chunk_c, chunk_c)
+    } else {
+        MatF::zeros(0, 0)
+    };
+    let mut bb_f32 = if use_f32 {
+        MatF32::zeros(chunk_c, chunk_c)
+    } else {
+        MatF32::zeros(0, 0)
+    };
     let mut contrib_bb = MatF::zeros(chunk_c, n_annot);
     let mut contrib_left = MatF::zeros(max_window_size.max(1), n_annot);
     let mut contrib_right = MatF::zeros(chunk_c, n_annot);
@@ -599,7 +707,11 @@ fn compute_ldscore_global(
                     .iter()
                     .map(|s| s.bed_idx as isize)
                     .collect();
-                ChunkSpec { chunk_start: start, chunk_end: end, bed_indices }
+                ChunkSpec {
+                    chunk_start: start,
+                    chunk_end: end,
+                    bed_indices,
+                }
             })
             .collect();
 
@@ -625,7 +737,10 @@ fn compute_ldscore_global(
                         builder.read(&mut bed)
                     };
                     raw.with_context(|| {
-                        format!("reading BED chunk [{},{})", spec.chunk_start, spec.chunk_end)
+                        format!(
+                            "reading BED chunk [{},{})",
+                            spec.chunk_start, spec.chunk_end
+                        )
                     })
                 };
                 let msg = result.map(|raw| (spec.chunk_start, spec.chunk_end, raw));
@@ -712,9 +827,7 @@ fn compute_ldscore_global(
                 let bed = seq_bed.as_mut().unwrap();
                 let cr = chunk_reader.as_mut().unwrap();
                 cr.read_contiguous(bed, start_bed_idx, c)
-                    .with_context(|| {
-                        format!("reading BED chunk [{},{})", chunk_start, chunk_end)
-                    })?
+                    .with_context(|| format!("reading BED chunk [{},{})", chunk_start, chunk_end))?
             } else {
                 // Fallback: non-contiguous BED indices (--extract with gaps)
                 let bed_indices: Vec<isize> = all_snps[chunk_start..chunk_end]
@@ -742,10 +855,12 @@ fn compute_ldscore_global(
             // Get raw column as contiguous slice (1 bounds check vs 2 per element)
             let raw_col = raw_ref.col(j).try_as_col_major().unwrap().as_slice();
             match bufs {
-                GemmBufs::F32 {
-                    ref mut b_mat, ..
-                } => {
-                    let col = b_mat.col_mut(j).try_as_col_major_mut().unwrap().as_slice_mut();
+                GemmBufs::F32 { ref mut b_mat, .. } => {
+                    let col = b_mat
+                        .col_mut(j)
+                        .try_as_col_major_mut()
+                        .unwrap()
+                        .as_slice_mut();
                     col[..n_indiv].copy_from_slice(&raw_col[..n_indiv]);
                     // SAFETY: we build with +avx2,+fma for the musl target;
                     // native builds have AVX2 on any modern x86_64 CPU.
@@ -776,10 +891,12 @@ fn compute_ldscore_global(
                         pq_vec[chunk_start + j] = pq;
                     }
                 }
-                GemmBufs::F64 {
-                    ref mut b_mat, ..
-                } => {
-                    let col = b_mat.col_mut(j).try_as_col_major_mut().unwrap().as_slice_mut();
+                GemmBufs::F64 { ref mut b_mat, .. } => {
+                    let col = b_mat
+                        .col_mut(j)
+                        .try_as_col_major_mut()
+                        .unwrap()
+                        .as_slice_mut();
                     // SAFETY: see above.
                     let (sum, sum_sq) = unsafe { sum_sumsq_f32(&raw_col[..n_indiv]) };
                     // Widening copy (f32 → f64) — vectorizes to vcvtps2pd + vmovupd
@@ -854,221 +971,241 @@ fn compute_ldscore_global(
             (None, all_zero)
         };
 
-        // B×B — compute GEMM then extract r2_unbiased into r2u_bb (always f64).
-        let t0 = Instant::now();
-        if !chunk_all_zero {
-            // Inline helper: fill r2u_bb from bb matrix values.
-            // Generic over closure to avoid dyn dispatch in inner loop.
-            // Uses pre-computed n_inv²·r2u_a to save one multiply per iteration.
-            #[inline(always)]
-            fn fill_r2u_bb_from<F: Fn(usize, usize) -> f64>(
-                r2u_bb: &mut MatF, c: usize, n_inv_sq_r2u_a: f64, r2u_b: f64, bb_val: F,
-            ) {
-                // Column-major zeroing: inner loop over rows (stride-1)
-                for k in 0..c {
-                    for j in 0..c {
-                        r2u_bb[(j, k)] = 0.0;
+        // ---- Stochastic Hutchinson path (batched GEMM, scalar LD only) ----
+        // Instead of T separate mat-vecs, batch all probes into matrix operations:
+        //   Z (c×T random), Y = B*Z (n×T), Q = B'*Y = (B'B)*Z (c×T)
+        //   hutch[j] = sum_t Q[j,t]^2 / T  ≈  sum_k (B'B)[j,k]^2
+        if let Some(n_probes) = stochastic_probes {
+            let rng = rng.as_mut().unwrap();
+            let n_sq = n * n;
+            let inv_t = 1.0 / n_probes as f64;
+
+            /// Sum of squared elements per row of a matrix: result[i] = sum_j mat[i,j]^2
+            fn row_sum_sq(mat: faer::MatRef<'_, f64>, nrows: usize, ncols: usize) -> Vec<f64> {
+                let mut out = vec![0.0f64; nrows];
+                for j in 0..ncols {
+                    let col = mat.col(j).try_as_col_major().unwrap().as_slice();
+                    for (i, v) in col[..nrows].iter().enumerate() {
+                        out[i] += v * v;
                     }
                 }
-                for j in 0..c {
-                    r2u_bb[(j, j)] = 1.0;
-                    for k in 0..j {
-                        let val = bb_val(k, j);
-                        let r2u = val * val * n_inv_sq_r2u_a + r2u_b;
-                        r2u_bb[(j, k)] = r2u;
-                        r2u_bb[(k, j)] = r2u;
-                    }
-                }
+                out
             }
 
-            match bufs {
-                GemmBufs::F32 { ref b_mat, .. } => {
-                    let b_slice = mat_slice_f32(b_mat.as_ref(), 0..n_indiv, 0..c);
-                    #[allow(unused_mut)]
-                    let mut bb_sl = mat_slice_mut_f32(bb_f32.as_mut(), 0..c, 0..c);
-                    let mut _did_gpu = false;
-                    #[cfg(feature = "gpu")]
-                    {
-                        if let Some(ref ctx) = gpu_ctx {
-                            let b_f32 = mat_to_col_major_f32_from_f32(b_slice, n_indiv, c);
-                            let gpu_result = if let Some(tc) = _gpu_tile_cols {
-                                if _gpu_flex32 {
-                                    ctx.matmul_tn_tiled_flex32(&b_f32, n_indiv, c, &b_f32, c, tc)
-                                } else {
-                                    ctx.matmul_tn_tiled(&b_f32, n_indiv, c, &b_f32, c, tc)
-                                }
-                            } else if _gpu_flex32 {
-                                ctx.matmul_tn_flex32(&b_f32, n_indiv, c, &b_f32, c)
-                            } else {
-                                ctx.matmul_tn(&b_f32, n_indiv, c, &b_f32, c)
-                            };
-                            match gpu_result {
-                                Ok(result) => {
-                                    write_gpu_result_f32(&result, bb_sl.as_mut(), c, c);
-                                    _did_gpu = true;
-                                }
-                                Err(e) => eprintln!("GPU: f32 B×B matmul failed ({e}), falling back to CPU"),
-                            }
-                        }
+            /// Sum of squared elements per row (f32 input, f64 accumulation).
+            fn row_sum_sq_f32(mat: faer::MatRef<'_, f32>, nrows: usize, ncols: usize) -> Vec<f64> {
+                let mut out = vec![0.0f64; nrows];
+                for j in 0..ncols {
+                    let col = mat.col(j).try_as_col_major().unwrap().as_slice();
+                    for (i, v) in col[..nrows].iter().enumerate() {
+                        let vf = *v as f64;
+                        out[i] += vf * vf;
                     }
-                    if !_did_gpu {
-                        matmul_tn_to_f32(
-                            bb_sl,
-                            b_slice,
-                            b_slice,
-                            1.0f32,
-                            Accum::Replace,
-                            Par::rayon(0),
-                        );
-                    }
-                    fill_r2u_bb_from(&mut r2u_bb, c, n_inv_sq_r2u_a, r2u_b, |k, j| bb_f32[(k, j)] as f64);
                 }
+                out
+            }
+
+            // bb via batched Hutchinson
+            let t0 = Instant::now();
+            let hutch_bb = match bufs {
                 GemmBufs::F64 { ref b_mat, .. } => {
-                    let b_slice = mat_slice(b_mat.as_ref(), 0..n_indiv, 0..c);
-                    #[allow(unused_mut)]
-                    let mut bb_sl = mat_slice_mut(bb_f64.as_mut(), 0..c, 0..c);
-                    let mut _did_gpu = false;
-                    #[cfg(feature = "gpu")]
-                    {
-                        if let Some(ref ctx) = gpu_ctx {
-                            if _gpu_f64 && ctx.capabilities.has_f64 {
-                                // Native f64 path — no precision loss
-                                let b_f64 = mat_to_col_major_f64(b_slice, n_indiv, c);
-                                let gpu_result = if let Some(tc) = _gpu_tile_cols {
-                                    ctx.matmul_tn_tiled_f64(&b_f64, n_indiv, c, &b_f64, c, tc)
-                                } else {
-                                    ctx.matmul_tn_f64(&b_f64, n_indiv, c, &b_f64, c)
-                                };
-                                match gpu_result {
-                                    Ok(result) => {
-                                        write_gpu_result_f64_native(&result, bb_sl.as_mut(), c, c);
-                                        _did_gpu = true;
-                                    }
-                                    Err(e) => eprintln!("GPU: f64 B×B matmul failed ({e}), falling back to CPU"),
-                                }
-                            } else {
-                                // f32 conversion path
-                                let b_f32 = mat_to_col_major_f32_from_f64(b_slice, n_indiv, c);
-                                let gpu_result = if let Some(tc) = _gpu_tile_cols {
-                                    if _gpu_flex32 {
-                                        ctx.matmul_tn_tiled_flex32(&b_f32, n_indiv, c, &b_f32, c, tc)
-                                    } else {
-                                        ctx.matmul_tn_tiled(&b_f32, n_indiv, c, &b_f32, c, tc)
-                                    }
-                                } else if _gpu_flex32 {
-                                    ctx.matmul_tn_flex32(&b_f32, n_indiv, c, &b_f32, c)
-                                } else {
-                                    ctx.matmul_tn(&b_f32, n_indiv, c, &b_f32, c)
-                                };
-                                match gpu_result {
-                                    Ok(result) => {
-                                        write_gpu_result_f64(&result, bb_sl.as_mut(), c, c);
-                                        _did_gpu = true;
-                                    }
-                                    Err(e) => eprintln!("GPU: B×B matmul failed ({e}), falling back to CPU"),
-                                }
+                    let b_sl = mat_slice(b_mat.as_ref(), 0..n_indiv, 0..c);
+                    // Fill Z (c × T) with Rademacher values
+                    for t in 0..n_probes {
+                        fill_rademacher_f64(
+                            rng,
+                            &mut hutch_z_c_f64
+                                .col_mut(t)
+                                .try_as_col_major_mut()
+                                .unwrap()
+                                .as_slice_mut()[..c],
+                        );
+                    }
+                    let z_ref = mat_slice(hutch_z_c_f64.as_ref(), 0..c, 0..n_probes);
+                    // Y = B * Z  (n × T)
+                    matmul_to(
+                        mat_slice_mut(hutch_y_f64.as_mut(), 0..n_indiv, 0..n_probes),
+                        b_sl,
+                        z_ref,
+                        1.0,
+                        Accum::Replace,
+                        Par::rayon(0),
+                    );
+                    let y_ref = mat_slice(hutch_y_f64.as_ref(), 0..n_indiv, 0..n_probes);
+                    // Q = B' * Y = (B'B) * Z  (c × T)
+                    matmul_tn_to(
+                        mat_slice_mut(hutch_q_f64.as_mut(), 0..c, 0..n_probes),
+                        b_sl,
+                        y_ref,
+                        1.0,
+                        Accum::Replace,
+                        Par::rayon(0),
+                    );
+                    row_sum_sq(
+                        mat_slice(hutch_q_f64.as_ref(), 0..c, 0..n_probes),
+                        c,
+                        n_probes,
+                    )
+                }
+                GemmBufs::F32 { ref b_mat, .. } => {
+                    let b_sl = mat_slice_f32(b_mat.as_ref(), 0..n_indiv, 0..c);
+                    for t in 0..n_probes {
+                        fill_rademacher_f32(
+                            rng,
+                            &mut hutch_z_c_f32
+                                .col_mut(t)
+                                .try_as_col_major_mut()
+                                .unwrap()
+                                .as_slice_mut()[..c],
+                        );
+                    }
+                    let z_ref = mat_slice_f32(hutch_z_c_f32.as_ref(), 0..c, 0..n_probes);
+                    faer::linalg::matmul::matmul(
+                        mat_slice_mut_f32(hutch_y_f32.as_mut(), 0..n_indiv, 0..n_probes),
+                        Accum::Replace,
+                        b_sl,
+                        z_ref,
+                        1.0f32,
+                        Par::rayon(0),
+                    );
+                    let y_ref = mat_slice_f32(hutch_y_f32.as_ref(), 0..n_indiv, 0..n_probes);
+                    faer::linalg::matmul::matmul(
+                        mat_slice_mut_f32(hutch_q_f32.as_mut(), 0..c, 0..n_probes),
+                        Accum::Replace,
+                        b_sl.transpose(),
+                        y_ref,
+                        1.0f32,
+                        Par::rayon(0),
+                    );
+                    row_sum_sq_f32(
+                        mat_slice_f32(hutch_q_f32.as_ref(), 0..c, 0..n_probes),
+                        c,
+                        n_probes,
+                    )
+                }
+            };
+            // Convert: hutch_bb[j]/T ≈ sum_k G[j,k]^2 (including diagonal n^2)
+            for j in 0..c {
+                let est = hutch_bb[j] * inv_t;
+                l2[(chunk_start + j, 0)] +=
+                    1.0 + n_inv_sq_r2u_a * (est - n_sq) + (c as f64 - 1.0) * r2u_b;
+            }
+            t_bb_dot += t0.elapsed();
+
+            // ab via batched Hutchinson
+            let t0 = Instant::now();
+            if !window.is_empty() {
+                let w = window.len();
+                let (first_slot, last_slot) = window
+                    .front()
+                    .and_then(|(_, f)| window.back().map(|(_, l)| (*f, *l)))
+                    .unwrap_or((0, 0));
+                let contiguous = first_slot <= last_slot && last_slot - first_slot + 1 == w;
+
+                match bufs {
+                    GemmBufs::F64 {
+                        ref ring_buf,
+                        ref b_mat,
+                        ref mut a_buf,
+                        ..
+                    } => {
+                        if !contiguous {
+                            for (wi, (_, slot)) in window.iter().enumerate() {
+                                a_buf
+                                    .as_mut()
+                                    .submatrix_mut(0, wi, n_indiv, 1)
+                                    .copy_from(ring_buf.as_ref().submatrix(0, *slot, n_indiv, 1));
                             }
                         }
-                    }
-                    if !_did_gpu {
-                        matmul_tn_to(
-                            bb_sl,
-                            b_slice,
-                            b_slice,
-                            1.0f64,
+                        let a_view = if contiguous {
+                            mat_slice(ring_buf.as_ref(), 0..n_indiv, first_slot..(first_slot + w))
+                        } else {
+                            mat_slice(a_buf.as_ref(), 0..n_indiv, 0..w)
+                        };
+                        let b_sl = mat_slice(b_mat.as_ref(), 0..n_indiv, 0..c);
+
+                        // ab left: Z_c (c×T), Y=B*Z_c, P=A'*Y → hutch_ab_left
+                        for t in 0..n_probes {
+                            fill_rademacher_f64(
+                                rng,
+                                &mut hutch_z_c_f64
+                                    .col_mut(t)
+                                    .try_as_col_major_mut()
+                                    .unwrap()
+                                    .as_slice_mut()[..c],
+                            );
+                        }
+                        let z_ref = mat_slice(hutch_z_c_f64.as_ref(), 0..c, 0..n_probes);
+                        matmul_to(
+                            mat_slice_mut(hutch_y_f64.as_mut(), 0..n_indiv, 0..n_probes),
+                            b_sl,
+                            z_ref,
+                            1.0,
                             Accum::Replace,
                             Par::rayon(0),
                         );
-                    }
-                    fill_r2u_bb_from(&mut r2u_bb, c, n_inv_sq_r2u_a, r2u_b, |k, j| bb_f64[(k, j)]);
-                }
-            }
-            let r2u_bb_view = mat_slice(r2u_bb.as_ref(), 0..c, 0..c);
-            // Small matmul (c×c @ c×n_annot) — Par::Seq avoids thread-pool overhead
-            if let Some(ref eff) = annot_chunk_eff {
-                matmul_to(
-                    mat_slice_mut(contrib_bb.as_mut(), 0..c, 0..n_annot),
-                    r2u_bb_view,
-                    eff.as_ref(),
-                    1.0,
-                    Accum::Replace,
-                    Par::Seq,
-                );
-            } else {
-                matmul_to(
-                    mat_slice_mut(contrib_bb.as_mut(), 0..c, 0..n_annot),
-                    r2u_bb_view,
-                    annot_chunk,
-                    1.0,
-                    Accum::Replace,
-                    Par::Seq,
-                );
-            }
-            mat_add_in_place(
-                mat_slice_mut(l2.as_mut(), chunk_start..chunk_end, 0..n_annot),
-                mat_slice(contrib_bb.as_ref(), 0..c, 0..n_annot),
-            );
-        }
-        t_bb_dot += t0.elapsed();
+                        let y_ref = mat_slice(hutch_y_f64.as_ref(), 0..n_indiv, 0..n_probes);
+                        matmul_tn_to(
+                            mat_slice_mut(hutch_p_f64.as_mut(), 0..w, 0..n_probes),
+                            a_view,
+                            y_ref,
+                            1.0,
+                            Accum::Replace,
+                            Par::rayon(0),
+                        );
+                        let hutch_ab_left = row_sum_sq(
+                            mat_slice(hutch_p_f64.as_ref(), 0..w, 0..n_probes),
+                            w,
+                            n_probes,
+                        );
+                        for (wi, (snp_idx, _)) in window.iter().enumerate() {
+                            let est = hutch_ab_left[wi] * inv_t;
+                            l2[(*snp_idx, 0)] += n_inv_sq_r2u_a * est + c as f64 * r2u_b;
+                        }
 
-        // A×B
-        let t0 = Instant::now();
-        if !window.is_empty() {
-            let w = window.len();
-            let a_left_idx = window.front().map(|(idx, _)| *idx).unwrap_or(0);
-            let (first_slot, last_slot) = window
-                .front()
-                .and_then(|(_, f)| window.back().map(|(_, l)| (*f, *l)))
-                .unwrap_or((0, 0));
-            let contiguous = first_slot <= last_slot && last_slot - first_slot + 1 == w;
-
-            let annot_window = mat_slice(annot.as_ref(), a_left_idx..chunk_start, 0..n_annot);
-            let (annot_window_eff, window_all_zero) = if let Some(ref pq_vec) = pq_per_snp {
-                let mut eff = MatF::zeros(w, n_annot);
-                mat_copy_from(eff.as_mut(), annot_window);
-                for (wi, (w_g, _)) in window.iter().enumerate() {
-                    let pq = pq_vec[*w_g];
-                    for k in 0..n_annot {
-                        eff[(wi, k)] *= pq;
-                    }
-                }
-                let mut all_zero = true;
-                for i in 0..w {
-                    for k in 0..n_annot {
-                        if eff[(i, k)] != 0.0 {
-                            all_zero = false;
-                            break;
+                        // ab right: Z_w (w×T), Y=A*Z_w, Q=B'*Y → hutch_ab_right
+                        for t in 0..n_probes {
+                            fill_rademacher_f64(
+                                rng,
+                                &mut hutch_z_w_f64
+                                    .col_mut(t)
+                                    .try_as_col_major_mut()
+                                    .unwrap()
+                                    .as_slice_mut()[..w],
+                            );
+                        }
+                        let z_ref = mat_slice(hutch_z_w_f64.as_ref(), 0..w, 0..n_probes);
+                        matmul_to(
+                            mat_slice_mut(hutch_y_f64.as_mut(), 0..n_indiv, 0..n_probes),
+                            a_view,
+                            z_ref,
+                            1.0,
+                            Accum::Replace,
+                            Par::rayon(0),
+                        );
+                        let y_ref = mat_slice(hutch_y_f64.as_ref(), 0..n_indiv, 0..n_probes);
+                        matmul_tn_to(
+                            mat_slice_mut(hutch_q_f64.as_mut(), 0..c, 0..n_probes),
+                            b_sl,
+                            y_ref,
+                            1.0,
+                            Accum::Replace,
+                            Par::rayon(0),
+                        );
+                        let hutch_ab_right = row_sum_sq(
+                            mat_slice(hutch_q_f64.as_ref(), 0..c, 0..n_probes),
+                            c,
+                            n_probes,
+                        );
+                        for j in 0..c {
+                            let est = hutch_ab_right[j] * inv_t;
+                            l2[(chunk_start + j, 0)] += n_inv_sq_r2u_a * est + w as f64 * r2u_b;
                         }
                     }
-                    if !all_zero {
-                        break;
-                    }
-                }
-                (Some(eff), all_zero)
-            } else {
-                let mut all_zero = true;
-                for i in 0..w {
-                    for k in 0..n_annot {
-                        if annot_window[(i, k)] != 0.0 {
-                            all_zero = false;
-                            break;
-                        }
-                    }
-                    if !all_zero {
-                        break;
-                    }
-                }
-                (None, all_zero)
-            };
-
-            if !(chunk_all_zero && window_all_zero) {
-                // Compute A^T × B GEMM, then fill r2u_ab (always f64).
-                match bufs {
                     GemmBufs::F32 {
-                        ref mut ring_buf,
-                        ref mut b_mat,
+                        ref ring_buf,
+                        ref b_mat,
                         ref mut a_buf,
-                        ref mut ab_buf,
                         ..
                     } => {
                         if !contiguous {
@@ -1090,117 +1227,354 @@ fn compute_ldscore_global(
                         };
                         let b_sl = mat_slice_f32(b_mat.as_ref(), 0..n_indiv, 0..c);
 
+                        // ab left
+                        for t in 0..n_probes {
+                            fill_rademacher_f32(
+                                rng,
+                                &mut hutch_z_c_f32
+                                    .col_mut(t)
+                                    .try_as_col_major_mut()
+                                    .unwrap()
+                                    .as_slice_mut()[..c],
+                            );
+                        }
+                        let z_ref = mat_slice_f32(hutch_z_c_f32.as_ref(), 0..c, 0..n_probes);
+                        faer::linalg::matmul::matmul(
+                            mat_slice_mut_f32(hutch_y_f32.as_mut(), 0..n_indiv, 0..n_probes),
+                            Accum::Replace,
+                            b_sl,
+                            z_ref,
+                            1.0f32,
+                            Par::rayon(0),
+                        );
+                        let y_ref = mat_slice_f32(hutch_y_f32.as_ref(), 0..n_indiv, 0..n_probes);
+                        faer::linalg::matmul::matmul(
+                            mat_slice_mut_f32(hutch_p_f32.as_mut(), 0..w, 0..n_probes),
+                            Accum::Replace,
+                            a_view.transpose(),
+                            y_ref,
+                            1.0f32,
+                            Par::rayon(0),
+                        );
+                        let hutch_ab_left = row_sum_sq_f32(
+                            mat_slice_f32(hutch_p_f32.as_ref(), 0..w, 0..n_probes),
+                            w,
+                            n_probes,
+                        );
+                        for (wi, (snp_idx, _)) in window.iter().enumerate() {
+                            let est = hutch_ab_left[wi] * inv_t;
+                            l2[(*snp_idx, 0)] += n_inv_sq_r2u_a * est + c as f64 * r2u_b;
+                        }
+
+                        // ab right
+                        for t in 0..n_probes {
+                            fill_rademacher_f32(
+                                rng,
+                                &mut hutch_z_w_f32
+                                    .col_mut(t)
+                                    .try_as_col_major_mut()
+                                    .unwrap()
+                                    .as_slice_mut()[..w],
+                            );
+                        }
+                        let z_ref = mat_slice_f32(hutch_z_w_f32.as_ref(), 0..w, 0..n_probes);
+                        faer::linalg::matmul::matmul(
+                            mat_slice_mut_f32(hutch_y_f32.as_mut(), 0..n_indiv, 0..n_probes),
+                            Accum::Replace,
+                            a_view,
+                            z_ref,
+                            1.0f32,
+                            Par::rayon(0),
+                        );
+                        let y_ref = mat_slice_f32(hutch_y_f32.as_ref(), 0..n_indiv, 0..n_probes);
+                        faer::linalg::matmul::matmul(
+                            mat_slice_mut_f32(hutch_q_f32.as_mut(), 0..c, 0..n_probes),
+                            Accum::Replace,
+                            b_sl.transpose(),
+                            y_ref,
+                            1.0f32,
+                            Par::rayon(0),
+                        );
+                        let hutch_ab_right = row_sum_sq_f32(
+                            mat_slice_f32(hutch_q_f32.as_ref(), 0..c, 0..n_probes),
+                            c,
+                            n_probes,
+                        );
+                        for j in 0..c {
+                            let est = hutch_ab_right[j] * inv_t;
+                            l2[(chunk_start + j, 0)] += n_inv_sq_r2u_a * est + w as f64 * r2u_b;
+                        }
+                    }
+                }
+            }
+            t_ab_dot += t0.elapsed();
+        } else {
+            // ---- Exact GEMM path ----
+
+            // B×B — compute GEMM then extract r2_unbiased into r2u_bb (always f64).
+            let t0 = Instant::now();
+            if !chunk_all_zero {
+                // Inline helper: fill r2u_bb from bb matrix values.
+                // Generic over closure to avoid dyn dispatch in inner loop.
+                // Uses pre-computed n_inv²·r2u_a to save one multiply per iteration.
+                #[inline(always)]
+                fn fill_r2u_bb_from<F: Fn(usize, usize) -> f64>(
+                    r2u_bb: &mut MatF,
+                    c: usize,
+                    n_inv_sq_r2u_a: f64,
+                    r2u_b: f64,
+                    bb_val: F,
+                ) {
+                    // Column-major zeroing: inner loop over rows (stride-1)
+                    for k in 0..c {
+                        for j in 0..c {
+                            r2u_bb[(j, k)] = 0.0;
+                        }
+                    }
+                    for j in 0..c {
+                        r2u_bb[(j, j)] = 1.0;
+                        for k in 0..j {
+                            let val = bb_val(k, j);
+                            let r2u = val * val * n_inv_sq_r2u_a + r2u_b;
+                            r2u_bb[(j, k)] = r2u;
+                            r2u_bb[(k, j)] = r2u;
+                        }
+                    }
+                }
+
+                match bufs {
+                    GemmBufs::F32 { ref b_mat, .. } => {
+                        let b_slice = mat_slice_f32(b_mat.as_ref(), 0..n_indiv, 0..c);
+                        #[allow(unused_mut)]
+                        let mut bb_sl = mat_slice_mut_f32(bb_f32.as_mut(), 0..c, 0..c);
                         let mut _did_gpu = false;
                         #[cfg(feature = "gpu")]
                         {
                             if let Some(ref ctx) = gpu_ctx {
-                                let a_f32 = mat_to_col_major_f32_from_f32(a_view, n_indiv, w);
-                                let b_f32 = mat_to_col_major_f32_from_f32(b_sl, n_indiv, c);
+                                let b_f32 = mat_to_col_major_f32_from_f32(b_slice, n_indiv, c);
                                 let gpu_result = if let Some(tc) = _gpu_tile_cols {
                                     if _gpu_flex32 {
                                         ctx.matmul_tn_tiled_flex32(
-                                            &a_f32, n_indiv, w, &b_f32, c, tc,
+                                            &b_f32, n_indiv, c, &b_f32, c, tc,
                                         )
                                     } else {
-                                        ctx.matmul_tn_tiled(&a_f32, n_indiv, w, &b_f32, c, tc)
+                                        ctx.matmul_tn_tiled(&b_f32, n_indiv, c, &b_f32, c, tc)
                                     }
                                 } else if _gpu_flex32 {
-                                    ctx.matmul_tn_flex32(&a_f32, n_indiv, w, &b_f32, c)
+                                    ctx.matmul_tn_flex32(&b_f32, n_indiv, c, &b_f32, c)
                                 } else {
-                                    ctx.matmul_tn(&a_f32, n_indiv, w, &b_f32, c)
+                                    ctx.matmul_tn(&b_f32, n_indiv, c, &b_f32, c)
                                 };
                                 match gpu_result {
                                     Ok(result) => {
-                                        write_gpu_result_f32(
-                                            &result,
-                                            mat_slice_mut_f32(ab_buf.as_mut(), 0..w, 0..c),
-                                            w,
-                                            c,
-                                        );
+                                        write_gpu_result_f32(&result, bb_sl.as_mut(), c, c);
                                         _did_gpu = true;
                                     }
-                                    Err(e) => eprintln!("GPU: f32 A×B matmul failed ({e}), falling back to CPU"),
+                                    Err(e) => eprintln!(
+                                        "GPU: f32 B×B matmul failed ({e}), falling back to CPU"
+                                    ),
                                 }
                             }
                         }
                         if !_did_gpu {
                             matmul_tn_to_f32(
-                                mat_slice_mut_f32(ab_buf.as_mut(), 0..w, 0..c),
-                                a_view,
-                                b_sl,
+                                bb_sl,
+                                b_slice,
+                                b_slice,
                                 1.0f32,
                                 Accum::Replace,
                                 Par::rayon(0),
                             );
                         }
-                        let ab_view = mat_slice_f32(ab_buf.as_ref(), 0..w, 0..c);
-                        // Column-major inner loop with column slices: eliminates faer
-                        // tuple-indexing bounds checks (~8.3B checks for full genome).
-                        // Pre-computed n_inv²·r2u_a saves one multiply per iteration.
-                        for j in 0..c {
-                            let ab_col = ab_view.col(j).try_as_col_major().unwrap().as_slice();
-                            let r2u_col = r2u_ab.col_mut(j).try_as_col_major_mut().unwrap().as_slice_mut();
-                            for (ab_val, r2u_val) in ab_col[..w].iter().zip(r2u_col[..w].iter_mut()) {
-                                let val = *ab_val as f64;
-                                *r2u_val = val * val * n_inv_sq_r2u_a + r2u_b;
-                            }
-                        }
+                        fill_r2u_bb_from(&mut r2u_bb, c, n_inv_sq_r2u_a, r2u_b, |k, j| {
+                            bb_f32[(k, j)] as f64
+                        });
                     }
-                    GemmBufs::F64 {
-                        ref mut ring_buf,
-                        ref mut b_mat,
-                        ref mut a_buf,
-                        ref mut ab_buf,
-                        ..
-                    } => {
-                        if !contiguous {
-                            for (wi, (_, slot)) in window.iter().enumerate() {
-                                a_buf
-                                    .as_mut()
-                                    .submatrix_mut(0, wi, n_indiv, 1)
-                                    .copy_from(ring_buf.as_ref().submatrix(0, *slot, n_indiv, 1));
-                            }
-                        }
-                        let a_view = if contiguous {
-                            mat_slice(ring_buf.as_ref(), 0..n_indiv, first_slot..(first_slot + w))
-                        } else {
-                            mat_slice(a_buf.as_ref(), 0..n_indiv, 0..w)
-                        };
-                        let b_sl = mat_slice(b_mat.as_ref(), 0..n_indiv, 0..c);
-
+                    GemmBufs::F64 { ref b_mat, .. } => {
+                        let b_slice = mat_slice(b_mat.as_ref(), 0..n_indiv, 0..c);
+                        #[allow(unused_mut)]
+                        let mut bb_sl = mat_slice_mut(bb_f64.as_mut(), 0..c, 0..c);
                         let mut _did_gpu = false;
                         #[cfg(feature = "gpu")]
                         {
                             if let Some(ref ctx) = gpu_ctx {
                                 if _gpu_f64 && ctx.capabilities.has_f64 {
-                                    // Native f64 path
-                                    let a_f64_data = mat_to_col_major_f64(a_view, n_indiv, w);
-                                    let b_f64_data = mat_to_col_major_f64(b_sl, n_indiv, c);
+                                    // Native f64 path — no precision loss
+                                    let b_f64 = mat_to_col_major_f64(b_slice, n_indiv, c);
                                     let gpu_result = if let Some(tc) = _gpu_tile_cols {
-                                        ctx.matmul_tn_tiled_f64(
-                                            &a_f64_data, n_indiv, w, &b_f64_data, c, tc,
-                                        )
+                                        ctx.matmul_tn_tiled_f64(&b_f64, n_indiv, c, &b_f64, c, tc)
                                     } else {
-                                        ctx.matmul_tn_f64(
-                                            &a_f64_data, n_indiv, w, &b_f64_data, c,
-                                        )
+                                        ctx.matmul_tn_f64(&b_f64, n_indiv, c, &b_f64, c)
                                     };
                                     match gpu_result {
                                         Ok(result) => {
                                             write_gpu_result_f64_native(
                                                 &result,
-                                                mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
-                                                w,
+                                                bb_sl.as_mut(),
+                                                c,
                                                 c,
                                             );
                                             _did_gpu = true;
                                         }
-                                        Err(e) => eprintln!("GPU: f64 A×B matmul failed ({e}), falling back to CPU"),
+                                        Err(e) => eprintln!(
+                                            "GPU: f64 B×B matmul failed ({e}), falling back to CPU"
+                                        ),
                                     }
                                 } else {
                                     // f32 conversion path
-                                    let a_f32 = mat_to_col_major_f32_from_f64(a_view, n_indiv, w);
-                                    let b_f32 = mat_to_col_major_f32_from_f64(b_sl, n_indiv, c);
+                                    let b_f32 = mat_to_col_major_f32_from_f64(b_slice, n_indiv, c);
+                                    let gpu_result = if let Some(tc) = _gpu_tile_cols {
+                                        if _gpu_flex32 {
+                                            ctx.matmul_tn_tiled_flex32(
+                                                &b_f32, n_indiv, c, &b_f32, c, tc,
+                                            )
+                                        } else {
+                                            ctx.matmul_tn_tiled(&b_f32, n_indiv, c, &b_f32, c, tc)
+                                        }
+                                    } else if _gpu_flex32 {
+                                        ctx.matmul_tn_flex32(&b_f32, n_indiv, c, &b_f32, c)
+                                    } else {
+                                        ctx.matmul_tn(&b_f32, n_indiv, c, &b_f32, c)
+                                    };
+                                    match gpu_result {
+                                        Ok(result) => {
+                                            write_gpu_result_f64(&result, bb_sl.as_mut(), c, c);
+                                            _did_gpu = true;
+                                        }
+                                        Err(e) => eprintln!(
+                                            "GPU: B×B matmul failed ({e}), falling back to CPU"
+                                        ),
+                                    }
+                                }
+                            }
+                        }
+                        if !_did_gpu {
+                            matmul_tn_to(
+                                bb_sl,
+                                b_slice,
+                                b_slice,
+                                1.0f64,
+                                Accum::Replace,
+                                Par::rayon(0),
+                            );
+                        }
+                        fill_r2u_bb_from(&mut r2u_bb, c, n_inv_sq_r2u_a, r2u_b, |k, j| {
+                            bb_f64[(k, j)]
+                        });
+                    }
+                }
+                let r2u_bb_view = mat_slice(r2u_bb.as_ref(), 0..c, 0..c);
+                // Small matmul (c×c @ c×n_annot) — Par::Seq avoids thread-pool overhead
+                if let Some(ref eff) = annot_chunk_eff {
+                    matmul_to(
+                        mat_slice_mut(contrib_bb.as_mut(), 0..c, 0..n_annot),
+                        r2u_bb_view,
+                        eff.as_ref(),
+                        1.0,
+                        Accum::Replace,
+                        Par::Seq,
+                    );
+                } else {
+                    matmul_to(
+                        mat_slice_mut(contrib_bb.as_mut(), 0..c, 0..n_annot),
+                        r2u_bb_view,
+                        annot_chunk,
+                        1.0,
+                        Accum::Replace,
+                        Par::Seq,
+                    );
+                }
+                mat_add_in_place(
+                    mat_slice_mut(l2.as_mut(), chunk_start..chunk_end, 0..n_annot),
+                    mat_slice(contrib_bb.as_ref(), 0..c, 0..n_annot),
+                );
+            }
+            t_bb_dot += t0.elapsed();
+
+            // A×B
+            let t0 = Instant::now();
+            if !window.is_empty() {
+                let w = window.len();
+                let a_left_idx = window.front().map(|(idx, _)| *idx).unwrap_or(0);
+                let (first_slot, last_slot) = window
+                    .front()
+                    .and_then(|(_, f)| window.back().map(|(_, l)| (*f, *l)))
+                    .unwrap_or((0, 0));
+                let contiguous = first_slot <= last_slot && last_slot - first_slot + 1 == w;
+
+                let annot_window = mat_slice(annot.as_ref(), a_left_idx..chunk_start, 0..n_annot);
+                let (annot_window_eff, window_all_zero) = if let Some(ref pq_vec) = pq_per_snp {
+                    let mut eff = MatF::zeros(w, n_annot);
+                    mat_copy_from(eff.as_mut(), annot_window);
+                    for (wi, (w_g, _)) in window.iter().enumerate() {
+                        let pq = pq_vec[*w_g];
+                        for k in 0..n_annot {
+                            eff[(wi, k)] *= pq;
+                        }
+                    }
+                    let mut all_zero = true;
+                    for i in 0..w {
+                        for k in 0..n_annot {
+                            if eff[(i, k)] != 0.0 {
+                                all_zero = false;
+                                break;
+                            }
+                        }
+                        if !all_zero {
+                            break;
+                        }
+                    }
+                    (Some(eff), all_zero)
+                } else {
+                    let mut all_zero = true;
+                    for i in 0..w {
+                        for k in 0..n_annot {
+                            if annot_window[(i, k)] != 0.0 {
+                                all_zero = false;
+                                break;
+                            }
+                        }
+                        if !all_zero {
+                            break;
+                        }
+                    }
+                    (None, all_zero)
+                };
+
+                if !(chunk_all_zero && window_all_zero) {
+                    // Compute A^T × B GEMM, then fill r2u_ab (always f64).
+                    match bufs {
+                        GemmBufs::F32 {
+                            ref mut ring_buf,
+                            ref mut b_mat,
+                            ref mut a_buf,
+                            ref mut ab_buf,
+                            ..
+                        } => {
+                            if !contiguous {
+                                for (wi, (_, slot)) in window.iter().enumerate() {
+                                    a_buf.as_mut().submatrix_mut(0, wi, n_indiv, 1).copy_from(
+                                        ring_buf.as_ref().submatrix(0, *slot, n_indiv, 1),
+                                    );
+                                }
+                            }
+                            let a_view = if contiguous {
+                                mat_slice_f32(
+                                    ring_buf.as_ref(),
+                                    0..n_indiv,
+                                    first_slot..(first_slot + w),
+                                )
+                            } else {
+                                mat_slice_f32(a_buf.as_ref(), 0..n_indiv, 0..w)
+                            };
+                            let b_sl = mat_slice_f32(b_mat.as_ref(), 0..n_indiv, 0..c);
+
+                            let mut _did_gpu = false;
+                            #[cfg(feature = "gpu")]
+                            {
+                                if let Some(ref ctx) = gpu_ctx {
+                                    let a_f32 = mat_to_col_major_f32_from_f32(a_view, n_indiv, w);
+                                    let b_f32 = mat_to_col_major_f32_from_f32(b_sl, n_indiv, c);
                                     let gpu_result = if let Some(tc) = _gpu_tile_cols {
                                         if _gpu_flex32 {
                                             ctx.matmul_tn_tiled_flex32(
@@ -1216,102 +1590,241 @@ fn compute_ldscore_global(
                                     };
                                     match gpu_result {
                                         Ok(result) => {
-                                            write_gpu_result_f64(
+                                            write_gpu_result_f32(
                                                 &result,
-                                                mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
+                                                mat_slice_mut_f32(ab_buf.as_mut(), 0..w, 0..c),
                                                 w,
                                                 c,
                                             );
                                             _did_gpu = true;
                                         }
-                                        Err(e) => eprintln!("GPU: A×B matmul failed ({e}), falling back to CPU"),
+                                        Err(e) => eprintln!(
+                                            "GPU: f32 A×B matmul failed ({e}), falling back to CPU"
+                                        ),
                                     }
                                 }
                             }
+                            if !_did_gpu {
+                                matmul_tn_to_f32(
+                                    mat_slice_mut_f32(ab_buf.as_mut(), 0..w, 0..c),
+                                    a_view,
+                                    b_sl,
+                                    1.0f32,
+                                    Accum::Replace,
+                                    Par::rayon(0),
+                                );
+                            }
+                            let ab_view = mat_slice_f32(ab_buf.as_ref(), 0..w, 0..c);
+                            // Column-major inner loop with column slices: eliminates faer
+                            // tuple-indexing bounds checks (~8.3B checks for full genome).
+                            // Pre-computed n_inv²·r2u_a saves one multiply per iteration.
+                            for j in 0..c {
+                                let ab_col = ab_view.col(j).try_as_col_major().unwrap().as_slice();
+                                let r2u_col = r2u_ab
+                                    .col_mut(j)
+                                    .try_as_col_major_mut()
+                                    .unwrap()
+                                    .as_slice_mut();
+                                for (ab_val, r2u_val) in
+                                    ab_col[..w].iter().zip(r2u_col[..w].iter_mut())
+                                {
+                                    let val = *ab_val as f64;
+                                    *r2u_val = val * val * n_inv_sq_r2u_a + r2u_b;
+                                }
+                            }
                         }
-                        if !_did_gpu {
-                            matmul_tn_to(
-                                mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
-                                a_view,
-                                b_sl,
-                                1.0f64,
-                                Accum::Replace,
-                                Par::rayon(0),
-                            );
-                        }
-                        let ab_view = mat_slice(ab_buf.as_ref(), 0..w, 0..c);
-                        // Column-major inner loop with column slices: eliminates faer
-                        // tuple-indexing bounds checks. Pre-computed constant saves 1 mul.
-                        for j in 0..c {
-                            let ab_col = ab_view.col(j).try_as_col_major().unwrap().as_slice();
-                            let r2u_col = r2u_ab.col_mut(j).try_as_col_major_mut().unwrap().as_slice_mut();
-                            for (ab_val, r2u_val) in ab_col[..w].iter().zip(r2u_col[..w].iter_mut()) {
-                                *r2u_val = *ab_val * *ab_val * n_inv_sq_r2u_a + r2u_b;
+                        GemmBufs::F64 {
+                            ref mut ring_buf,
+                            ref mut b_mat,
+                            ref mut a_buf,
+                            ref mut ab_buf,
+                            ..
+                        } => {
+                            if !contiguous {
+                                for (wi, (_, slot)) in window.iter().enumerate() {
+                                    a_buf.as_mut().submatrix_mut(0, wi, n_indiv, 1).copy_from(
+                                        ring_buf.as_ref().submatrix(0, *slot, n_indiv, 1),
+                                    );
+                                }
+                            }
+                            let a_view = if contiguous {
+                                mat_slice(
+                                    ring_buf.as_ref(),
+                                    0..n_indiv,
+                                    first_slot..(first_slot + w),
+                                )
+                            } else {
+                                mat_slice(a_buf.as_ref(), 0..n_indiv, 0..w)
+                            };
+                            let b_sl = mat_slice(b_mat.as_ref(), 0..n_indiv, 0..c);
+
+                            let mut _did_gpu = false;
+                            #[cfg(feature = "gpu")]
+                            {
+                                if let Some(ref ctx) = gpu_ctx {
+                                    if _gpu_f64 && ctx.capabilities.has_f64 {
+                                        // Native f64 path
+                                        let a_f64_data = mat_to_col_major_f64(a_view, n_indiv, w);
+                                        let b_f64_data = mat_to_col_major_f64(b_sl, n_indiv, c);
+                                        let gpu_result = if let Some(tc) = _gpu_tile_cols {
+                                            ctx.matmul_tn_tiled_f64(
+                                                &a_f64_data,
+                                                n_indiv,
+                                                w,
+                                                &b_f64_data,
+                                                c,
+                                                tc,
+                                            )
+                                        } else {
+                                            ctx.matmul_tn_f64(
+                                                &a_f64_data,
+                                                n_indiv,
+                                                w,
+                                                &b_f64_data,
+                                                c,
+                                            )
+                                        };
+                                        match gpu_result {
+                                            Ok(result) => {
+                                                write_gpu_result_f64_native(
+                                                    &result,
+                                                    mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
+                                                    w,
+                                                    c,
+                                                );
+                                                _did_gpu = true;
+                                            }
+                                            Err(e) => eprintln!(
+                                                "GPU: f64 A×B matmul failed ({e}), falling back to CPU"
+                                            ),
+                                        }
+                                    } else {
+                                        // f32 conversion path
+                                        let a_f32 =
+                                            mat_to_col_major_f32_from_f64(a_view, n_indiv, w);
+                                        let b_f32 = mat_to_col_major_f32_from_f64(b_sl, n_indiv, c);
+                                        let gpu_result = if let Some(tc) = _gpu_tile_cols {
+                                            if _gpu_flex32 {
+                                                ctx.matmul_tn_tiled_flex32(
+                                                    &a_f32, n_indiv, w, &b_f32, c, tc,
+                                                )
+                                            } else {
+                                                ctx.matmul_tn_tiled(
+                                                    &a_f32, n_indiv, w, &b_f32, c, tc,
+                                                )
+                                            }
+                                        } else if _gpu_flex32 {
+                                            ctx.matmul_tn_flex32(&a_f32, n_indiv, w, &b_f32, c)
+                                        } else {
+                                            ctx.matmul_tn(&a_f32, n_indiv, w, &b_f32, c)
+                                        };
+                                        match gpu_result {
+                                            Ok(result) => {
+                                                write_gpu_result_f64(
+                                                    &result,
+                                                    mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
+                                                    w,
+                                                    c,
+                                                );
+                                                _did_gpu = true;
+                                            }
+                                            Err(e) => eprintln!(
+                                                "GPU: A×B matmul failed ({e}), falling back to CPU"
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                            if !_did_gpu {
+                                matmul_tn_to(
+                                    mat_slice_mut(ab_buf.as_mut(), 0..w, 0..c),
+                                    a_view,
+                                    b_sl,
+                                    1.0f64,
+                                    Accum::Replace,
+                                    Par::rayon(0),
+                                );
+                            }
+                            let ab_view = mat_slice(ab_buf.as_ref(), 0..w, 0..c);
+                            // Column-major inner loop with column slices: eliminates faer
+                            // tuple-indexing bounds checks. Pre-computed constant saves 1 mul.
+                            for j in 0..c {
+                                let ab_col = ab_view.col(j).try_as_col_major().unwrap().as_slice();
+                                let r2u_col = r2u_ab
+                                    .col_mut(j)
+                                    .try_as_col_major_mut()
+                                    .unwrap()
+                                    .as_slice_mut();
+                                for (ab_val, r2u_val) in
+                                    ab_col[..w].iter().zip(r2u_col[..w].iter_mut())
+                                {
+                                    *r2u_val = *ab_val * *ab_val * n_inv_sq_r2u_a + r2u_b;
+                                }
                             }
                         }
                     }
-                }
 
-                // Small matmuls (w×c @ c×n_annot, c×w @ w×n_annot) — Par::Seq
-                if !chunk_all_zero {
-                    let r2u_ab_view = mat_slice(r2u_ab.as_ref(), 0..w, 0..c);
-                    let cl_sl = mat_slice_mut(contrib_left.as_mut(), 0..w, 0..n_annot);
-                    if let Some(ref eff) = annot_chunk_eff {
-                        matmul_to(
-                            cl_sl,
-                            r2u_ab_view,
-                            eff.as_ref(),
-                            1.0,
-                            Accum::Replace,
-                            Par::Seq,
-                        );
-                    } else {
-                        matmul_to(
-                            cl_sl,
-                            r2u_ab_view,
-                            annot_chunk,
-                            1.0,
-                            Accum::Replace,
-                            Par::Seq,
+                    // Small matmuls (w×c @ c×n_annot, c×w @ w×n_annot) — Par::Seq
+                    if !chunk_all_zero {
+                        let r2u_ab_view = mat_slice(r2u_ab.as_ref(), 0..w, 0..c);
+                        let cl_sl = mat_slice_mut(contrib_left.as_mut(), 0..w, 0..n_annot);
+                        if let Some(ref eff) = annot_chunk_eff {
+                            matmul_to(
+                                cl_sl,
+                                r2u_ab_view,
+                                eff.as_ref(),
+                                1.0,
+                                Accum::Replace,
+                                Par::Seq,
+                            );
+                        } else {
+                            matmul_to(
+                                cl_sl,
+                                r2u_ab_view,
+                                annot_chunk,
+                                1.0,
+                                Accum::Replace,
+                                Par::Seq,
+                            );
+                        }
+                        mat_add_in_place(
+                            mat_slice_mut(l2.as_mut(), a_left_idx..chunk_start, 0..n_annot),
+                            mat_slice(contrib_left.as_ref(), 0..w, 0..n_annot),
                         );
                     }
-                    mat_add_in_place(
-                        mat_slice_mut(l2.as_mut(), a_left_idx..chunk_start, 0..n_annot),
-                        mat_slice(contrib_left.as_ref(), 0..w, 0..n_annot),
-                    );
-                }
 
-                if !window_all_zero {
-                    let r2u_ab_view = mat_slice(r2u_ab.as_ref(), 0..w, 0..c);
-                    let cr_sl = mat_slice_mut(contrib_right.as_mut(), 0..c, 0..n_annot);
-                    if let Some(ref eff) = annot_window_eff {
-                        matmul_tn_to(
-                            cr_sl,
-                            r2u_ab_view,
-                            eff.as_ref(),
-                            1.0,
-                            Accum::Replace,
-                            Par::Seq,
-                        );
-                    } else {
-                        matmul_tn_to(
-                            cr_sl,
-                            r2u_ab_view,
-                            annot_window,
-                            1.0,
-                            Accum::Replace,
-                            Par::Seq,
+                    if !window_all_zero {
+                        let r2u_ab_view = mat_slice(r2u_ab.as_ref(), 0..w, 0..c);
+                        let cr_sl = mat_slice_mut(contrib_right.as_mut(), 0..c, 0..n_annot);
+                        if let Some(ref eff) = annot_window_eff {
+                            matmul_tn_to(
+                                cr_sl,
+                                r2u_ab_view,
+                                eff.as_ref(),
+                                1.0,
+                                Accum::Replace,
+                                Par::Seq,
+                            );
+                        } else {
+                            matmul_tn_to(
+                                cr_sl,
+                                r2u_ab_view,
+                                annot_window,
+                                1.0,
+                                Accum::Replace,
+                                Par::Seq,
+                            );
+                        }
+                        mat_add_in_place(
+                            mat_slice_mut(l2.as_mut(), chunk_start..chunk_end, 0..n_annot),
+                            mat_slice(contrib_right.as_ref(), 0..c, 0..n_annot),
                         );
                     }
-                    mat_add_in_place(
-                        mat_slice_mut(l2.as_mut(), chunk_start..chunk_end, 0..n_annot),
-                        mat_slice(contrib_right.as_ref(), 0..c, 0..n_annot),
-                    );
                 }
             }
-        }
 
-        t_ab_dot += t0.elapsed();
+            t_ab_dot += t0.elapsed();
+        } // end exact GEMM else branch
 
         // Push B columns into ring buffer.
         // When all c slots are contiguous (no wrap), do a single bulk copy.
@@ -2043,6 +2556,7 @@ pub fn run(args: L2Args) -> Result<()> {
         args.fast_f32,
         args.prefetch_bed,
         args.verbose_timing,
+        args.stochastic,
     )
     .context("computing LD scores")?;
 
@@ -2193,8 +2707,7 @@ pub fn run(args: L2Args) -> Result<()> {
     let chr_messages: Vec<String> = chrs
         .par_iter()
         .map(|chr| -> Result<String> {
-            let chr_snps_all: Vec<&BimRecord> =
-                all_snps.iter().filter(|s| s.chr == *chr).collect();
+            let chr_snps_all: Vec<&BimRecord> = all_snps.iter().filter(|s| s.chr == *chr).collect();
             let chr_positions_all: Vec<usize> = chr_snps_all
                 .iter()
                 .map(|s| bed_idx_to_pos[&s.bed_idx])

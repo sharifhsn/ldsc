@@ -2539,6 +2539,7 @@ dependencies = [
  "cubecl",
  "cubek-matmul",
  "faer",
+ "fastrand",
  "flate2",
  "mimalloc",
  "polars",

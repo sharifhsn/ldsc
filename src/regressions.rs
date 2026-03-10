@@ -766,10 +766,7 @@ pub fn run_h2(args: H2Args) -> Result<()> {
     }
 
     if verbose_timing {
-        eprintln!(
-            "[perf] h2 total={:.3}s",
-            t_start.elapsed().as_secs_f64()
-        );
+        eprintln!("[perf] h2 total={:.3}s", t_start.elapsed().as_secs_f64());
     }
     Ok(())
 }
@@ -2439,10 +2436,7 @@ To match Python, provide {} values (first ignored).",
     }
 
     if verbose_timing {
-        eprintln!(
-            "[perf] rg total={:.3}s",
-            t_start.elapsed().as_secs_f64()
-        );
+        eprintln!("[perf] rg total={:.3}s", t_start.elapsed().as_secs_f64());
     }
     Ok(())
 }

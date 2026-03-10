@@ -392,7 +392,11 @@ fn decode_column<T: BedVal>(
     all_iids: bool,
 ) {
     // Get column as contiguous slice (1 bounds check instead of 2 per element)
-    let out_col = out.col_mut(col).try_as_col_major_mut().unwrap().as_slice_mut();
+    let out_col = out
+        .col_mut(col)
+        .try_as_col_major_mut()
+        .unwrap()
+        .as_slice_mut();
 
     if all_iids {
         // Fast path: all individuals, sequential layout — process 4 per byte.
@@ -447,8 +451,7 @@ impl<T: BedVal> ChunkReader<T> {
     ) -> Result<Self> {
         let iid_idx = resolve_indices(iid_indices, bed.iid_count)?;
         let n_iid = iid_idx.len();
-        let all_iids =
-            n_iid == bed.iid_count && iid_idx.iter().enumerate().all(|(i, &v)| v == i);
+        let all_iids = n_iid == bed.iid_count && iid_idx.iter().enumerate().all(|(i, &v)| v == i);
         let iid_positions = precompute_iid_positions(&iid_idx);
         let lut = build_lut(count_a1, missing_value);
         let bytes_per_snp = bed.bytes_per_snp;

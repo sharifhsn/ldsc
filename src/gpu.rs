@@ -76,10 +76,7 @@ impl GpuContext {
         let tma_detail = if caps.has_tma { "TMA=yes" } else { "TMA=no" };
         format!(
             "{}, Plane={}, {}, f64={}",
-            cmma_detail,
-            caps.has_plane_ops,
-            tma_detail,
-            caps.has_f64,
+            cmma_detail, caps.has_plane_ops, tma_detail, caps.has_f64,
         )
     }
 
@@ -414,8 +411,7 @@ impl GpuContext {
                 f64_storage,
             );
 
-            let out_tensor =
-                TensorHandle::<R>::empty(&self.client, vec![tile_m, n], f64_storage);
+            let out_tensor = TensorHandle::<R>::empty(&self.client, vec![tile_m, n], f64_storage);
             let out_row_stride = out_tensor.strides()[0];
 
             let mut dtypes = MatmulElems::from_single_dtype(f64_storage);

@@ -67,6 +67,7 @@ tokio = { version = "1.50.0", features = ["full"] }
 # mimalloc — use for musl builds where the default allocator is slow under rayon parallelism.
 # Builds mimalloc from C source (self-contained, no system dependency).
 mimalloc = { version = "0.1", optional = true }
+fastrand = "2.3.0"
 
 [profile.release]
 opt-level     = 3

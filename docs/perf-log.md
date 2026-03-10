@@ -1068,3 +1068,57 @@ The sum/sum_sq reduction was ~8% of runtime (~3.5s). The AVX2 intrinsics process
 
 ### Conclusion
 **AVX2 intrinsics provide a real ~3.6% improvement** (median 41.09s, was 42.62s). New best: **~41.1s** on EPYC 7R13, **~37.7× speedup** vs Python (1548.5s). Safe Rust cannot produce ymm-width f32 reductions on stable — intrinsics are necessary for this pattern.
+
+## 2026-03-10: Hutchinson's Stochastic Trace Estimation (`--stochastic`)
+
+### Change
+Implemented Hutchinson's stochastic trace estimation as an opt-in `--stochastic <T>` flag.
+Instead of computing exact `diag(X'X)²` via GEMM, approximates it using T random Rademacher
+probe vectors: `diag(R²) ≈ (1/T) Σ_t (Rz_t) ⊙ (Rz_t)`. Uses batched GEMM (T-column random
+matrices) to retain `Par::rayon(0)` multi-core parallelism. Added `fastrand` crate for WyRand
+PRNG (zero transitive deps, seedable).
+
+**Scope**: Scalar (n_annot=1) only. Falls back to exact for partitioned annotations or `--pq-exp`.
+
+### Accuracy (bench_5k, chr1, 446 SNPs)
+| Probes (T) | Mean Relative Error | Median |rel| Error | Max |rel| Error |
+|-----------|--------------------|--------------------|-----------------|
+| 50        | -2.00%             | 6.95%              | 27.20%          |
+| 1000      | ~0.35%             | ~1.5%              | ~5%             |
+
+Theory predicts √(2/T) ≈ 20% relative std per SNP at T=50.
+
+### Performance (local, Ryzen 5 5600X, bench_200k)
+
+| Mode | Time | Notes |
+|------|------|-------|
+| Exact | 3.05s | Baseline |
+| Stochastic T=50 | 3.25s | ~7% slower |
+
+Local bench_200k showed no improvement — dataset too small for the stochastic advantage to manifest.
+
+### Performance (AWS c6a.4xlarge, EPYC 7R13, 16 vCPU, full 1.66M SNPs)
+
+| Mode | Mean ± σ | Range | User time | System time | vs T=50 |
+|------|----------|-------|-----------|-------------|---------|
+| **Stochastic T=50** | **36.181s ± 0.194s** | 35.9–36.5s | 419s | 21s | 1.00× |
+| **Exact GEMM** | **41.808s ± 1.407s** | 40.8–45.2s | 489s | 23s | 1.16× slower |
+| **Stochastic T=100** | **72.357s ± 1.257s** | 70.3–73.8s | 731s | **250s** | 2.00× slower |
+
+### Analysis
+- **T=50 is 13.5% faster than exact** on the full dataset. The advantage comes from replacing O(c²) within-chunk GEMM with O(T·c) probe operations, which matters at scale when window sizes are large (avg ~1000 SNPs for `--ld-wind-kb 1000`).
+- **T=100 is catastrophically slow**: 72.4s, 1.73× slower than exact. The system time exploded from 21s to 250s (12× increase), indicating severe memory allocation pressure or cache thrashing from the 100-column probe matrices. At chunk_size=200 and max_window≈1000, the Z/Y/Q/P buffers for T=100 total ~16MB per set — likely exceeding L3 cache capacity and causing TLB misses.
+- **T=50 is the sweet spot**: 36.2s wall time with ~7% median per-SNP error. The probe buffers are half the size (~8MB), fitting in L3 cache.
+- **Local vs HPC discrepancy**: bench_200k (200k SNPs) showed no improvement because windows are smaller and the GEMM is already fast. The stochastic advantage only manifests at full genome scale where window sizes average ~1000 SNPs.
+
+### Conclusion
+**`--stochastic 50` provides a meaningful 13.5% speedup** on the full 1.66M SNP dataset
+(36.2s vs 41.8s). This makes `--stochastic 50` the new fastest option at **~42.8× speedup**
+vs Python (1548.5s). However, it trades exact numerical parity for ~7% median per-SNP error.
+
+**T=100 has a pathological memory issue** — needs investigation. Do not recommend T>50
+until the cache thrashing is resolved.
+
+The exact path remains the default for users who need numerical parity with Python.
+`--stochastic 50` is recommended for users who prioritize speed and can tolerate small
+per-SNP errors (downstream h2 estimates are typically robust to this noise).
