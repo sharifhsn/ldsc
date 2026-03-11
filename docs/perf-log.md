@@ -1133,23 +1133,38 @@ constants. Works with partitioned annotations (unlike `--stochastic`). Incompati
 
 ### Math
 - Projection: x̃_j = P x_j (d×1), P entries ±1/√d
-- E[val̃²] = val²(1+1/d) + N²/d, corrected by:
-  - `active_A = n_inv_sq_r2u_a × d/(d+1)`
-  - `active_B = r2u_b - r2u_a/(d+1)`
-- Unbiased in expectation: E[val̃² × A + B] = val² × A_orig + B_orig
+- After projection, columns re-normalized: ||x̃'_j||² = N (ratio estimator)
+- Ratio estimator reduces per-pair variance by ~2× (correlated noise cancels)
+- Bias correction: `active_A = n_inv_sq_r2u_a × d/(d-2)`, `active_B = r2u_b - r2u_a/(d-2)`
+- Requires d ≥ 3 (prevents division by zero)
 - Single shared P matrix (seed=42) → correlated errors across SNPs (errors don't average out)
 
 ### Performance (AWS c6a.4xlarge, EPYC 7R13, 16 vCPU, full 1.66M SNPs, --ld-wind-kb 1000)
 
+With ratio estimator (column re-normalization):
+
+| Mode | Mean ± σ | Speedup vs exact | vs Python (1548s) |
+|------|----------|------------------|-------------------|
+| **exact** | **41.057s ± 0.222s** | 1.00× | 37.7× |
+| **sketch d=50** | **15.322s ± 0.117s** | **2.68×** | **~101×** |
+| **sketch d=200** | **25.444s ± 0.189s** | **1.61×** | **~61×** |
+
+Previous results without ratio estimator (for comparison):
+
 | Mode | Mean ± σ | Speedup vs exact | vs Python (1548s) | System time |
 |------|----------|------------------|-------------------|-------------|
-| **exact** | **41.160s ± 1.072s** | 1.00× | 37.6× | 22s |
-| **sketch d=25** | **14.293s ± 0.148s** | **2.88×** | **108.3×** | 11s |
+| exact | 41.160s ± 1.072s | 1.00× | 37.6× | 22s |
+| sketch d=25 | 14.293s ± 0.148s | 2.88× | 108.3× | 11s |
 | sketch d=50 | 15.467s ± 0.084s | 2.66× | 100.1× | 12s |
 | sketch d=100 | 16.436s ± 0.089s | 2.50× | 94.2× | 12s |
 | sketch d=200 | 19.868s ± 0.044s | 2.07× | 77.9× | 13s |
 | sketch d=500 | 31.535s ± 0.382s | 1.30× | 49.1× | 15s |
-| sketch d=1000 | 83.870s ± 1.495s | 0.49× (SLOWER) | 18.5× | **380s** |
+| sketch d=1000 | 83.870s ± 1.495s | 0.49× (SLOWER) | 18.5× | 380s |
+
+Note: d=200 is ~28% slower with ratio estimator (25.4s vs 19.9s) because the
+re-normalization pass adds overhead at full 1.66M-SNP scale. At d=50 the difference
+is negligible (15.3s vs 15.5s). The accuracy gain (Pearson r: 0.90→0.93 at d=200)
+is worth the speed cost.
 
 ### Timing Breakdown (local bench_200k, verbose)
 
@@ -1219,8 +1234,17 @@ Requires d ≥ 3 (to avoid division by zero).
 The ratio estimator consistently outperforms the raw estimator across ALL d values.
 Variance reduction (~2×) outweighs the harder-to-correct higher-order bias terms.
 
-**Performance** (bench_200k, hyperfine --runs 3): exact 3.23s, sketch d=50 1.37s (2.4×),
-d=200 2.16s (1.5×). No measurable overhead from re-normalization.
+**Performance** (local bench_200k, hyperfine --runs 3): exact 3.23s, sketch d=50 1.37s (2.4×),
+d=200 2.16s (1.5×).
+
+**AWS HPC results** (c6a.4xlarge, EPYC 7R13, 16 vCPU, 1.66M SNPs, hyperfine --runs 5):
+- exact: 41.06s ± 0.22s
+- sketch d=50: 15.32s ± 0.12s (2.68× vs exact, ~101× vs Python)
+- sketch d=200: 25.44s ± 0.19s (1.61× vs exact, ~61× vs Python)
+
+Re-normalization adds ~28% overhead at d=200 full scale (25.4s vs 19.9s without ratio
+estimator). At d=50 the cost is negligible (15.3s vs 15.5s). The accuracy gain justifies
+the cost.
 
 ### Also Fixed
 - GPU f64 AB matmul used `n_indiv` instead of `gemm_n` — corrected (defensive, code path
@@ -1229,10 +1253,11 @@ d=200 2.16s (1.5×). No measurable overhead from re-normalization.
 
 ### Conclusion
 `--sketch` is **theoretically sound but practically limited at N=2,490**:
-- Up to 2.4× speedup at d=50 with ratio estimator (Pearson r=0.81, ~52% median error)
+- d=50: 2.68× speedup on AWS (15.3s, ~101× vs Python), Pearson r=0.81, ~52% median error
+- d=200: 1.61× speedup on AWS (25.4s, ~61× vs Python), Pearson r=0.93, ~21% median error
 - Ratio estimator improves accuracy by ~30-40% across all d values vs raw projection
 - The shared projection matrix creates correlated errors that don't average across SNPs
 - **Recommended for biobank-scale data (N>50k)** where the inner dimension reduction
   from N→d yields massive GEMM savings with acceptable accuracy
-- At 1000G scale, `--stochastic 50` (36.2s, ~7% error) remains the fastest practical option
-- Exact (41.2s) remains best for numerical parity
+- At 1000G scale, `--stochastic 50` (36.2s, ~7% error) remains the best speed/accuracy tradeoff
+- Exact (41.1s) remains best for numerical parity
