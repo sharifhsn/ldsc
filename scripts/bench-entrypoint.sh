@@ -1,20 +1,35 @@
 #!/bin/bash
 set -euo pipefail
 
-BFILE="/data/1000G_phase3_common_norel"
 S3_BUCKET="${S3_DATA_BUCKET:-ldsc-bench-data-270497617191}"
 RUNS="${BENCH_RUNS:-10}"
 WARMUP="${BENCH_WARMUP:-2}"
+DATASET="${BENCH_DATASET:-1000G}"  # "1000G" or "biobank_50k"
+
+# ── Resolve dataset ──────────────────────────────────────────────────────────
+case "$DATASET" in
+    1000G)
+        BFILE="/data/1000G_phase3_common_norel"
+        S3_FILES=(1000G_phase3_common_norel.bed 1000G_phase3_common_norel.bim 1000G_phase3_common_norel.fam
+                  bench_5k.bed bench_5k.bim bench_5k.fam)
+        ;;
+    biobank_50k)
+        BFILE="/data/biobank_50k"
+        S3_FILES=(biobank_50k.bed biobank_50k.bim biobank_50k.fam)
+        ;;
+    *)
+        echo "ERROR: Unknown BENCH_DATASET='$DATASET'. Use '1000G' or 'biobank_50k'." >&2
+        exit 1
+        ;;
+esac
 
 # ── Download benchmark data from S3 ──────────────────────────────────────────
-echo "=== Downloading benchmark data from s3://${S3_BUCKET}/ ==="
+echo "=== Downloading benchmark data ($DATASET) from s3://${S3_BUCKET}/ ==="
 mkdir -p /data
-aws s3 cp "s3://${S3_BUCKET}/1000G_phase3_common_norel.bed" /data/ --quiet
-aws s3 cp "s3://${S3_BUCKET}/1000G_phase3_common_norel.bim" /data/ --quiet
-aws s3 cp "s3://${S3_BUCKET}/1000G_phase3_common_norel.fam" /data/ --quiet
-aws s3 cp "s3://${S3_BUCKET}/bench_5k.bed" /data/ --quiet
-aws s3 cp "s3://${S3_BUCKET}/bench_5k.bim" /data/ --quiet
-aws s3 cp "s3://${S3_BUCKET}/bench_5k.fam" /data/ --quiet
+for f in "${S3_FILES[@]}"; do
+    echo "  $f ..."
+    aws s3 cp "s3://${S3_BUCKET}/$f" /data/ --quiet
+done
 echo "Download complete."
 echo ""
 

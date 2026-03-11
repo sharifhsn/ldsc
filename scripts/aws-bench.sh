@@ -9,6 +9,7 @@
 #   ./scripts/aws-bench.sh --skip-build             # reuse existing image
 #   ./scripts/aws-bench.sh --command "hyperfine ..." # custom command
 #   ./scripts/aws-bench.sh --vcpus 8 --memory 4096  # override resources
+#   ./scripts/aws-bench.sh --dataset biobank_50k    # use 50K-individual synthetic data
 #
 set -euo pipefail
 
@@ -30,6 +31,7 @@ BENCH_WARMUP=2
 CUSTOM_CMD=""
 VCPUS=16
 MEMORY=8192
+BENCH_DATASET="1000G"
 JOB_NAME="bench-$(date +%Y%m%d-%H%M%S)"
 
 while [[ $# -gt 0 ]]; do
@@ -40,10 +42,17 @@ while [[ $# -gt 0 ]]; do
         --command)     CUSTOM_CMD="$2"; shift 2 ;;
         --vcpus)       VCPUS="$2"; shift 2 ;;
         --memory)      MEMORY="$2"; shift 2 ;;
+        --dataset)     BENCH_DATASET="$2"; shift 2 ;;
         --name)        JOB_NAME="$2"; shift 2 ;;
         *)             echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# Auto-increase memory for biobank dataset (working memory ~2GB, plus page cache headroom)
+if [ "$BENCH_DATASET" = "biobank_50k" ] && [ "$MEMORY" -lt 16384 ]; then
+    MEMORY=16384
+    echo "NOTE: Auto-increased memory to ${MEMORY}MB for biobank_50k dataset"
+fi
 
 # ── Build & Push ──────────────────────────────────────────────────────────────
 #
@@ -90,6 +99,8 @@ if [ "$SKIP_BUILD" = false ]; then
     docker rm -f ldsc-bench-assemble 2>/dev/null || true
     docker run --entrypoint true --name ldsc-bench-assemble "$RUNTIME_IMAGE"
     docker cp target/release/ldsc.musl ldsc-bench-assemble:/usr/local/bin/ldsc
+    docker cp scripts/bench-entrypoint.sh ldsc-bench-assemble:/entrypoint.sh
+    docker cp scripts/biobank-bench.sh ldsc-bench-assemble:/usr/local/bin/biobank-bench
     docker commit \
         --change 'ENTRYPOINT ["/entrypoint.sh"]' \
         ldsc-bench-assemble "${PREFIX}:latest"
@@ -123,6 +134,7 @@ OVERRIDES=$(cat << EOF
   "environment": [
     {"name": "BENCH_RUNS", "value": "${BENCH_RUNS}"},
     {"name": "BENCH_WARMUP", "value": "${BENCH_WARMUP}"},
+    {"name": "BENCH_DATASET", "value": "${BENCH_DATASET}"},
     {"name": "S3_DATA_BUCKET", "value": "${S3_BUCKET}"}
   ]
 }
@@ -139,9 +151,16 @@ json.dump(o, sys.stdout)
 ")
 fi
 
+# Use biobank queue (50GB EBS) for biobank dataset, default queue otherwise
+if [ "$BENCH_DATASET" = "biobank_50k" ]; then
+    JOB_QUEUE="${PREFIX}-biobank-queue"
+else
+    JOB_QUEUE="${PREFIX}-queue"
+fi
+
 JOB_ID=$($AWS batch submit-job \
     --job-name "$JOB_NAME" \
-    --job-queue "${PREFIX}-queue" \
+    --job-queue "$JOB_QUEUE" \
     --job-definition "${PREFIX}-job" \
     --container-overrides "$OVERRIDES" \
     --query "jobId" --output text)

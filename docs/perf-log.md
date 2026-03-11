@@ -1261,3 +1261,97 @@ the cost.
   from N→d yields massive GEMM savings with acceptable accuracy
 - At 1000G scale, `--stochastic 50` (36.2s, ~7% error) remains the best speed/accuracy tradeoff
 - Exact (41.1s) remains best for numerical parity
+
+## 2026-03-11: Sparse Rademacher Investigation (Abandoned)
+
+### Hypothesis
+Sparse Rademacher projection (s=3, Achlioptas 2003) would reduce sketch projection FLOPs
+by 3× (2/3 of entries are zero). This should help at large N (e.g., biobank 50K individuals)
+where the P×B projection dominates runtime.
+
+### Implementation
+CSC (column-compressed) sparse matrix with positive/negative indices separated for
+branchless inner loops. Tested both single-threaded and rayon-parallelized (across B columns).
+
+### Results (local, Ryzen 5 5600X)
+
+**N=2,490 (1000G), 5K SNPs, d=50:**
+| Approach | Sketch time | Total | Notes |
+|----------|------------|-------|-------|
+| Dense faer GEMM | ~0ms | 0.100s | Par::rayon(0), SIMD |
+| Sparse single-thread | 0.199s | 0.226s | 2× total regression |
+| Sparse + rayon | 0.022s | 0.055s | Better but still overhead |
+
+**N=50,000 (biobank), 5K SNPs, d=50:**
+| Approach | Sketch time | Total | Notes |
+|----------|------------|-------|-------|
+| Dense faer GEMM | ~0.4s | ~83s | BED read dominates (80s) |
+| Sparse single-thread | 5.085s | 84.6s | 12× slower than dense |
+| Sparse + rayon | 0.666s | 64.5s | 1.7× slower than dense |
+
+Accuracy (N=2490, d=50): sparse r=0.62, 54% median error — comparable to dense (~52% median
+error from AWS results). At d=200: sparse r=0.94, 25% median error — also comparable.
+
+### Why It Failed
+1. **faer's dense GEMM is extremely optimized**: AVX2 SIMD, cache tiling, rayon parallelism →
+   >50 GFLOPS. Custom sparse scatter-add loop achieves only ~5 GFLOPS even with rayon.
+2. **Arithmetic intensity too low**: each sparse entry requires index load + conditional add,
+   vs packed SIMD FMA for dense. The 3× FLOPs reduction doesn't compensate for 10× lower
+   throughput per FLOP.
+3. **Bandwidth-bound at large N**: at N=50K the bottleneck is reading B (80MB/chunk), which
+   both dense and sparse must do. Sparse saves FLOPs but not bandwidth.
+
+### Conclusion
+**Abandoned.** Dense Rademacher with faer GEMM remains optimal. The sparse approach would only
+help if: (a) N is large enough that P itself doesn't fit in cache (N>500K), AND (b) we
+implement AVX2 gather-based sparse matmul to match faer's throughput. Neither applies to
+current benchmarks.
+
+## 2026-03-11: Biobank-Scale Sketch Benchmarks (N=50,000)
+
+### Setup
+- **Dataset**: Synthetic biobank_50k (1,664,852 SNPs × 50,000 individuals, ~20GB BED file)
+  - Generated from bench_5k via `make_synthetic_biobank.py` (10× replication, 1% genotype noise)
+- **Hardware**: AWS c6a.4xlarge (EPYC 7R13, 16 vCPU, 32 GiB RAM), SPOT instance, 50GB gp3 EBS
+- **Build**: musl+mimalloc+AVX2+FMA (production binary, ldsc 0.3.1)
+- **Command**: `ldsc l2 --bfile /data/biobank_50k --ld-wind-kb 1000 --chunk-size 200 --yes-really --verbose-timing [--sketch d]`
+- **Benchmark**: hyperfine --warmup 1 --runs 3
+
+### Results
+
+| Mode | Mean ± σ | User time | System | Parallelism | Speedup vs Exact |
+|------|----------|-----------|--------|-------------|-----------------|
+| Exact | 718.6s ± 3.4s | 7707s | 58s | 10.7× | 1.0× |
+| --sketch 50 | 214.3s ± 0.5s | 1158s | 28s | 5.4× | 3.4× |
+| --sketch 100 | 177.6s ± 1.2s | 1466s | 23s | 8.2× | 4.0× |
+| --sketch 200 | 265.8s ± 1.7s | 1921s | 29s | 7.2× | 2.7× |
+
+### Analysis
+
+**Sketch overhead at N=50K is dominated by projection matmul P×B (d×N × N×chunk_c)**:
+- The projection P×B has fixed cost proportional to d×N×chunk_c, regardless of d
+- Downstream bb/ab GEMMs scale as d×d and d×window — much smaller than N×N exact GEMMs
+
+**Optimal d at N=50K is ~100**: d=100 (177.6s) beats d=50 (214.3s) because the d=50 downstream GEMMs (50×50, 50×window) are too small for rayon to parallelize effectively (5.4× vs 8.2× CPU utilization). At d=200 the projection overhead dominates.
+
+**Parallelism analysis**:
+- Exact: 10.7× (faer's tiled GEMM on N=50K matrices is highly parallel)
+- sketch 100: 8.2× (good balance: projection and downstream GEMMs both large enough for rayon)
+- sketch 200: 7.2× (larger projection overhead, still reasonable)
+- sketch 50: 5.4× (downstream GEMMs too small for effective parallelization)
+
+**Memory**: 20GB BED file page cache + working memory occasionally exceeds 16GB container limit (sketch100 OOM'd nondeterministically at 16GB). 28GB container memory is recommended for N=50K.
+
+### Comparison with N=2490 (1000G reference)
+
+| Mode | N=2490 (1000G) | N=50K (biobank) | Scaling |
+|------|----------------|-----------------|---------|
+| Exact | 41.1s | 718.6s | 17.5× (linear in N: 50000/2490 = 20.1×) |
+| --sketch 50 | 15.5s | 214.3s | 13.8× |
+| --sketch 200 | 19.9s | 265.8s | 13.4× |
+
+Sketch modes scale better than linear in N because the downstream GEMM (d×d) is independent of N, and the projection P×B scales linearly in N (not quadratically like the exact GEMM which is N×chunk).
+
+### Key Takeaway
+
+At biobank scale (N=50K), `--sketch 100` provides a **4× speedup** (718.6s → 177.6s) with good CPU utilization. The optimal sketch dimension shifts upward with N: at N=2490, d=50 was optimal; at N=50K, d=100 is optimal. This is because larger d allows better rayon parallelization of downstream GEMMs, and the projection P×B cost is fixed per-d regardless.
