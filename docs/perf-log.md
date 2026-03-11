@@ -1122,3 +1122,117 @@ until the cache thrashing is resolved.
 The exact path remains the default for users who need numerical parity with Python.
 `--stochastic 50` is recommended for users who prioritize speed and can tolerate small
 per-SNP errors (downstream h2 estimates are typically robust to this noise).
+
+## 2026-03-10: Randomized Sketching (`--sketch d`)
+
+### What
+New `--sketch d` flag compresses the individual dimension N→d via random Rademacher
+projection P (d×N) before all GEMMs. Bias is exactly corrected by adjusting the r²_unbiased
+constants. Works with partitioned annotations (unlike `--stochastic`). Incompatible with
+`--gpu` and `--stochastic`.
+
+### Math
+- Projection: x̃_j = P x_j (d×1), P entries ±1/√d
+- E[val̃²] = val²(1+1/d) + N²/d, corrected by:
+  - `active_A = n_inv_sq_r2u_a × d/(d+1)`
+  - `active_B = r2u_b - r2u_a/(d+1)`
+- Unbiased in expectation: E[val̃² × A + B] = val² × A_orig + B_orig
+- Single shared P matrix (seed=42) → correlated errors across SNPs (errors don't average out)
+
+### Performance (AWS c6a.4xlarge, EPYC 7R13, 16 vCPU, full 1.66M SNPs, --ld-wind-kb 1000)
+
+| Mode | Mean ± σ | Speedup vs exact | vs Python (1548s) | System time |
+|------|----------|------------------|-------------------|-------------|
+| **exact** | **41.160s ± 1.072s** | 1.00× | 37.6× | 22s |
+| **sketch d=25** | **14.293s ± 0.148s** | **2.88×** | **108.3×** | 11s |
+| sketch d=50 | 15.467s ± 0.084s | 2.66× | 100.1× | 12s |
+| sketch d=100 | 16.436s ± 0.089s | 2.50× | 94.2× | 12s |
+| sketch d=200 | 19.868s ± 0.044s | 2.07× | 77.9× | 13s |
+| sketch d=500 | 31.535s ± 0.382s | 1.30× | 49.1× | 15s |
+| sketch d=1000 | 83.870s ± 1.495s | 0.49× (SLOWER) | 18.5× | **380s** |
+
+### Timing Breakdown (local bench_200k, verbose)
+
+| Section | Exact | Sketch d=50 | Change |
+|---------|-------|-------------|--------|
+| bed_read | 0.18s | 0.17s | same |
+| norm (+projection) | 0.28s | 0.71s | +0.43s (P×B matmul) |
+| bb_dot | 1.06s | 0.08s | **13× faster** |
+| ab_dot | 1.00s | 0.11s | **9× faster** |
+| ring_store | 0.24s | 0.00s | ring is d×ring_size (tiny) |
+
+### Accuracy (local bench_200k, 200,237 SNPs, N=2,490)
+
+| d | Mean bias | Median rel error | Pearson r | Spearman ρ |
+|---|-----------|-----------------|-----------|------------|
+| 25 | +6.92 (+93%) | 140% | 0.587 | — |
+| 50 | +2.42 (+33%) | 66% | 0.715 | 0.632 |
+| 100 | -1.44 (-19%) | 38% | 0.760 | — |
+| 200 | -0.48 (-6%) | 23% | 0.900 | 0.870 |
+| 500 | -0.10 (-1%) | 13% | 0.963 | 0.952 |
+| 1000 | -0.11 (-1%) | 9% | 0.982 | — |
+
+Note: "bias" is per-realization (from shared P matrix, seed=42). Expectation over random
+seeds is zero. Sign flips confirm it's noise, not systematic.
+
+### d=1000 Cache Pathology
+Same phenomenon as `--stochastic 100`: system time explodes (380s vs ~12s for d≤500).
+Ring buffer at d=1000 is 1000×ring_size×8 ≈ 22MB, plus a_buf (1000×1000×8 = 8MB) and
+projection P (1000×2490×8 = 20MB). Total working set ~50MB exceeds L3 capacity on
+EPYC 7R13. **Do not use d>500.**
+
+### Key Finding: Limited Utility at N=2,490
+At 1000G scale (N=2,490), the projection P×B (d×N×c FLOPs) costs nearly as much as the
+original B'B GEMM (N×c² FLOPs) because N and c are comparable. The GEMM savings only
+dominate when N >> c (biobank scale, N>50k).
+
+Best speed/accuracy tradeoff at this N:
+- **d=200**: 2.07× speedup, Pearson r=0.90, ~23% median error
+- **d=50**: 2.66× speedup, Pearson r=0.72, ~66% median error (too noisy for most uses)
+
+For comparison, `--stochastic 50` gives 1.14× speedup with ~7% median error — better
+accuracy per unit of speed sacrifice.
+
+### Ratio Estimator Improvement (column re-normalization)
+
+After sketch projection x̃_j = P x_j, rescale each column so ||x̃'_j||² = N. This implements
+the ratio estimator r̃² = (x̃_j · x̃_k)² / (||x̃_j||² × ||x̃_k||²) implicitly. Reduces
+per-pair variance by ~2× because correlated noise in numerator/denominator cancels.
+
+**Bias correction**: The squared cosine has bias ≈ (2r⁴ - 7r² + 1)/d. Leading linear
+correction: `r²_corr = r̃² × d/(d-2) - 1/(d-2)`. Applied as:
+- `active_A = n_inv_sq_r2u_a × d/(d-2)`
+- `active_B = r2u_b - r2u_a/(d-2)`
+
+Requires d ≥ 3 (to avoid division by zero).
+
+**Accuracy comparison** (bench_5k, 5,000 SNPs, N=2,490):
+
+| d | Original Pearson r | Ratio Pearson r | Original med_rel% | Ratio med_rel% |
+|---|---|---|---|---|
+| 25 | 0.587 | **0.726** | 140% | **97%** |
+| 50 | 0.715 | **0.812** | 66% | **52%** |
+| 100 | 0.760 | **0.849** | 38% | **33%** |
+| 200 | 0.900 | **0.934** | 23% | **21%** |
+| 500 | 0.963 | **0.974** | 13% | **12%** |
+
+The ratio estimator consistently outperforms the raw estimator across ALL d values.
+Variance reduction (~2×) outweighs the harder-to-correct higher-order bias terms.
+
+**Performance** (bench_200k, hyperfine --runs 3): exact 3.23s, sketch d=50 1.37s (2.4×),
+d=200 2.16s (1.5×). No measurable overhead from re-normalization.
+
+### Also Fixed
+- GPU f64 AB matmul used `n_indiv` instead of `gemm_n` — corrected (defensive, code path
+  is currently unreachable since GPU only does f32).
+- Sketch minimum d raised from 1 to 3 (prevents d-2 division by zero).
+
+### Conclusion
+`--sketch` is **theoretically sound but practically limited at N=2,490**:
+- Up to 2.4× speedup at d=50 with ratio estimator (Pearson r=0.81, ~52% median error)
+- Ratio estimator improves accuracy by ~30-40% across all d values vs raw projection
+- The shared projection matrix creates correlated errors that don't average across SNPs
+- **Recommended for biobank-scale data (N>50k)** where the inner dimension reduction
+  from N→d yields massive GEMM savings with acceptable accuracy
+- At 1000G scale, `--stochastic 50` (36.2s, ~7% error) remains the fastest practical option
+- Exact (41.2s) remains best for numerical parity

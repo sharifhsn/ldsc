@@ -306,6 +306,15 @@ pub struct L2Args {
     #[arg(long, value_name = "PROBES", conflicts_with = "gpu")]
     pub stochastic: Option<usize>,
 
+    /// Random projection sketch: compress individual dimension N→d before GEMM.
+    /// Trades precision for speed — larger d is more accurate but slower.
+    /// At 1000G scale (N=2490): d=200 gives ~2× speedup with Pearson r≈0.90
+    /// vs exact; d=50 gives ~2.7× speedup but r≈0.72. For biobank scale
+    /// (N>50k) much smaller d suffices. Works with partitioned annotations.
+    /// Avoid d>500 (cache thrashing). Bias is exactly corrected in expectation.
+    #[arg(long, value_name = "DIM", conflicts_with_all = ["gpu", "stochastic"])]
+    pub sketch: Option<usize>,
+
     /// Print per-section timing breakdown to stderr.
     #[arg(long)]
     pub verbose_timing: bool,

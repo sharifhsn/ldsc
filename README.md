@@ -276,6 +276,42 @@ ldsc l2 --bfile … --out …
 - Results are deterministic (fixed PRNG seed) but not identical across runs with
   different T values.
 
+### Random projection sketch (`--sketch`, experimental)
+
+Pass `--sketch d` to `ldsc l2` to compress the individual dimension from N to d via
+a random Rademacher projection before all GEMM operations. This reduces the inner
+dimension of every matrix multiply, trading precision for speed. After projection,
+each column is re-normalized (ratio estimator) to reduce per-pair variance by ~2×.
+
+**This is an approximation.** All SNPs share the same random projection matrix, so
+errors are correlated across SNPs. The bias is corrected in expectation via adjusted
+r²_unbiased constants, but a single run can show systematic shifts. Requires d ≥ 3.
+
+| d (dim) | Speedup (1.66M SNPs) | Pearson r vs exact | Median \|rel\| error | Recommended for |
+|---------|---------------------|-------------------|---------------------|-----------------|
+| 25      | 2.88× (14.3s)       | ~0.73             | ~97%                | quick screening |
+| 50      | 2.66× (15.5s)       | ~0.81             | ~52%                | rough estimates |
+| 100     | 2.50× (16.4s)       | ~0.85             | ~33%                | moderate use    |
+| 200     | 2.07× (19.9s)       | ~0.93             | ~21%                | recommended     |
+| 500     | 1.30× (31.5s)       | ~0.97             | ~12%                | high accuracy   |
+
+Accuracy measured at N=2,490 (1000G). For biobank-scale data (N>50k), much smaller d
+suffices because the random projection preserves dot products better in higher dimensions.
+
+```bash
+# Sketch (faster, approximate — d=200 is a good default)
+ldsc l2 --bfile … --out … --sketch 200
+
+# Exact (default, numerically identical to Python)
+ldsc l2 --bfile … --out …
+```
+
+**Limitations:**
+- Avoid d > 500 — cache thrashing causes severe regression at d=1000.
+- Incompatible with `--gpu` and `--stochastic`.
+- Results are deterministic (fixed PRNG seed).
+- Works with partitioned annotations (unlike `--stochastic`).
+
 ### BED prefetch for networked storage (`--prefetch-bed`)
 
 On HPC clusters with networked filesystems (GPFS, NFS, Lustre), BED file reads travel over
@@ -434,9 +470,11 @@ Static musl binary with mimalloc, AVX2+FMA target features.
 | **Rust f64** (default) | **41.1 s** | **~38×** | exact (`max_abs_diff = 0`) |
 | **Rust stochastic** (`--stochastic 50`) | **36.2 s** | **~43×** | ~7% median per-SNP error |
 | **Rust f32** (`--fast-f32`) | **~33 s** | **~47×** | `max_abs_diff = 0.008` |
+| **Rust sketch** (`--sketch 200`) | **19.9 s** | **~78×** | Pearson r ≈ 0.93 vs exact |
+| **Rust sketch** (`--sketch 50`) | **15.5 s** | **~100×** | Pearson r ≈ 0.81 vs exact |
 
-`--ld-wind-kb 1000`, `--chunk-size 200`. The `--stochastic` and `--fast-f32` paths trade
-exact parity for speed; the default f64 path is numerically identical to Python across
+`--ld-wind-kb 1000`, `--chunk-size 200`. The `--stochastic`, `--fast-f32`, and `--sketch`
+paths trade exact parity for speed; the default f64 path is numerically identical to Python across
 all 1,664,852 SNPs.
 
 Speedup varies with window size (200k-SNP extract, same machine):
@@ -718,7 +756,7 @@ make_annot.rs        BED → 0/1 annotation generator.
 | `flate2` | 1 | gzip output for .sumstats.gz and .ldscore.gz |
 | `cubecl` | 0.10 | (optional, `gpu` feature) multi-backend GPU compute |
 | `cubek-matmul` | 0.2 | (optional, `gpu` feature) autotuned GPU matmul |
-| `fastrand` | 2 | Rademacher probe generation for `--stochastic` mode |
+| `fastrand` | 2 | Rademacher random generation for `--stochastic` and `--sketch` modes |
 | `mimalloc` | 0.1 | (optional, `mimalloc` feature) fast allocator for musl builds |
 
 ---

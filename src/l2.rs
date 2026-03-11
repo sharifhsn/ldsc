@@ -492,6 +492,7 @@ fn compute_ldscore_global(
     prefetch_bed: bool,
     verbose_timing: bool,
     stochastic: Option<usize>,
+    sketch: Option<usize>,
 ) -> Result<(MatF, Vec<f64>)> {
     let m = all_snps.len();
     if m == 0 {
@@ -519,6 +520,96 @@ fn compute_ldscore_global(
     // Pre-compute n_inv² · r2u_a so hot loop does 2 muls instead of 3:
     // r2u(val) = val² · n_inv² · r2u_a + r2u_b  (was: r = val·n_inv; r²·r2u_a + r2u_b)
     let n_inv_sq_r2u_a = n_inv * n_inv * r2u_a;
+
+    // ── Randomized sketching setup ──────────────────────────────────────────
+    // Compress individual dimension N→d via random projection P (d×N).
+    // All subsequent GEMMs operate on d-dimensional data.
+    // Bias correction: E[val̃²] = val²(1+1/d) + N²/d, absorbed into adjusted constants.
+    let sketch_dim: Option<usize> = sketch.and_then(|d| {
+        if d < 3 || d >= n_indiv {
+            eprintln!("WARNING: --sketch {d} ignored (must be 3 ≤ d < n_indiv={n_indiv})");
+            return None;
+        }
+        Some(d)
+    });
+    let gemm_n: usize; // row dimension for all GEMM matrices (d when sketching, N otherwise)
+    let active_n_inv_sq_r2u_a: f64;
+    let active_r2u_b: f64;
+    // Projection matrices (one per precision path, allocated only when sketching)
+    let proj_f64: Option<MatF>;
+    let proj_f32: Option<MatF32>;
+
+    if let Some(d) = sketch_dim {
+        gemm_n = d;
+        // Bias correction with column re-normalization (ratio estimator).
+        // After projecting, each column is rescaled so ||x̃'_j||² = N.
+        // This reduces per-pair variance by ~2× compared to the raw estimator.
+        // The squared cosine r̃² = (val̃'/N)² has bias ≈ (2r⁴ - 7r² + 1)/d;
+        // the leading linear correction is: r²_corr = r̃² × d/(d-2) - 1/(d-2).
+        // Residual r⁴/(d-2) per pair is negligible for typical LD.
+        let d_f = d as f64;
+        let dm2 = d_f - 2.0;
+        active_n_inv_sq_r2u_a = n_inv_sq_r2u_a * d_f / dm2;
+        active_r2u_b = r2u_b - r2u_a / dm2;
+
+        let inv_sqrt_d = 1.0 / d_f.sqrt();
+        let mut rng_proj = fastrand::Rng::with_seed(42);
+
+        if use_f32 {
+            let mut p = MatF32::zeros(d, n_indiv);
+            for col in 0..n_indiv {
+                let sl = p
+                    .col_mut(col)
+                    .try_as_col_major_mut()
+                    .unwrap()
+                    .as_slice_mut();
+                for chunk in sl[..d].chunks_mut(64) {
+                    let bits = rng_proj.u64(..);
+                    for (j, v) in chunk.iter_mut().enumerate() {
+                        *v = if (bits >> j) & 1 == 0 {
+                            inv_sqrt_d as f32
+                        } else {
+                            -(inv_sqrt_d as f32)
+                        };
+                    }
+                }
+            }
+            proj_f32 = Some(p);
+            proj_f64 = None;
+        } else {
+            let mut p = MatF::zeros(d, n_indiv);
+            for col in 0..n_indiv {
+                let sl = p
+                    .col_mut(col)
+                    .try_as_col_major_mut()
+                    .unwrap()
+                    .as_slice_mut();
+                for chunk in sl[..d].chunks_mut(64) {
+                    let bits = rng_proj.u64(..);
+                    for (j, v) in chunk.iter_mut().enumerate() {
+                        *v = if (bits >> j) & 1 == 0 {
+                            inv_sqrt_d
+                        } else {
+                            -inv_sqrt_d
+                        };
+                    }
+                }
+            }
+            proj_f64 = Some(p);
+            proj_f32 = None;
+        }
+        println!(
+            "Sketch mode: projecting N={} → d={} (bias-corrected)",
+            n_indiv, d
+        );
+    } else {
+        gemm_n = n_indiv;
+        active_n_inv_sq_r2u_a = n_inv_sq_r2u_a;
+        active_r2u_b = r2u_b;
+        proj_f64 = None;
+        proj_f32 = None;
+    }
+
     let mut maf_per_snp = vec![0.0f64; m];
 
     let block_sizes: Vec<usize> = (0..m)
@@ -539,7 +630,7 @@ fn compute_ldscore_global(
     if chunk_c > 0 {
         ring_size = ring_size.div_ceil(chunk_c) * chunk_c;
     }
-    let mut bufs = GemmBufs::new(use_f32, n_indiv, chunk_c, ring_size, max_window_size);
+    let mut bufs = GemmBufs::new(use_f32, gemm_n, chunk_c, ring_size, max_window_size);
     let mut ring_next: usize = 0;
     let mut window: VecDeque<(usize, usize)> = VecDeque::new(); // (snp_idx, ring_slot)
 
@@ -607,12 +698,12 @@ fn compute_ldscore_global(
         MatF32::zeros(0, 0)
     };
     let mut hutch_y_f64 = if n_probes_alloc > 0 && !use_f32 {
-        MatF::zeros(n_indiv, n_probes_alloc)
+        MatF::zeros(gemm_n, n_probes_alloc)
     } else {
         MatF::zeros(0, 0)
     };
     let mut hutch_y_f32 = if n_probes_alloc > 0 && use_f32 {
-        MatF32::zeros(n_indiv, n_probes_alloc)
+        MatF32::zeros(gemm_n, n_probes_alloc)
     } else {
         MatF32::zeros(0, 0)
     };
@@ -633,6 +724,20 @@ fn compute_ldscore_global(
     };
     let mut hutch_p_f32 = if n_probes_alloc > 0 && use_f32 {
         MatF32::zeros(max_window_size.max(1), n_probes_alloc)
+    } else {
+        MatF32::zeros(0, 0)
+    };
+
+    // Sketch: temporary full-size buffer for normalization before projection.
+    // When sketching, BED data is normalized into b_full (n_indiv × chunk_c),
+    // then projected: b_mat (d × chunk_c) = P × b_full.
+    let mut b_full_f64: MatF = if sketch_dim.is_some() && !use_f32 {
+        MatF::zeros(n_indiv, chunk_c)
+    } else {
+        MatF::zeros(0, 0)
+    };
+    let mut b_full_f32: MatF32 = if sketch_dim.is_some() && use_f32 {
+        MatF32::zeros(n_indiv, chunk_c)
     } else {
         MatF32::zeros(0, 0)
     };
@@ -659,6 +764,7 @@ fn compute_ldscore_global(
     use std::time::Instant;
     let mut t_bed_read = std::time::Duration::ZERO;
     let mut t_norm = std::time::Duration::ZERO;
+    let mut t_sketch = std::time::Duration::ZERO;
     let mut t_bb_dot = std::time::Duration::ZERO;
     let mut t_ab_dot = std::time::Duration::ZERO;
     let mut t_ring_store = std::time::Duration::ZERO;
@@ -851,16 +957,27 @@ fn compute_ldscore_global(
         t_bed_read += t0.elapsed();
 
         let t0 = Instant::now();
+        // When sketching, normalize into b_full (n_indiv rows), then project into b_mat (d rows).
+        // When not sketching, normalize directly into b_mat (n_indiv rows).
+        let sketching = sketch_dim.is_some();
         for j in 0..c {
             // Get raw column as contiguous slice (1 bounds check vs 2 per element)
             let raw_col = raw_ref.col(j).try_as_col_major().unwrap().as_slice();
             match bufs {
                 GemmBufs::F32 { ref mut b_mat, .. } => {
-                    let col = b_mat
-                        .col_mut(j)
-                        .try_as_col_major_mut()
-                        .unwrap()
-                        .as_slice_mut();
+                    let col = if sketching {
+                        b_full_f32
+                            .col_mut(j)
+                            .try_as_col_major_mut()
+                            .unwrap()
+                            .as_slice_mut()
+                    } else {
+                        b_mat
+                            .col_mut(j)
+                            .try_as_col_major_mut()
+                            .unwrap()
+                            .as_slice_mut()
+                    };
                     col[..n_indiv].copy_from_slice(&raw_col[..n_indiv]);
                     // SAFETY: we build with +avx2,+fma for the musl target;
                     // native builds have AVX2 on any modern x86_64 CPU.
@@ -892,11 +1009,19 @@ fn compute_ldscore_global(
                     }
                 }
                 GemmBufs::F64 { ref mut b_mat, .. } => {
-                    let col = b_mat
-                        .col_mut(j)
-                        .try_as_col_major_mut()
-                        .unwrap()
-                        .as_slice_mut();
+                    let col = if sketching {
+                        b_full_f64
+                            .col_mut(j)
+                            .try_as_col_major_mut()
+                            .unwrap()
+                            .as_slice_mut()
+                    } else {
+                        b_mat
+                            .col_mut(j)
+                            .try_as_col_major_mut()
+                            .unwrap()
+                            .as_slice_mut()
+                    };
                     // SAFETY: see above.
                     let (sum, sum_sq) = unsafe { sum_sumsq_f32(&raw_col[..n_indiv]) };
                     // Widening copy (f32 → f64) — vectorizes to vcvtps2pd + vmovupd
@@ -931,6 +1056,78 @@ fn compute_ldscore_global(
         }
 
         t_norm += t0.elapsed();
+
+        // Sketch projection: b_mat (d × c) = P (d × N) × b_full (N × c)
+        if sketching {
+            let t0 = Instant::now();
+            match bufs {
+                GemmBufs::F32 { ref mut b_mat, .. } => {
+                    let p = proj_f32.as_ref().unwrap();
+                    let d = sketch_dim.unwrap();
+                    faer::linalg::matmul::matmul(
+                        mat_slice_mut_f32(b_mat.as_mut(), 0..d, 0..c),
+                        Accum::Replace,
+                        mat_slice_f32(p.as_ref(), 0..d, 0..n_indiv),
+                        mat_slice_f32(b_full_f32.as_ref(), 0..n_indiv, 0..c),
+                        1.0f32,
+                        Par::rayon(0),
+                    );
+                    // Re-normalize: ||x̃'_j||² = N (ratio estimator).
+                    // Reduces per-pair variance by cancelling correlated noise
+                    // in the numerator (dot product) and denominator (norms).
+                    for j in 0..c {
+                        let col = b_mat.col(j).try_as_col_major().unwrap().as_slice();
+                        let mut nrm_sq = 0.0f64;
+                        for &v in &col[..d] {
+                            nrm_sq += (v as f64) * (v as f64);
+                        }
+                        if nrm_sq > 0.0 {
+                            let scale = ((n / nrm_sq).sqrt()) as f32;
+                            let col_mut = b_mat
+                                .col_mut(j)
+                                .try_as_col_major_mut()
+                                .unwrap()
+                                .as_slice_mut();
+                            for v in &mut col_mut[..d] {
+                                *v *= scale;
+                            }
+                        }
+                    }
+                }
+                GemmBufs::F64 { ref mut b_mat, .. } => {
+                    let p = proj_f64.as_ref().unwrap();
+                    let d = sketch_dim.unwrap();
+                    matmul_to(
+                        mat_slice_mut(b_mat.as_mut(), 0..d, 0..c),
+                        mat_slice(p.as_ref(), 0..d, 0..n_indiv),
+                        mat_slice(b_full_f64.as_ref(), 0..n_indiv, 0..c),
+                        1.0,
+                        Accum::Replace,
+                        Par::rayon(0),
+                    );
+                    // Re-normalize: ||x̃'_j||² = N (ratio estimator)
+                    for j in 0..c {
+                        let col = b_mat.col(j).try_as_col_major().unwrap().as_slice();
+                        let mut nrm_sq = 0.0f64;
+                        for &v in &col[..d] {
+                            nrm_sq += v * v;
+                        }
+                        if nrm_sq > 0.0 {
+                            let scale = (n / nrm_sq).sqrt();
+                            let col_mut = b_mat
+                                .col_mut(j)
+                                .try_as_col_major_mut()
+                                .unwrap()
+                                .as_slice_mut();
+                            for v in &mut col_mut[..d] {
+                                *v *= scale;
+                            }
+                        }
+                    }
+                }
+            }
+            t_sketch += t0.elapsed();
+        }
 
         let annot_chunk = mat_slice(annot.as_ref(), chunk_start..chunk_end, 0..n_annot);
         let (annot_chunk_eff, chunk_all_zero) = if let Some(ref pq_vec) = pq_per_snp {
@@ -1009,7 +1206,7 @@ fn compute_ldscore_global(
             let t0 = Instant::now();
             let hutch_bb = match bufs {
                 GemmBufs::F64 { ref b_mat, .. } => {
-                    let b_sl = mat_slice(b_mat.as_ref(), 0..n_indiv, 0..c);
+                    let b_sl = mat_slice(b_mat.as_ref(), 0..gemm_n, 0..c);
                     // Fill Z (c × T) with Rademacher values
                     for t in 0..n_probes {
                         fill_rademacher_f64(
@@ -1024,14 +1221,14 @@ fn compute_ldscore_global(
                     let z_ref = mat_slice(hutch_z_c_f64.as_ref(), 0..c, 0..n_probes);
                     // Y = B * Z  (n × T)
                     matmul_to(
-                        mat_slice_mut(hutch_y_f64.as_mut(), 0..n_indiv, 0..n_probes),
+                        mat_slice_mut(hutch_y_f64.as_mut(), 0..gemm_n, 0..n_probes),
                         b_sl,
                         z_ref,
                         1.0,
                         Accum::Replace,
                         Par::rayon(0),
                     );
-                    let y_ref = mat_slice(hutch_y_f64.as_ref(), 0..n_indiv, 0..n_probes);
+                    let y_ref = mat_slice(hutch_y_f64.as_ref(), 0..gemm_n, 0..n_probes);
                     // Q = B' * Y = (B'B) * Z  (c × T)
                     matmul_tn_to(
                         mat_slice_mut(hutch_q_f64.as_mut(), 0..c, 0..n_probes),
@@ -1048,7 +1245,7 @@ fn compute_ldscore_global(
                     )
                 }
                 GemmBufs::F32 { ref b_mat, .. } => {
-                    let b_sl = mat_slice_f32(b_mat.as_ref(), 0..n_indiv, 0..c);
+                    let b_sl = mat_slice_f32(b_mat.as_ref(), 0..gemm_n, 0..c);
                     for t in 0..n_probes {
                         fill_rademacher_f32(
                             rng,
@@ -1061,14 +1258,14 @@ fn compute_ldscore_global(
                     }
                     let z_ref = mat_slice_f32(hutch_z_c_f32.as_ref(), 0..c, 0..n_probes);
                     faer::linalg::matmul::matmul(
-                        mat_slice_mut_f32(hutch_y_f32.as_mut(), 0..n_indiv, 0..n_probes),
+                        mat_slice_mut_f32(hutch_y_f32.as_mut(), 0..gemm_n, 0..n_probes),
                         Accum::Replace,
                         b_sl,
                         z_ref,
                         1.0f32,
                         Par::rayon(0),
                     );
-                    let y_ref = mat_slice_f32(hutch_y_f32.as_ref(), 0..n_indiv, 0..n_probes);
+                    let y_ref = mat_slice_f32(hutch_y_f32.as_ref(), 0..gemm_n, 0..n_probes);
                     faer::linalg::matmul::matmul(
                         mat_slice_mut_f32(hutch_q_f32.as_mut(), 0..c, 0..n_probes),
                         Accum::Replace,
@@ -1088,7 +1285,7 @@ fn compute_ldscore_global(
             for j in 0..c {
                 let est = hutch_bb[j] * inv_t;
                 l2[(chunk_start + j, 0)] +=
-                    1.0 + n_inv_sq_r2u_a * (est - n_sq) + (c as f64 - 1.0) * r2u_b;
+                    1.0 + active_n_inv_sq_r2u_a * (est - n_sq) + (c as f64 - 1.0) * active_r2u_b;
             }
             t_bb_dot += t0.elapsed();
 
@@ -1113,16 +1310,16 @@ fn compute_ldscore_global(
                             for (wi, (_, slot)) in window.iter().enumerate() {
                                 a_buf
                                     .as_mut()
-                                    .submatrix_mut(0, wi, n_indiv, 1)
-                                    .copy_from(ring_buf.as_ref().submatrix(0, *slot, n_indiv, 1));
+                                    .submatrix_mut(0, wi, gemm_n, 1)
+                                    .copy_from(ring_buf.as_ref().submatrix(0, *slot, gemm_n, 1));
                             }
                         }
                         let a_view = if contiguous {
-                            mat_slice(ring_buf.as_ref(), 0..n_indiv, first_slot..(first_slot + w))
+                            mat_slice(ring_buf.as_ref(), 0..gemm_n, first_slot..(first_slot + w))
                         } else {
-                            mat_slice(a_buf.as_ref(), 0..n_indiv, 0..w)
+                            mat_slice(a_buf.as_ref(), 0..gemm_n, 0..w)
                         };
-                        let b_sl = mat_slice(b_mat.as_ref(), 0..n_indiv, 0..c);
+                        let b_sl = mat_slice(b_mat.as_ref(), 0..gemm_n, 0..c);
 
                         // ab left: Z_c (c×T), Y=B*Z_c, P=A'*Y → hutch_ab_left
                         for t in 0..n_probes {
@@ -1137,14 +1334,14 @@ fn compute_ldscore_global(
                         }
                         let z_ref = mat_slice(hutch_z_c_f64.as_ref(), 0..c, 0..n_probes);
                         matmul_to(
-                            mat_slice_mut(hutch_y_f64.as_mut(), 0..n_indiv, 0..n_probes),
+                            mat_slice_mut(hutch_y_f64.as_mut(), 0..gemm_n, 0..n_probes),
                             b_sl,
                             z_ref,
                             1.0,
                             Accum::Replace,
                             Par::rayon(0),
                         );
-                        let y_ref = mat_slice(hutch_y_f64.as_ref(), 0..n_indiv, 0..n_probes);
+                        let y_ref = mat_slice(hutch_y_f64.as_ref(), 0..gemm_n, 0..n_probes);
                         matmul_tn_to(
                             mat_slice_mut(hutch_p_f64.as_mut(), 0..w, 0..n_probes),
                             a_view,
@@ -1160,7 +1357,8 @@ fn compute_ldscore_global(
                         );
                         for (wi, (snp_idx, _)) in window.iter().enumerate() {
                             let est = hutch_ab_left[wi] * inv_t;
-                            l2[(*snp_idx, 0)] += n_inv_sq_r2u_a * est + c as f64 * r2u_b;
+                            l2[(*snp_idx, 0)] +=
+                                active_n_inv_sq_r2u_a * est + c as f64 * active_r2u_b;
                         }
 
                         // ab right: Z_w (w×T), Y=A*Z_w, Q=B'*Y → hutch_ab_right
@@ -1176,14 +1374,14 @@ fn compute_ldscore_global(
                         }
                         let z_ref = mat_slice(hutch_z_w_f64.as_ref(), 0..w, 0..n_probes);
                         matmul_to(
-                            mat_slice_mut(hutch_y_f64.as_mut(), 0..n_indiv, 0..n_probes),
+                            mat_slice_mut(hutch_y_f64.as_mut(), 0..gemm_n, 0..n_probes),
                             a_view,
                             z_ref,
                             1.0,
                             Accum::Replace,
                             Par::rayon(0),
                         );
-                        let y_ref = mat_slice(hutch_y_f64.as_ref(), 0..n_indiv, 0..n_probes);
+                        let y_ref = mat_slice(hutch_y_f64.as_ref(), 0..gemm_n, 0..n_probes);
                         matmul_tn_to(
                             mat_slice_mut(hutch_q_f64.as_mut(), 0..c, 0..n_probes),
                             b_sl,
@@ -1199,7 +1397,8 @@ fn compute_ldscore_global(
                         );
                         for j in 0..c {
                             let est = hutch_ab_right[j] * inv_t;
-                            l2[(chunk_start + j, 0)] += n_inv_sq_r2u_a * est + w as f64 * r2u_b;
+                            l2[(chunk_start + j, 0)] +=
+                                active_n_inv_sq_r2u_a * est + w as f64 * active_r2u_b;
                         }
                     }
                     GemmBufs::F32 {
@@ -1212,20 +1411,20 @@ fn compute_ldscore_global(
                             for (wi, (_, slot)) in window.iter().enumerate() {
                                 a_buf
                                     .as_mut()
-                                    .submatrix_mut(0, wi, n_indiv, 1)
-                                    .copy_from(ring_buf.as_ref().submatrix(0, *slot, n_indiv, 1));
+                                    .submatrix_mut(0, wi, gemm_n, 1)
+                                    .copy_from(ring_buf.as_ref().submatrix(0, *slot, gemm_n, 1));
                             }
                         }
                         let a_view = if contiguous {
                             mat_slice_f32(
                                 ring_buf.as_ref(),
-                                0..n_indiv,
+                                0..gemm_n,
                                 first_slot..(first_slot + w),
                             )
                         } else {
-                            mat_slice_f32(a_buf.as_ref(), 0..n_indiv, 0..w)
+                            mat_slice_f32(a_buf.as_ref(), 0..gemm_n, 0..w)
                         };
-                        let b_sl = mat_slice_f32(b_mat.as_ref(), 0..n_indiv, 0..c);
+                        let b_sl = mat_slice_f32(b_mat.as_ref(), 0..gemm_n, 0..c);
 
                         // ab left
                         for t in 0..n_probes {
@@ -1240,14 +1439,14 @@ fn compute_ldscore_global(
                         }
                         let z_ref = mat_slice_f32(hutch_z_c_f32.as_ref(), 0..c, 0..n_probes);
                         faer::linalg::matmul::matmul(
-                            mat_slice_mut_f32(hutch_y_f32.as_mut(), 0..n_indiv, 0..n_probes),
+                            mat_slice_mut_f32(hutch_y_f32.as_mut(), 0..gemm_n, 0..n_probes),
                             Accum::Replace,
                             b_sl,
                             z_ref,
                             1.0f32,
                             Par::rayon(0),
                         );
-                        let y_ref = mat_slice_f32(hutch_y_f32.as_ref(), 0..n_indiv, 0..n_probes);
+                        let y_ref = mat_slice_f32(hutch_y_f32.as_ref(), 0..gemm_n, 0..n_probes);
                         faer::linalg::matmul::matmul(
                             mat_slice_mut_f32(hutch_p_f32.as_mut(), 0..w, 0..n_probes),
                             Accum::Replace,
@@ -1263,7 +1462,8 @@ fn compute_ldscore_global(
                         );
                         for (wi, (snp_idx, _)) in window.iter().enumerate() {
                             let est = hutch_ab_left[wi] * inv_t;
-                            l2[(*snp_idx, 0)] += n_inv_sq_r2u_a * est + c as f64 * r2u_b;
+                            l2[(*snp_idx, 0)] +=
+                                active_n_inv_sq_r2u_a * est + c as f64 * active_r2u_b;
                         }
 
                         // ab right
@@ -1279,14 +1479,14 @@ fn compute_ldscore_global(
                         }
                         let z_ref = mat_slice_f32(hutch_z_w_f32.as_ref(), 0..w, 0..n_probes);
                         faer::linalg::matmul::matmul(
-                            mat_slice_mut_f32(hutch_y_f32.as_mut(), 0..n_indiv, 0..n_probes),
+                            mat_slice_mut_f32(hutch_y_f32.as_mut(), 0..gemm_n, 0..n_probes),
                             Accum::Replace,
                             a_view,
                             z_ref,
                             1.0f32,
                             Par::rayon(0),
                         );
-                        let y_ref = mat_slice_f32(hutch_y_f32.as_ref(), 0..n_indiv, 0..n_probes);
+                        let y_ref = mat_slice_f32(hutch_y_f32.as_ref(), 0..gemm_n, 0..n_probes);
                         faer::linalg::matmul::matmul(
                             mat_slice_mut_f32(hutch_q_f32.as_mut(), 0..c, 0..n_probes),
                             Accum::Replace,
@@ -1302,7 +1502,8 @@ fn compute_ldscore_global(
                         );
                         for j in 0..c {
                             let est = hutch_ab_right[j] * inv_t;
-                            l2[(chunk_start + j, 0)] += n_inv_sq_r2u_a * est + w as f64 * r2u_b;
+                            l2[(chunk_start + j, 0)] +=
+                                active_n_inv_sq_r2u_a * est + w as f64 * active_r2u_b;
                         }
                     }
                 }
@@ -1344,26 +1545,24 @@ fn compute_ldscore_global(
 
                 match bufs {
                     GemmBufs::F32 { ref b_mat, .. } => {
-                        let b_slice = mat_slice_f32(b_mat.as_ref(), 0..n_indiv, 0..c);
+                        let b_slice = mat_slice_f32(b_mat.as_ref(), 0..gemm_n, 0..c);
                         #[allow(unused_mut)]
                         let mut bb_sl = mat_slice_mut_f32(bb_f32.as_mut(), 0..c, 0..c);
                         let mut _did_gpu = false;
                         #[cfg(feature = "gpu")]
                         {
                             if let Some(ref ctx) = gpu_ctx {
-                                let b_f32 = mat_to_col_major_f32_from_f32(b_slice, n_indiv, c);
+                                let b_f32 = mat_to_col_major_f32_from_f32(b_slice, gemm_n, c);
                                 let gpu_result = if let Some(tc) = _gpu_tile_cols {
                                     if _gpu_flex32 {
-                                        ctx.matmul_tn_tiled_flex32(
-                                            &b_f32, n_indiv, c, &b_f32, c, tc,
-                                        )
+                                        ctx.matmul_tn_tiled_flex32(&b_f32, gemm_n, c, &b_f32, c, tc)
                                     } else {
-                                        ctx.matmul_tn_tiled(&b_f32, n_indiv, c, &b_f32, c, tc)
+                                        ctx.matmul_tn_tiled(&b_f32, gemm_n, c, &b_f32, c, tc)
                                     }
                                 } else if _gpu_flex32 {
-                                    ctx.matmul_tn_flex32(&b_f32, n_indiv, c, &b_f32, c)
+                                    ctx.matmul_tn_flex32(&b_f32, gemm_n, c, &b_f32, c)
                                 } else {
-                                    ctx.matmul_tn(&b_f32, n_indiv, c, &b_f32, c)
+                                    ctx.matmul_tn(&b_f32, gemm_n, c, &b_f32, c)
                                 };
                                 match gpu_result {
                                     Ok(result) => {
@@ -1386,12 +1585,16 @@ fn compute_ldscore_global(
                                 Par::rayon(0),
                             );
                         }
-                        fill_r2u_bb_from(&mut r2u_bb, c, n_inv_sq_r2u_a, r2u_b, |k, j| {
-                            bb_f32[(k, j)] as f64
-                        });
+                        fill_r2u_bb_from(
+                            &mut r2u_bb,
+                            c,
+                            active_n_inv_sq_r2u_a,
+                            active_r2u_b,
+                            |k, j| bb_f32[(k, j)] as f64,
+                        );
                     }
                     GemmBufs::F64 { ref b_mat, .. } => {
-                        let b_slice = mat_slice(b_mat.as_ref(), 0..n_indiv, 0..c);
+                        let b_slice = mat_slice(b_mat.as_ref(), 0..gemm_n, 0..c);
                         #[allow(unused_mut)]
                         let mut bb_sl = mat_slice_mut(bb_f64.as_mut(), 0..c, 0..c);
                         let mut _did_gpu = false;
@@ -1400,11 +1603,11 @@ fn compute_ldscore_global(
                             if let Some(ref ctx) = gpu_ctx {
                                 if _gpu_f64 && ctx.capabilities.has_f64 {
                                     // Native f64 path — no precision loss
-                                    let b_f64 = mat_to_col_major_f64(b_slice, n_indiv, c);
+                                    let b_f64 = mat_to_col_major_f64(b_slice, gemm_n, c);
                                     let gpu_result = if let Some(tc) = _gpu_tile_cols {
-                                        ctx.matmul_tn_tiled_f64(&b_f64, n_indiv, c, &b_f64, c, tc)
+                                        ctx.matmul_tn_tiled_f64(&b_f64, gemm_n, c, &b_f64, c, tc)
                                     } else {
-                                        ctx.matmul_tn_f64(&b_f64, n_indiv, c, &b_f64, c)
+                                        ctx.matmul_tn_f64(&b_f64, gemm_n, c, &b_f64, c)
                                     };
                                     match gpu_result {
                                         Ok(result) => {
@@ -1422,19 +1625,19 @@ fn compute_ldscore_global(
                                     }
                                 } else {
                                     // f32 conversion path
-                                    let b_f32 = mat_to_col_major_f32_from_f64(b_slice, n_indiv, c);
+                                    let b_f32 = mat_to_col_major_f32_from_f64(b_slice, gemm_n, c);
                                     let gpu_result = if let Some(tc) = _gpu_tile_cols {
                                         if _gpu_flex32 {
                                             ctx.matmul_tn_tiled_flex32(
-                                                &b_f32, n_indiv, c, &b_f32, c, tc,
+                                                &b_f32, gemm_n, c, &b_f32, c, tc,
                                             )
                                         } else {
-                                            ctx.matmul_tn_tiled(&b_f32, n_indiv, c, &b_f32, c, tc)
+                                            ctx.matmul_tn_tiled(&b_f32, gemm_n, c, &b_f32, c, tc)
                                         }
                                     } else if _gpu_flex32 {
-                                        ctx.matmul_tn_flex32(&b_f32, n_indiv, c, &b_f32, c)
+                                        ctx.matmul_tn_flex32(&b_f32, gemm_n, c, &b_f32, c)
                                     } else {
-                                        ctx.matmul_tn(&b_f32, n_indiv, c, &b_f32, c)
+                                        ctx.matmul_tn(&b_f32, gemm_n, c, &b_f32, c)
                                     };
                                     match gpu_result {
                                         Ok(result) => {
@@ -1458,9 +1661,13 @@ fn compute_ldscore_global(
                                 Par::rayon(0),
                             );
                         }
-                        fill_r2u_bb_from(&mut r2u_bb, c, n_inv_sq_r2u_a, r2u_b, |k, j| {
-                            bb_f64[(k, j)]
-                        });
+                        fill_r2u_bb_from(
+                            &mut r2u_bb,
+                            c,
+                            active_n_inv_sq_r2u_a,
+                            active_r2u_b,
+                            |k, j| bb_f64[(k, j)],
+                        );
                     }
                 }
                 let r2u_bb_view = mat_slice(r2u_bb.as_ref(), 0..c, 0..c);
@@ -1553,40 +1760,40 @@ fn compute_ldscore_global(
                         } => {
                             if !contiguous {
                                 for (wi, (_, slot)) in window.iter().enumerate() {
-                                    a_buf.as_mut().submatrix_mut(0, wi, n_indiv, 1).copy_from(
-                                        ring_buf.as_ref().submatrix(0, *slot, n_indiv, 1),
+                                    a_buf.as_mut().submatrix_mut(0, wi, gemm_n, 1).copy_from(
+                                        ring_buf.as_ref().submatrix(0, *slot, gemm_n, 1),
                                     );
                                 }
                             }
                             let a_view = if contiguous {
                                 mat_slice_f32(
                                     ring_buf.as_ref(),
-                                    0..n_indiv,
+                                    0..gemm_n,
                                     first_slot..(first_slot + w),
                                 )
                             } else {
-                                mat_slice_f32(a_buf.as_ref(), 0..n_indiv, 0..w)
+                                mat_slice_f32(a_buf.as_ref(), 0..gemm_n, 0..w)
                             };
-                            let b_sl = mat_slice_f32(b_mat.as_ref(), 0..n_indiv, 0..c);
+                            let b_sl = mat_slice_f32(b_mat.as_ref(), 0..gemm_n, 0..c);
 
                             let mut _did_gpu = false;
                             #[cfg(feature = "gpu")]
                             {
                                 if let Some(ref ctx) = gpu_ctx {
-                                    let a_f32 = mat_to_col_major_f32_from_f32(a_view, n_indiv, w);
-                                    let b_f32 = mat_to_col_major_f32_from_f32(b_sl, n_indiv, c);
+                                    let a_f32 = mat_to_col_major_f32_from_f32(a_view, gemm_n, w);
+                                    let b_f32 = mat_to_col_major_f32_from_f32(b_sl, gemm_n, c);
                                     let gpu_result = if let Some(tc) = _gpu_tile_cols {
                                         if _gpu_flex32 {
                                             ctx.matmul_tn_tiled_flex32(
-                                                &a_f32, n_indiv, w, &b_f32, c, tc,
+                                                &a_f32, gemm_n, w, &b_f32, c, tc,
                                             )
                                         } else {
-                                            ctx.matmul_tn_tiled(&a_f32, n_indiv, w, &b_f32, c, tc)
+                                            ctx.matmul_tn_tiled(&a_f32, gemm_n, w, &b_f32, c, tc)
                                         }
                                     } else if _gpu_flex32 {
-                                        ctx.matmul_tn_flex32(&a_f32, n_indiv, w, &b_f32, c)
+                                        ctx.matmul_tn_flex32(&a_f32, gemm_n, w, &b_f32, c)
                                     } else {
-                                        ctx.matmul_tn(&a_f32, n_indiv, w, &b_f32, c)
+                                        ctx.matmul_tn(&a_f32, gemm_n, w, &b_f32, c)
                                     };
                                     match gpu_result {
                                         Ok(result) => {
@@ -1629,7 +1836,7 @@ fn compute_ldscore_global(
                                     ab_col[..w].iter().zip(r2u_col[..w].iter_mut())
                                 {
                                     let val = *ab_val as f64;
-                                    *r2u_val = val * val * n_inv_sq_r2u_a + r2u_b;
+                                    *r2u_val = val * val * active_n_inv_sq_r2u_a + active_r2u_b;
                                 }
                             }
                         }
@@ -1642,21 +1849,21 @@ fn compute_ldscore_global(
                         } => {
                             if !contiguous {
                                 for (wi, (_, slot)) in window.iter().enumerate() {
-                                    a_buf.as_mut().submatrix_mut(0, wi, n_indiv, 1).copy_from(
-                                        ring_buf.as_ref().submatrix(0, *slot, n_indiv, 1),
+                                    a_buf.as_mut().submatrix_mut(0, wi, gemm_n, 1).copy_from(
+                                        ring_buf.as_ref().submatrix(0, *slot, gemm_n, 1),
                                     );
                                 }
                             }
                             let a_view = if contiguous {
                                 mat_slice(
                                     ring_buf.as_ref(),
-                                    0..n_indiv,
+                                    0..gemm_n,
                                     first_slot..(first_slot + w),
                                 )
                             } else {
-                                mat_slice(a_buf.as_ref(), 0..n_indiv, 0..w)
+                                mat_slice(a_buf.as_ref(), 0..gemm_n, 0..w)
                             };
-                            let b_sl = mat_slice(b_mat.as_ref(), 0..n_indiv, 0..c);
+                            let b_sl = mat_slice(b_mat.as_ref(), 0..gemm_n, 0..c);
 
                             let mut _did_gpu = false;
                             #[cfg(feature = "gpu")]
@@ -1664,12 +1871,12 @@ fn compute_ldscore_global(
                                 if let Some(ref ctx) = gpu_ctx {
                                     if _gpu_f64 && ctx.capabilities.has_f64 {
                                         // Native f64 path
-                                        let a_f64_data = mat_to_col_major_f64(a_view, n_indiv, w);
-                                        let b_f64_data = mat_to_col_major_f64(b_sl, n_indiv, c);
+                                        let a_f64_data = mat_to_col_major_f64(a_view, gemm_n, w);
+                                        let b_f64_data = mat_to_col_major_f64(b_sl, gemm_n, c);
                                         let gpu_result = if let Some(tc) = _gpu_tile_cols {
                                             ctx.matmul_tn_tiled_f64(
                                                 &a_f64_data,
-                                                n_indiv,
+                                                gemm_n,
                                                 w,
                                                 &b_f64_data,
                                                 c,
@@ -1678,7 +1885,7 @@ fn compute_ldscore_global(
                                         } else {
                                             ctx.matmul_tn_f64(
                                                 &a_f64_data,
-                                                n_indiv,
+                                                gemm_n,
                                                 w,
                                                 &b_f64_data,
                                                 c,
@@ -1701,22 +1908,22 @@ fn compute_ldscore_global(
                                     } else {
                                         // f32 conversion path
                                         let a_f32 =
-                                            mat_to_col_major_f32_from_f64(a_view, n_indiv, w);
-                                        let b_f32 = mat_to_col_major_f32_from_f64(b_sl, n_indiv, c);
+                                            mat_to_col_major_f32_from_f64(a_view, gemm_n, w);
+                                        let b_f32 = mat_to_col_major_f32_from_f64(b_sl, gemm_n, c);
                                         let gpu_result = if let Some(tc) = _gpu_tile_cols {
                                             if _gpu_flex32 {
                                                 ctx.matmul_tn_tiled_flex32(
-                                                    &a_f32, n_indiv, w, &b_f32, c, tc,
+                                                    &a_f32, gemm_n, w, &b_f32, c, tc,
                                                 )
                                             } else {
                                                 ctx.matmul_tn_tiled(
-                                                    &a_f32, n_indiv, w, &b_f32, c, tc,
+                                                    &a_f32, gemm_n, w, &b_f32, c, tc,
                                                 )
                                             }
                                         } else if _gpu_flex32 {
-                                            ctx.matmul_tn_flex32(&a_f32, n_indiv, w, &b_f32, c)
+                                            ctx.matmul_tn_flex32(&a_f32, gemm_n, w, &b_f32, c)
                                         } else {
-                                            ctx.matmul_tn(&a_f32, n_indiv, w, &b_f32, c)
+                                            ctx.matmul_tn(&a_f32, gemm_n, w, &b_f32, c)
                                         };
                                         match gpu_result {
                                             Ok(result) => {
@@ -1758,7 +1965,8 @@ fn compute_ldscore_global(
                                 for (ab_val, r2u_val) in
                                     ab_col[..w].iter().zip(r2u_col[..w].iter_mut())
                                 {
-                                    *r2u_val = *ab_val * *ab_val * n_inv_sq_r2u_a + r2u_b;
+                                    *r2u_val =
+                                        *ab_val * *ab_val * active_n_inv_sq_r2u_a + active_r2u_b;
                                 }
                             }
                         }
@@ -1841,8 +2049,8 @@ fn compute_ldscore_global(
                 if bulk_ok {
                     ring_buf
                         .as_mut()
-                        .submatrix_mut(0, start_slot, n_indiv, c)
-                        .copy_from(b_mat.as_ref().submatrix(0, 0, n_indiv, c));
+                        .submatrix_mut(0, start_slot, gemm_n, c)
+                        .copy_from(b_mat.as_ref().submatrix(0, 0, gemm_n, c));
                     for j in 0..c {
                         window.push_back((chunk_start + j, start_slot + j));
                     }
@@ -1851,8 +2059,8 @@ fn compute_ldscore_global(
                         let slot = (ring_next + j) % ring_size;
                         ring_buf
                             .as_mut()
-                            .submatrix_mut(0, slot, n_indiv, 1)
-                            .copy_from(b_mat.as_ref().submatrix(0, j, n_indiv, 1));
+                            .submatrix_mut(0, slot, gemm_n, 1)
+                            .copy_from(b_mat.as_ref().submatrix(0, j, gemm_n, 1));
                         window.push_back((chunk_start + j, slot));
                     }
                 }
@@ -1865,8 +2073,8 @@ fn compute_ldscore_global(
                 if bulk_ok {
                     ring_buf
                         .as_mut()
-                        .submatrix_mut(0, start_slot, n_indiv, c)
-                        .copy_from(b_mat.as_ref().submatrix(0, 0, n_indiv, c));
+                        .submatrix_mut(0, start_slot, gemm_n, c)
+                        .copy_from(b_mat.as_ref().submatrix(0, 0, gemm_n, c));
                     for j in 0..c {
                         window.push_back((chunk_start + j, start_slot + j));
                     }
@@ -1875,8 +2083,8 @@ fn compute_ldscore_global(
                         let slot = (ring_next + j) % ring_size;
                         ring_buf
                             .as_mut()
-                            .submatrix_mut(0, slot, n_indiv, 1)
-                            .copy_from(b_mat.as_ref().submatrix(0, j, n_indiv, 1));
+                            .submatrix_mut(0, slot, gemm_n, 1)
+                            .copy_from(b_mat.as_ref().submatrix(0, j, gemm_n, 1));
                         window.push_back((chunk_start + j, slot));
                     }
                 }
@@ -1891,14 +2099,26 @@ fn compute_ldscore_global(
     }
 
     if verbose_timing {
-        eprintln!(
-            "[perf] compute_ldscore: bed_read(stall)={:.3}s norm={:.3}s bb_dot={:.3}s ab_dot={:.3}s ring_store={:.3}s",
-            t_bed_read.as_secs_f64(),
-            t_norm.as_secs_f64(),
-            t_bb_dot.as_secs_f64(),
-            t_ab_dot.as_secs_f64(),
-            t_ring_store.as_secs_f64(),
-        );
+        if sketch_dim.is_some() {
+            eprintln!(
+                "[perf] compute_ldscore: bed_read(stall)={:.3}s norm={:.3}s sketch={:.3}s bb_dot={:.3}s ab_dot={:.3}s ring_store={:.3}s",
+                t_bed_read.as_secs_f64(),
+                t_norm.as_secs_f64(),
+                t_sketch.as_secs_f64(),
+                t_bb_dot.as_secs_f64(),
+                t_ab_dot.as_secs_f64(),
+                t_ring_store.as_secs_f64(),
+            );
+        } else {
+            eprintln!(
+                "[perf] compute_ldscore: bed_read(stall)={:.3}s norm={:.3}s bb_dot={:.3}s ab_dot={:.3}s ring_store={:.3}s",
+                t_bed_read.as_secs_f64(),
+                t_norm.as_secs_f64(),
+                t_bb_dot.as_secs_f64(),
+                t_ab_dot.as_secs_f64(),
+                t_ring_store.as_secs_f64(),
+            );
+        }
     }
 
     Ok((l2, maf_per_snp))
@@ -2557,6 +2777,7 @@ pub fn run(args: L2Args) -> Result<()> {
         args.prefetch_bed,
         args.verbose_timing,
         args.stochastic,
+        args.sketch,
     )
     .context("computing LD scores")?;
 
