@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Biobank-scale benchmark: exact vs sketch at various d values.
+# Biobank-scale benchmark: exact vs sketch × {f64, f32} at various d values.
 # Designed for AWS Batch with the biobank_50k dataset (1.66M SNPs × 50K individuals).
 #
 set -euo pipefail
@@ -14,24 +14,32 @@ echo "Dataset: $BFILE"
 echo "Runs: $RUNS, Warmup: $WARMUP"
 echo ""
 
-COMMON="--bfile $BFILE --ld-wind-kb 1000 --chunk-size 200 --yes-really --verbose-timing"
+COMMON="--bfile $BFILE --ld-wind-kb 1000 --chunk-size 200 --yes-really"
 
-# Exact baseline
-echo "--- Exact ---"
-hyperfine --warmup "$WARMUP" --runs "$RUNS" --export-json /tmp/exact.json \
-    "ldsc l2 $COMMON --out /tmp/exact_out"
+run_bench() {
+    local label="$1"; local extra="$2"; local out_json="/tmp/${label}.json"
+    echo "--- $label ---"
+    # shellcheck disable=SC2086
+    hyperfine --warmup "$WARMUP" --runs "$RUNS" --export-json "$out_json" \
+        "ldsc l2 $COMMON $extra --out /tmp/${label}_out"
+    echo ""
+}
 
-# Sketch sweep
-for d in 50 100 200; do
-    echo "--- Sketch d=$d ---"
-    hyperfine --warmup "$WARMUP" --runs "$RUNS" --export-json "/tmp/s${d}.json" \
-        "ldsc l2 $COMMON --sketch $d --out /tmp/s${d}_out"
-done
+run_bench "exact-f64"       ""
+run_bench "exact-f32"       "--fast-f32"
+run_bench "sketch-50-f64"   "--sketch 50"
+run_bench "sketch-100-f64"  "--sketch 100"
+run_bench "sketch-200-f64"  "--sketch 200"
+run_bench "sketch-50-f32"   "--sketch 50  --fast-f32"
+run_bench "sketch-100-f32"  "--sketch 100 --fast-f32"
+run_bench "sketch-200-f32"  "--sketch 200 --fast-f32"
 
 echo ""
 echo "=== RAW JSON ==="
-for f in /tmp/exact.json /tmp/s50.json /tmp/s100.json /tmp/s200.json; do
-    echo "--- $(basename "$f") ---"
+for label in exact-f64 exact-f32 sketch-50-f64 sketch-100-f64 sketch-200-f64 \
+             sketch-50-f32 sketch-100-f32 sketch-200-f32; do
+    f="/tmp/${label}.json"
+    echo "--- $label ---"
     cat "$f" 2>/dev/null || echo "(not available)"
     echo ""
 done

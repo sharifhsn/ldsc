@@ -43,7 +43,14 @@ echo "Date: $(date -u)"
 echo ""
 
 # ── Run benchmark ─────────────────────────────────────────────────────────────
-if [ $# -eq 0 ]; then
+if [ $# -gt 0 ]; then
+    # Custom command passed as arguments
+    echo "=== Running custom command ==="
+    exec "$@"
+elif [ "$DATASET" = "biobank_50k" ]; then
+    # Biobank multi-mode sweep
+    exec biobank-bench
+else
     # Default: full 1000G benchmark with verbose timing
     echo "=== Running default benchmark (${RUNS} runs, ${WARMUP} warmup) ==="
     hyperfine \
@@ -55,8 +62,4 @@ if [ $# -eq 0 ]; then
     echo ""
     echo "=== RESULTS JSON ==="
     cat /tmp/results.json
-else
-    # Custom command passed as arguments
-    echo "=== Running custom command ==="
-    exec "$@"
 fi
