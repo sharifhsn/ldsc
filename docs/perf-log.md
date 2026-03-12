@@ -1355,3 +1355,51 @@ Sketch modes scale better than linear in N because the downstream GEMM (d×d) is
 ### Key Takeaway
 
 At biobank scale (N=50K), `--sketch 100` provides a **4× speedup** (718.6s → 177.6s) with good CPU utilization. The optimal sketch dimension shifts upward with N: at N=2490, d=50 was optimal; at N=50K, d=100 is optimal. This is because larger d allows better rayon parallelization of downstream GEMMs, and the projection P×B cost is fixed per-d regardless.
+
+## 2026-03-12: Full Mode × Precision Sweep (N=50,000, exact and sketch × f64/f32)
+
+### Setup
+Same hardware/build as 2026-03-11. New 8-way sweep using `scripts/biobank-bench.sh`
+(updated to include `--fast-f32` variants). Container memory 28GB (28672MB) to avoid OOM.
+Parity verified locally on bench_5k_chr22 using `scripts/verify_parity_all.sh`.
+
+### Results
+
+| Mode | Mean ± σ | User time | Parallelism | vs exact-f64 | vs Python (~1548s) |
+|------|----------|-----------|-------------|-------------|-------------------|
+| exact-f64 | 688.8s ± 3.5s | 7885s | 11.4× | 1.0× | 2.2× |
+| exact-f32 | 373.1s ± 1.0s | 4273s | 11.5× | **1.85×** | 4.1× |
+| sketch-50-f64 | 167.3s ± 0.8s | 1232s | 7.4× | 4.1× | 9.3× |
+| sketch-100-f64 | 186.9s ± 1.4s | 1526s | 8.2× | 3.7× | 8.3× |
+| sketch-200-f64 | 214.4s ± 0.9s | 1966s | 9.2× | 3.2× | 7.2× |
+| **sketch-50-f32** | **129.5s ± 0.4s** | 958s | 7.4× | **5.3×** | **12×** |
+| sketch-100-f32 | 138.6s ± 0.7s | 1108s | 8.0× | **5.0×** | 11.2× |
+| sketch-200-f32 | 159.3s ± 1.4s | 1420s | 8.9× | **4.3×** | 9.7× |
+
+Accuracy (bench_5k_chr22, vs Python exact):
+- sketch-50: Pearson r=0.635, median_pct_err=20.6% (on chr22 ~61 SNPs; r≈0.81 genome-wide)
+- sketch-100: Pearson r=0.731, median_pct_err=12.3%
+- sketch-200: Pearson r=0.883, median_pct_err=6.1%
+- f32 sketch: numerically identical to f64 sketch (same seed 42, ±1/√d representable exactly)
+
+### Key Findings
+
+**f32 sketch gives ~1.3× speedup over f64 sketch** (consistent across d=50/100/200):
+- sketch-50: 167.3 → 129.5s = 1.29× from f32
+- sketch-100: 186.9 → 138.6s = 1.35× from f32
+- sketch-200: 214.4 → 159.3s = 1.35× from f32
+
+Less than the 1.85× for exact mode because sketch mode already reduces the dominant GEMM
+dimension. The remaining bottleneck in f32 sketch is: read B (40MB/chunk f32 vs 80MB f64,
+2× savings), but also read P (10MB/chunk f32 at d=50), plus smaller downstream GEMMs.
+
+**f32 exact gives 1.85× speedup**: nearly the full 2× theoretical bandwidth savings, confirming
+the exact path is memory-bandwidth-bound at N=50K.
+
+**Best biobank-scale mode**: `--sketch 50 --fast-f32` at **129.5s → 5.3× over exact** (~12×
+vs Python). Accuracy: Pearson r≈0.81 (genome-wide estimate). Best accuracy/speed tradeoff:
+`--sketch 100 --fast-f32` at 138.6s (5.0×) with r≈0.85, median_pct_err≈13%.
+
+**Why we can't reach 7×**: The bandwidth floor from reading B (40MB/chunk in f32) is ~3.2× lower
+than exact-f64 (160MB/chunk), but compute savings + better GEMM structure together yield 5.3×.
+Going further would require reducing d below 50 (poor JL accuracy) or blocking at chunk level.
