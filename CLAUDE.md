@@ -4,7 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Rust rewrite of [Bulik-Sullivan et al.'s LDSC](https://github.com/bulik/ldsc) (LD Score Regression), a tool for estimating heritability and genetic correlation from GWAS summary statistics. Six subcommands: `munge-sumstats`, `l2`, `h2`, `rg`, `make-annot`, `cts-annot`. The goal is numerical parity with the Python implementation at 18× speedup (23× with `--fast-f32`).
+Rust rewrite of [Bulik-Sullivan et al.'s LDSC](https://github.com/bulik/ldsc) (LD Score Regression), a tool for estimating heritability and genetic correlation from GWAS summary statistics. Six subcommands: `munge-sumstats`, `l2`, `h2`, `rg`, `make-annot`, `cts-annot`. Numerically exact parity with Python (`max_abs_diff=0` in f64 mode). Current performance vs Python on AWS EPYC 7R13:
+
+- **1000G (N=2,490)**: 37.7× exact, 101× with `--sketch 50`
+- **Biobank (N=50K)**: 5.3× with `--sketch 50 --fast-f32` (best), 1.85× exact-f32
 
 ## Build & Test Commands
 
@@ -105,7 +108,10 @@ Parity/benchmark scripts in `scripts/`:
 - `verify_parity_munge.sh` — Munge output comparison
 - `bench_l2.sh` — Quick l2 benchmark (5k SNPs default)
 - `check_l2_tiny_py_vs_rust.sh` — Uses `--extract` on full 1.66M BED
-- `aws-bench.sh` — Build, push to ECR, run on AWS Batch (c7a.4xlarge EPYC). **Use this for verified perf numbers; local timings are noisy.**
+- `verify_parity_all.sh` — Comprehensive 8-mode parity sweep (exact/sketch × f64/f32 vs Python, chr22 data)
+- `aws-bench.sh` — Build, push to ECR, run on AWS Batch (c6a.4xlarge EPYC). **Use this for verified perf numbers; local timings are noisy.**
+- `biobank-bench.sh` — AWS Batch biobank 50K benchmark (all 8 mode×precision variants)
+- `make_synthetic_biobank.py` — Generate synthetic N=50K BED from 1000G (20× replication, 1% noise)
 
 ## Important Behavioral Notes
 
@@ -115,11 +121,14 @@ Parity/benchmark scripts in `scripts/`:
 - L2 uses a global sequential pass across all chromosomes (not per-chromosome parallel), matching Python's cross-chromosome window bleeding behavior.
 - All CM columns in the 1000G reference data are 0 — never use `--ld-wind-cm` for benchmarking with this data.
 - `make-annot` BED intervals are 0-based half-open; SNP BP=b matches [start,end) iff start < b <= end.
+- `--sketch` projection matrix P uses deterministic seed 42 (`fastrand::Rng::with_seed(42)`). Same `--sketch d` on same data always produces identical output.
 
 ## Data Files
 
 - Full genome: `data/1000G_phase3_common_norel.{bed,bim,fam}` (1,664,852 SNPs, 2,490 individuals)
+- Biobank synthetic: `data/biobank_50k.{bed,bim,fam}` (1,664,852 SNPs, 50,000 individuals, ~20GB BED)
 - Benchmark subsets: `data/bench_5k.*`, `data/bench_200k.*`, plus chr22 variants
+- S3 mirror: `s3://ldsc-bench-data-270497617191/` (all datasets including biobank_50k)
 
 ## Important Docs, Read When Needed
 - `generated_docs/`: All dependencies have documentation locally saved here, prefer checking those over web searching for documentation. This has a lot of text so be careful when reading to not hammer your context window.
@@ -128,6 +137,44 @@ Parity/benchmark scripts in `scripts/`:
 - `docs/hpc.md`: Example of an HPC that `ldsc` is intended to run on, in this case UPenn.
 - `ldsc.wiki/`: The wiki for the Bulik's LDSC implementation, has example workflows.
 - `ldsc_py/`: Bulik's LDSC implementation.
+
+## Approximate / Fast Modes
+
+Three opt-in modes trade precision for speed in the `l2` subcommand:
+
+- **`--fast-f32`** — Use f32 for genotype storage and GEMM. ~1.85× speedup (bandwidth-bound). Numerically close to f64; safe for downstream h2/rg. Combinable with all other modes.
+
+- **`--sketch <d>`** — Randomized Rademacher projection (N→d dimensions) before GEMM. Bias-corrected via ratio estimator with `d/(d-2) - 1/(d-2)` adjustment. Deterministic (seed=42). Accuracy depends on d:
+  - d=50: Pearson r≈0.81, ~52% median per-SNP error (best speed at small N)
+  - d=100: r≈0.85, ~13% median error (best speed at biobank N=50K)
+  - d=200: r≈0.93, ~6% median error (best accuracy/speed tradeoff)
+  - Combinable with `--fast-f32`. Optimal d shifts upward with N due to GEMM parallelism requirements.
+
+- **`--stochastic <T>`** — Hutchinson's trace estimation with T random probes. ~7% median error at T=50. Best at 1000G scale (36.2s vs 41.1s exact). Incompatible with partitioned (`--annot`). T>50 causes cache thrashing regression.
+
+### Performance Summary (AWS EPYC 7R13 c6a.4xlarge, 16 vCPU, 1.66M SNPs)
+
+**1000G reference (N=2,490)** — Python baseline: 1548.5s
+
+| Mode | Time | vs Python |
+|------|------|-----------|
+| exact | 41.1s | 37.7× |
+| --stochastic 50 | 36.2s | 42.8× |
+| --sketch 50 | 15.3s | 101× |
+| --sketch 200 | 25.4s | 61× |
+
+**Biobank scale (N=50,000)** — Python baseline: ~1548s (extrapolated)
+
+| Mode | Time | vs exact-f64 |
+|------|------|-------------|
+| exact-f64 | 688.8s | 1.0× |
+| exact-f32 | 373.1s | 1.85× |
+| sketch-50-f64 | 167.3s | 4.1× |
+| **sketch-50-f32** | **129.5s** | **5.3×** |
+| sketch-100-f32 | 138.6s | 5.0× |
+| sketch-200-f32 | 159.3s | 4.3× |
+
+Key insight: sketch speedup at large N is bounded by memory bandwidth (must still read full B matrix per chunk). f32 halves this bandwidth floor.
 
 ## GPU
 
