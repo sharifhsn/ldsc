@@ -388,6 +388,7 @@ pub fn run(args: L2Args) -> Result<()> {
         args.stochastic,
         args.sketch,
         args.sketch_method.as_str(),
+        args.mmap,
     )
     .context("computing LD scores")?;
 

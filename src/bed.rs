@@ -585,3 +585,101 @@ impl BedVal for i8 {
         v as i8
     }
 }
+
+// ── Memory-mapped BED reader ─────────────────────────────────────────────────
+
+/// Read-only memory-mapped BED file. Provides zero-copy access to packed genotype
+/// bytes via the OS page cache. Advantages over `BufReader`:
+/// - No seek invalidation (BufReader discards its 8MB buffer on every seek)
+/// - OS-managed prefetching with `MADV_SEQUENTIAL` / `MADV_WILLNEED`
+/// - Zero-copy for fused CountSketch path (eliminates `raw_bytes().to_vec()`)
+/// - Replaces `--prefetch-bed` background thread (mmap + madvise achieves
+///   the same I/O overlap without rayon contention)
+///
+/// Designed for HPC environments with networked filesystems (GPFS/Lustre over
+/// InfiniBand) where mmap's page-fault-based I/O is preferable to explicit reads.
+pub struct MmapBed {
+    mmap: memmap2::Mmap,
+    #[allow(dead_code)]
+    iid_count: usize,
+    #[allow(dead_code)]
+    sid_count: usize,
+    bytes_per_snp: usize,
+}
+
+impl MmapBed {
+    /// Open and memory-map a BED file. Validates magic bytes and sets
+    /// `MADV_SEQUENTIAL` for the entire file.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let (fam_path, bim_path) = resolve_companion_paths(path.as_ref())?;
+        let iid_count = count_lines(&fam_path)
+            .with_context(|| format!("counting FAM lines '{}'", fam_path.display()))?;
+        let sid_count = count_lines(&bim_path)
+            .with_context(|| format!("counting BIM lines '{}'", bim_path.display()))?;
+
+        let file = File::open(path.as_ref())
+            .with_context(|| format!("opening BED file '{}'", path.as_ref().display()))?;
+
+        // SAFETY: the file is opened read-only and we never create a mutable mapping.
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+
+        // Validate header
+        anyhow::ensure!(mmap.len() >= 3, "BED file too small ({}B)", mmap.len());
+        anyhow::ensure!(
+            mmap[0] == BED_MAGIC_1 && mmap[1] == BED_MAGIC_2,
+            "BED file has invalid magic bytes"
+        );
+        anyhow::ensure!(
+            mmap[2] == BED_MODE_SNP_MAJOR,
+            "BED file is not SNP-major (mode=1 required)"
+        );
+
+        let bytes_per_snp = iid_count.div_ceil(4);
+
+        // Hint the OS to prefetch sequentially
+        #[cfg(unix)]
+        mmap.advise(memmap2::Advice::Sequential)?;
+
+        Ok(Self {
+            mmap,
+            iid_count,
+            sid_count,
+            bytes_per_snp,
+        })
+    }
+
+    /// Zero-copy access to raw packed bytes for `count` SNPs starting at `sid_start`.
+    /// Returns a slice directly into the memory-mapped region.
+    pub fn snp_bytes(&self, sid_start: usize, count: usize) -> &[u8] {
+        let offset = BED_HEADER_LEN as usize + sid_start * self.bytes_per_snp;
+        let len = count * self.bytes_per_snp;
+        &self.mmap[offset..offset + len]
+    }
+
+    /// Hint the OS to prefetch bytes for the given SNP range asynchronously.
+    /// On GPFS/InfiniBand this triggers stripe-aware readahead without blocking.
+    #[cfg(unix)]
+    pub fn advise_willneed(&self, sid_start: usize, count: usize) {
+        let offset = BED_HEADER_LEN as usize + sid_start * self.bytes_per_snp;
+        let len = count * self.bytes_per_snp;
+        // advise_range is best-effort; ignore errors
+        let _ = self
+            .mmap
+            .advise_range(memmap2::Advice::WillNeed, offset, len);
+    }
+
+    #[allow(dead_code)]
+    pub fn bytes_per_snp(&self) -> usize {
+        self.bytes_per_snp
+    }
+
+    #[allow(dead_code)]
+    pub fn iid_count(&self) -> usize {
+        self.iid_count
+    }
+
+    #[allow(dead_code)]
+    pub fn sid_count(&self) -> usize {
+        self.sid_count
+    }
+}

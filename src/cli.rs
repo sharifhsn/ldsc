@@ -235,6 +235,13 @@ pub struct L2Args {
     #[arg(long)]
     pub prefetch_bed: bool,
 
+    /// Memory-map the BED file instead of buffered reads. Provides zero-copy access
+    /// via the OS page cache. Benefits: no seek invalidation, OS-managed prefetching,
+    /// zero-copy for fused CountSketch. Recommended for HPC with networked filesystems
+    /// (GPFS/Lustre over InfiniBand). Redundant with --prefetch-bed (mmap replaces it).
+    #[arg(long)]
+    pub mmap: bool,
+
     /// File containing SNP IDs (one per line) to print LD scores for.
     /// Unlike --extract, all SNPs are still used in LD windows; only output is filtered.
     #[arg(long)]

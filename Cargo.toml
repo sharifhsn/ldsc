@@ -69,6 +69,9 @@ tokio = { version = "1.50.0", features = ["full"] }
 mimalloc = { version = "0.1", optional = true }
 fastrand = "2.3.0"
 
+# Memory-mapped I/O for BED files — zero-copy reads, better for GPFS/HPC.
+memmap2 = "0.9"
+
 [profile.release]
 opt-level     = 3
 lto           = "thin"

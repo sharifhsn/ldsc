@@ -1741,3 +1741,44 @@ already has fewer individuals and the bottleneck is BED I/O overhead at large M 
 ### Perf gate (bench_200k, no regressions)
 
 All modes within expected range. No change to non-subsample paths.
+
+## 2026-03-14: mmap BED reader (`--mmap` flag)
+
+**Change:** Add `MmapBed` struct wrapping `memmap2::Mmap` for zero-copy BED access.
+New `--mmap` CLI flag enables mmap I/O for the fused CountSketch path:
+- Zero-copy: `snp_bytes()` returns a slice directly from the mmap'd region,
+  eliminating the `raw_bytes().to_vec()` copy (2.5MB per chunk, ~20GB total)
+- `MADV_SEQUENTIAL` at open + `MADV_WILLNEED` for next chunk at each iteration
+- Designed for GPFS/Lustre over InfiniBand where page-fault-based I/O is
+  preferable to BufReader's seek invalidation
+
+**Parity:** Bit-exact on bench_200k (exact-f64 and CS-200, all chromosomes).
+
+**Dependency:** `memmap2 = "0.9"` added to Cargo.toml.
+
+### Performance: local SSD (warm cache)
+
+| Dataset | Mode | non-mmap | --mmap | Change |
+|---------|------|----------|--------|--------|
+| bench_200k | CS-200 | 596ms | 618ms | +3.7% (noise) |
+| bench_200k | exact-f64 | 3136ms | 3048ms | -2.8% (noise) |
+| biobank_50k | CS-200 | 63.9s | 73.6s | **+15.2%** (regression) |
+
+### Analysis
+
+On local SSD with warm page cache, mmap regresses ~15% at biobank scale (20GB BED file).
+This is expected: BufReader's sequential `read()` syscalls (~2500 total for 20GB) avoid the
+~5M minor page faults that mmap incurs. Each page fault requires a kernel trap + page table
+update + TLB fill.
+
+**On GPFS/HPC (the target):** The calculus reverses:
+- BufReader's `seek(SeekFrom::Start)` discards its 8MB buffer on every seek (64× read
+  amplification), and each refill requires a network round-trip to the storage servers
+- mmap with `MADV_SEQUENTIAL` triggers GPFS stripe-aware readahead in parallel across
+  storage nodes (no seek invalidation penalty)
+- `MADV_WILLNEED` prefetches the next chunk asynchronously over InfiniBand, replacing
+  the `--prefetch-bed` background thread (which regressed 12% due to rayon contention)
+- Zero-copy eliminates the 2.5MB-per-chunk copy, saving ~20GB of memcpy at biobank scale
+
+**Verdict:** Commit as opt-in `--mmap` flag. Default remains BufReader. Recommend `--mmap`
+for HPC deployments with networked filesystems. Document local SSD regression.

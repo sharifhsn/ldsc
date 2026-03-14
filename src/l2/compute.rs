@@ -1,6 +1,6 @@
 use super::normalize::{normalize_col_f32_with_stats, normalize_col_f64_with_stats, sum_sumsq_f32};
 use super::window::{WindowMode, get_block_lefts_by_chr};
-use crate::bed::{Bed, ChunkReader, IidPos, ReadOptions};
+use crate::bed::{Bed, ChunkReader, IidPos, MmapBed, ReadOptions};
 #[cfg(feature = "gpu")]
 use crate::gpu::GpuContext;
 use crate::la::{
@@ -1110,6 +1110,7 @@ pub(super) fn compute_ldscore_global(
     stochastic: Option<usize>,
     sketch: Option<usize>,
     sketch_method: &str,
+    use_mmap: bool,
 ) -> Result<(MatF, Vec<f64>)> {
     let m = all_snps.len();
     if m == 0 {
@@ -1508,7 +1509,16 @@ pub(super) fn compute_ldscore_global(
         reader_handle = None;
     }
 
+    // Memory-mapped BED: zero-copy access, replaces BufReader for fused path.
+    let mmap_bed = if use_mmap {
+        Some(MmapBed::open(bed_path).context("memory-mapping BED file")?)
+    } else {
+        None
+    };
+
     // Sequential path: open BED once with pre-computed ChunkReader; used only when prefetch_bed=false.
+    // When mmap is enabled, we still need ChunkReader for metadata (iid_positions, etc.)
+    // but I/O goes through MmapBed instead.
     let mut seq_bed = if !prefetch_bed {
         Some(Bed::builder(bed_path).build().context("opening BED file")?)
     } else {
@@ -1531,7 +1541,7 @@ pub(super) fn compute_ldscore_global(
         && all_snps
             .windows(2)
             .all(|w| w[1].bed_idx == w[0].bed_idx + 1);
-    if all_bed_sequential && !prefetch_bed {
+    if all_bed_sequential && !prefetch_bed && !use_mmap {
         let bed = seq_bed.as_mut().unwrap();
         let cr = chunk_reader.as_mut().unwrap();
         cr.start_sequential(bed, all_snps[0].bed_idx)
@@ -1560,8 +1570,13 @@ pub(super) fn compute_ldscore_global(
         // and skip b_full materialization. Otherwise use the existing decoded-Mat path.
         let sketching = sketch_dim.is_some();
         // Determine if this chunk qualifies for the fused path.
-        // Fused requires: (a) sequential mode OR contiguous chunk, (b) not prefetch.
-        let chunk_is_contiguous = if !prefetch_bed && !all_bed_sequential {
+        // Fused requires: (a) contiguous chunk, (b) not prefetch.
+        // With mmap: any contiguous chunk qualifies (no sequential mode needed).
+        let chunk_is_contiguous = if use_mmap {
+            // mmap can access any contiguous range without seek penalty
+            let start_bed_idx = all_snps[chunk_start].bed_idx;
+            all_snps[chunk_end - 1].bed_idx == start_bed_idx + c - 1
+        } else if !prefetch_bed && !all_bed_sequential {
             let start_bed_idx = all_snps[chunk_start].bed_idx;
             all_snps[chunk_end - 1].bed_idx == start_bed_idx + c - 1
         } else {
@@ -1571,27 +1586,49 @@ pub(super) fn compute_ldscore_global(
 
         if do_fused {
             // ── Fused path: read raw bytes, fuse decode+normalize+project ──────────
-            let cr = chunk_reader.as_mut().unwrap();
-            let bed = seq_bed.as_mut().unwrap();
-            if all_bed_sequential {
-                cr.read_next_raw_only(bed, c).with_context(|| {
-                    format!("reading BED chunk [{},{})", chunk_start, chunk_end)
-                })?;
+            // Extract metadata from ChunkReader (immutable borrow)
+            let cr_ref = chunk_reader.as_ref().unwrap();
+            let bps = cr_ref.bytes_per_snp_val();
+            let start_bed_idx = all_snps[chunk_start].bed_idx;
+
+            let raw: std::borrow::Cow<'_, [u8]> = if let Some(ref mb) = mmap_bed {
+                // Zero-copy: slice directly from memory-mapped file
+                let raw_slice = mb.snp_bytes(start_bed_idx, c);
+                // Prefetch next chunk asynchronously
+                #[cfg(unix)]
+                {
+                    let next_start = chunk_start + chunk_c;
+                    if next_start < m {
+                        let next_end = (next_start + chunk_c).min(m);
+                        let next_c = next_end - next_start;
+                        let next_bed_idx = all_snps[next_start].bed_idx;
+                        mb.advise_willneed(next_bed_idx, next_c);
+                    }
+                }
+                std::borrow::Cow::Borrowed(&raw_slice[..c * bps])
             } else {
-                let start_bed_idx = all_snps[chunk_start].bed_idx;
-                cr.read_contiguous_raw_only(bed, start_bed_idx, c)
-                    .with_context(|| {
+                // BufReader path: read into ChunkReader buffer, then copy
+                let cr = chunk_reader.as_mut().unwrap();
+                let bed = seq_bed.as_mut().unwrap();
+                if all_bed_sequential {
+                    cr.read_next_raw_only(bed, c).with_context(|| {
                         format!("reading BED chunk [{},{})", chunk_start, chunk_end)
                     })?;
-            }
+                } else {
+                    cr.read_contiguous_raw_only(bed, start_bed_idx, c)
+                        .with_context(|| {
+                            format!("reading BED chunk [{},{})", chunk_start, chunk_end)
+                        })?;
+                }
+                std::borrow::Cow::Owned(cr.raw_bytes()[..c * bps].to_vec())
+            };
             t_bed_read += t0.elapsed();
 
             let t0 = Instant::now();
-            let bps = cr.bytes_per_snp_val();
-            let raw = cr.raw_bytes()[..c * bps].to_vec(); // copy to avoid borrow conflict
-            let n_i = cr.n_iid();
-            let ipos = cr.iid_positions_ref().to_vec();
-            let ai = cr.all_iids_flag();
+            let cr_ref = chunk_reader.as_ref().unwrap();
+            let n_i = cr_ref.n_iid();
+            let ipos = cr_ref.iid_positions_ref().to_vec();
+            let ai = cr_ref.all_iids_flag();
             if let Some(ref cs) = count_sketch {
                 // Fused CountSketch: decode + normalize + scatter-add (no GEMM)
                 match bufs {
