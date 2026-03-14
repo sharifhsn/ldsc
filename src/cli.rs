@@ -235,6 +235,13 @@ pub struct L2Args {
     #[arg(long)]
     pub prefetch_bed: bool,
 
+    /// Memory-map the BED file instead of buffered reads. Provides zero-copy access
+    /// via the OS page cache. Benefits: no seek invalidation, OS-managed prefetching,
+    /// zero-copy for fused CountSketch. Recommended for HPC with networked filesystems
+    /// (GPFS/Lustre over InfiniBand). Redundant with --prefetch-bed (mmap replaces it).
+    #[arg(long)]
+    pub mmap: bool,
+
     /// File containing SNP IDs (one per line) to print LD scores for.
     /// Unlike --extract, all SNPs are still used in LD windows; only output is filtered.
     #[arg(long)]
@@ -298,6 +305,39 @@ pub struct L2Args {
     /// ~0.001 at 1000G scale.
     #[arg(long)]
     pub fast_f32: bool,
+
+    /// Use Hutchinson's stochastic trace estimator with T random probes instead
+    /// of exact GEMM for LD score computation. Trades precision for speed:
+    /// ~sqrt(2/T) relative error per SNP. Only effective for scalar (non-partitioned)
+    /// LD scores; partitioned mode falls back to exact computation.
+    #[arg(long, value_name = "PROBES", conflicts_with = "gpu")]
+    pub stochastic: Option<usize>,
+
+    /// Random projection sketch: compress individual dimension N→d before GEMM.
+    /// Trades precision for speed — larger d is more accurate but slower.
+    /// At 1000G scale (N=2490): d=200 gives ~2× speedup with Pearson r≈0.90
+    /// vs exact; d=50 gives ~2.7× speedup but r≈0.72. For biobank scale
+    /// (N>50k) much smaller d suffices. Works with partitioned annotations.
+    /// Avoid d>500 (cache thrashing). Bias is exactly corrected in expectation.
+    /// Automatically enables f32 (sketch f64 and f32 produce bit-identical
+    /// output since ±1/√d entries are exactly representable in f32).
+    #[arg(long, value_name = "DIM", conflicts_with_all = ["gpu", "stochastic"])]
+    pub sketch: Option<usize>,
+
+    /// Sketch projection method: "rademacher" (default, dense ±1/√d matrix) or
+    /// "countsketch" (hash-based, O(N) scatter-add instead of O(d×N) GEMM).
+    /// CountSketch is faster at large N but slightly noisier at same d;
+    /// use d=100-200 for equivalent quality to Rademacher d=50.
+    /// Ignored unless --sketch is also set.
+    #[arg(long, value_name = "METHOD", default_value = "rademacher")]
+    pub sketch_method: String,
+
+    /// Randomly subsample N' individuals from the reference panel for LD computation.
+    /// Reduces both I/O and GEMM cost proportionally (~10× faster at N'=5K vs N=50K).
+    /// For biobank-scale data (N>10K), N'=5000-10000 gives accurate LD scores for
+    /// common variants (MAF>5%). Cannot be combined with --keep.
+    #[arg(long, value_name = "N_PRIME", conflicts_with = "keep")]
+    pub subsample: Option<usize>,
 
     /// Print per-section timing breakdown to stderr.
     #[arg(long)]

@@ -360,9 +360,9 @@ fn resolve_indices(raw: Option<&[isize]>, max: usize) -> Result<Vec<usize>> {
 }
 
 #[derive(Clone, Copy)]
-struct IidPos {
-    byte_idx: usize,
-    shift: u8,
+pub(crate) struct IidPos {
+    pub byte_idx: usize,
+    pub shift: u8,
 }
 
 fn precompute_iid_positions(iid_indices: &[usize]) -> Vec<IidPos> {
@@ -392,7 +392,11 @@ fn decode_column<T: BedVal>(
     all_iids: bool,
 ) {
     // Get column as contiguous slice (1 bounds check instead of 2 per element)
-    let out_col = out.col_mut(col).try_as_col_major_mut().unwrap().as_slice_mut();
+    let out_col = out
+        .col_mut(col)
+        .try_as_col_major_mut()
+        .unwrap()
+        .as_slice_mut();
 
     if all_iids {
         // Fast path: all individuals, sequential layout — process 4 per byte.
@@ -447,8 +451,7 @@ impl<T: BedVal> ChunkReader<T> {
     ) -> Result<Self> {
         let iid_idx = resolve_indices(iid_indices, bed.iid_count)?;
         let n_iid = iid_idx.len();
-        let all_iids =
-            n_iid == bed.iid_count && iid_idx.iter().enumerate().all(|(i, &v)| v == i);
+        let all_iids = n_iid == bed.iid_count && iid_idx.iter().enumerate().all(|(i, &v)| v == i);
         let iid_positions = precompute_iid_positions(&iid_idx);
         let lut = build_lut(count_a1, missing_value);
         let bytes_per_snp = bed.bytes_per_snp;
@@ -482,6 +485,53 @@ impl<T: BedVal> ChunkReader<T> {
         bed.read_next_block(count, &mut self.block_buf[..total_bytes])?;
         self.decode_block(count);
         Ok(&self.out)
+    }
+
+    /// Read the next `count` SNPs into the raw byte buffer without decoding.
+    /// Use `raw_bytes()` to access the packed BED bytes afterwards.
+    pub fn read_next_raw_only(&mut self, bed: &mut Bed, count: usize) -> Result<()> {
+        let total_bytes = count * self.bytes_per_snp;
+        bed.read_next_block(count, &mut self.block_buf[..total_bytes])?;
+        Ok(())
+    }
+
+    /// Read a contiguous block of `count` SNPs starting at `start_sid` into the raw byte
+    /// buffer without decoding. Use `raw_bytes()` to access the packed BED bytes afterwards.
+    pub fn read_contiguous_raw_only(
+        &mut self,
+        bed: &mut Bed,
+        start_sid: usize,
+        count: usize,
+    ) -> Result<()> {
+        let total_bytes = count * self.bytes_per_snp;
+        bed.read_snp_block(start_sid, count, &mut self.block_buf[..total_bytes])?;
+        Ok(())
+    }
+
+    /// Raw packed BED bytes from the last `read_next_raw_only` / `read_contiguous_raw_only` call.
+    /// Contains `count * bytes_per_snp` bytes in SNP-major order.
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.block_buf
+    }
+
+    /// Number of bytes per SNP in the packed BED format: `(n_iid_full + 3) / 4`.
+    pub fn bytes_per_snp_val(&self) -> usize {
+        self.bytes_per_snp
+    }
+
+    /// Number of selected individuals (after iid_index filtering).
+    pub fn n_iid(&self) -> usize {
+        self.out.nrows()
+    }
+
+    /// Precomputed byte/shift positions for selected individuals.
+    pub fn iid_positions_ref(&self) -> &[IidPos] {
+        &self.iid_positions
+    }
+
+    /// True when all individuals are used in order — enables fast 4-per-byte decode path.
+    pub fn all_iids_flag(&self) -> bool {
+        self.all_iids
     }
 
     /// Read a contiguous block of `count` SNPs starting at `start_sid` (with seek).
@@ -533,5 +583,90 @@ impl BedVal for f64 {
 impl BedVal for i8 {
     fn from_u8(v: u8) -> Self {
         v as i8
+    }
+}
+
+// ── Memory-mapped BED reader ─────────────────────────────────────────────────
+
+/// Read-only memory-mapped BED file. Provides zero-copy access to packed genotype
+/// bytes via the OS page cache. Advantages over `BufReader`:
+/// - No seek invalidation (BufReader discards its 8MB buffer on every seek)
+/// - OS-managed prefetching with `MADV_SEQUENTIAL` / `MADV_WILLNEED`
+/// - Zero-copy for fused CountSketch path (eliminates `raw_bytes().to_vec()`)
+/// - Replaces `--prefetch-bed` background thread (mmap + madvise achieves
+///   the same I/O overlap without rayon contention)
+///
+/// Designed for HPC environments with networked filesystems (GPFS/Lustre over
+/// InfiniBand) where mmap's page-fault-based I/O is preferable to explicit reads.
+pub struct MmapBed {
+    mmap: memmap2::Mmap,
+    #[allow(dead_code)]
+    iid_count: usize,
+    #[allow(dead_code)]
+    sid_count: usize,
+    bytes_per_snp: usize,
+}
+
+impl MmapBed {
+    /// Open and memory-map a BED file. Validates magic bytes and sets
+    /// `MADV_SEQUENTIAL` for the entire file.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let (fam_path, bim_path) = resolve_companion_paths(path.as_ref())?;
+        let iid_count = count_lines(&fam_path)
+            .with_context(|| format!("counting FAM lines '{}'", fam_path.display()))?;
+        let sid_count = count_lines(&bim_path)
+            .with_context(|| format!("counting BIM lines '{}'", bim_path.display()))?;
+
+        let file = File::open(path.as_ref())
+            .with_context(|| format!("opening BED file '{}'", path.as_ref().display()))?;
+
+        // SAFETY: the file is opened read-only and we never create a mutable mapping.
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+
+        // Validate header
+        anyhow::ensure!(mmap.len() >= 3, "BED file too small ({}B)", mmap.len());
+        anyhow::ensure!(
+            mmap[0] == BED_MAGIC_1 && mmap[1] == BED_MAGIC_2,
+            "BED file has invalid magic bytes"
+        );
+        anyhow::ensure!(
+            mmap[2] == BED_MODE_SNP_MAJOR,
+            "BED file is not SNP-major (mode=1 required)"
+        );
+
+        let bytes_per_snp = iid_count.div_ceil(4);
+
+        // Hint the OS to prefetch sequentially
+        #[cfg(unix)]
+        mmap.advise(memmap2::Advice::Sequential)?;
+
+        Ok(Self {
+            mmap,
+            iid_count,
+            sid_count,
+            bytes_per_snp,
+        })
+    }
+
+    /// Zero-copy access to raw packed bytes for `count` SNPs starting at `sid_start`.
+    /// Returns a slice directly into the memory-mapped region.
+    pub fn snp_bytes(&self, sid_start: usize, count: usize) -> &[u8] {
+        let offset = BED_HEADER_LEN as usize + sid_start * self.bytes_per_snp;
+        let len = count * self.bytes_per_snp;
+        &self.mmap[offset..offset + len]
+    }
+
+    /// Hint the OS to prefetch bytes for the given SNP range asynchronously.
+    /// On GPFS/InfiniBand this triggers stripe-aware readahead without blocking.
+    #[cfg(unix)]
+    pub fn advise_willneed(&self, sid_start: usize, count: usize) {
+        let offset = BED_HEADER_LEN as usize + sid_start * self.bytes_per_snp;
+        let len = count * self.bytes_per_snp;
+        if let Err(e) = self
+            .mmap
+            .advise_range(memmap2::Advice::WillNeed, offset, len)
+        {
+            tracing::warn!("madvise WILLNEED failed (offset={offset}, len={len}): {e}");
+        }
     }
 }

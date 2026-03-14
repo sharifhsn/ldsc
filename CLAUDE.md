@@ -4,7 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Rust rewrite of [Bulik-Sullivan et al.'s LDSC](https://github.com/bulik/ldsc) (LD Score Regression), a tool for estimating heritability and genetic correlation from GWAS summary statistics. Six subcommands: `munge-sumstats`, `l2`, `h2`, `rg`, `make-annot`, `cts-annot`. The goal is numerical parity with the Python implementation at 18× speedup (23× with `--fast-f32`).
+Rust rewrite of [Bulik-Sullivan et al.'s LDSC](https://github.com/bulik/ldsc) (LD Score Regression), a tool for estimating heritability and genetic correlation from GWAS summary statistics. Six subcommands: `munge-sumstats`, `l2`, `h2`, `rg`, `make-annot`, `cts-annot`. Numerically exact parity with Python (`max_abs_diff=0` in f64 mode). Current performance vs Python on AWS EPYC 7R13:
+
+- **1000G (N=2,490)**: 37.7× exact, 101× with `--sketch 50`
+- **Biobank (N=50K)**: 20× with `--sketch 50 --sketch-method countsketch` (best), 1.84× exact-f32
 
 ## Build & Test Commands
 
@@ -45,7 +48,13 @@ All source lives in `src/`. The binary is a clap-derive CLI dispatcher (`main.rs
 - **`cli.rs`** — Pure clap derive structs (`MungeArgs`, `L2Args`, `H2Args`, `RgArgs`, `MakeAnnotArgs`, `CtsAnnotArgs`). No logic.
 - **`main.rs`** — CLI dispatch + global thread pool setup. Injects implicit subcommand for backward-compatible `--h2`/`--l2` flag usage.
 - **`munge.rs`** — Polars LazyFrame pipeline for GWAS summary statistics preprocessing. Streams input without loading entire file into RAM.
-- **`l2.rs`** (~1800 lines, largest module) — LD score computation with ring-buffer genotype store and chunked GEMM. Sequential global pass across all chromosomes matching Python's cross-chromosome boundary behavior.
+- **`l2/`** — LD score computation, split into submodules:
+  - **`mod.rs`** (~570 lines) — `run()` orchestrator: arg validation, BIM/FAM loading, `--extract`/`--annot`/`--keep` wiring, output writing.
+  - **`compute.rs`** (~1830 lines) — `compute_ldscore_global`: ring-buffer GEMM loop (sequential global pass, scalar + partitioned + sketch + stochastic paths). Also `GemmBufs`, Rademacher helpers, GPU compat helpers.
+  - **`window.rs`** — `WindowMode` enum + `get_block_lefts_*`: per-chromosome window boundary computation.
+  - **`normalize.rs`** — `normalize_col_f{32,64}_with_stats`: impute NaN→mean, centre, unit-variance. AVX2+FMA `sum_sumsq_f32`.
+  - **`snp_stats.rs`** — `compute_snp_stats`: fast BED scan for MAF + het/missing prefilter.
+  - **`io.rs`** — FAM parsers (`count_fam`, `parse_fam`), SNP-set loaders, gzip TSV writers.
 - **`regressions.rs`** (~2500 lines) — h2/rg regression drivers. Scalar and partitioned paths, two-step estimator, liability-scale conversion.
 - **`h2.rs`** — IRWLS regression + block jackknife logic used by regressions.rs.
 - **`irwls.rs`** / **`jackknife.rs`** — Iteratively Reweighted Least Squares and parallel block jackknife (rayon `par_iter` over 200 leave-one-out blocks).
@@ -105,7 +114,10 @@ Parity/benchmark scripts in `scripts/`:
 - `verify_parity_munge.sh` — Munge output comparison
 - `bench_l2.sh` — Quick l2 benchmark (5k SNPs default)
 - `check_l2_tiny_py_vs_rust.sh` — Uses `--extract` on full 1.66M BED
-- `aws-bench.sh` — Build, push to ECR, run on AWS Batch (c7a.4xlarge EPYC). **Use this for verified perf numbers; local timings are noisy.**
+- `verify_parity_all.sh` — Comprehensive 8-mode parity sweep (exact/sketch × f64/f32 vs Python, chr22 data)
+- `aws-bench.sh` — Build, push to ECR, run on AWS Batch (c6a.4xlarge EPYC). **Use this for verified perf numbers; local timings are noisy.**
+- `biobank-bench.sh` — AWS Batch biobank 50K benchmark (all 8 mode×precision variants)
+- `make_synthetic_biobank.py` — Generate synthetic N=50K BED from 1000G (~21× replication of N=2,490, 1% noise)
 
 ## Important Behavioral Notes
 
@@ -115,11 +127,14 @@ Parity/benchmark scripts in `scripts/`:
 - L2 uses a global sequential pass across all chromosomes (not per-chromosome parallel), matching Python's cross-chromosome window bleeding behavior.
 - All CM columns in the 1000G reference data are 0 — never use `--ld-wind-cm` for benchmarking with this data.
 - `make-annot` BED intervals are 0-based half-open; SNP BP=b matches [start,end) iff start < b <= end.
+- `--sketch` projection matrix P uses deterministic seed 42 (`fastrand::Rng::with_seed(42)`). Same `--sketch d` on same data always produces identical output.
 
 ## Data Files
 
 - Full genome: `data/1000G_phase3_common_norel.{bed,bim,fam}` (1,664,852 SNPs, 2,490 individuals)
+- Biobank synthetic: `data/biobank_50k.{bed,bim,fam}` (1,664,852 SNPs, 50,000 individuals, ~20GB BED)
 - Benchmark subsets: `data/bench_5k.*`, `data/bench_200k.*`, plus chr22 variants
+- S3 mirror: `s3://ldsc-bench-data-270497617191/` (all datasets including biobank_50k)
 
 ## Important Docs, Read When Needed
 - `generated_docs/`: All dependencies have documentation locally saved here, prefer checking those over web searching for documentation. This has a lot of text so be careful when reading to not hammer your context window.
@@ -128,6 +143,48 @@ Parity/benchmark scripts in `scripts/`:
 - `docs/hpc.md`: Example of an HPC that `ldsc` is intended to run on, in this case UPenn.
 - `ldsc.wiki/`: The wiki for the Bulik's LDSC implementation, has example workflows.
 - `ldsc_py/`: Bulik's LDSC implementation.
+
+## Approximate / Fast Modes
+
+Three opt-in modes trade precision for speed in the `l2` subcommand:
+
+- **`--fast-f32`** — Use f32 for genotype storage and GEMM. ~1.85× speedup (bandwidth-bound). Numerically close to f64; safe for downstream h2/rg. Combinable with all other modes.
+
+- **`--sketch <d>`** — Randomized dimensionality reduction (N→d dimensions) before GEMM. Two methods:
+  - **Rademacher** (default): Dense ±1/√d projection matrix, O(d×N×c) GEMM. Bias-corrected via ratio estimator.
+  - **CountSketch** (`--sketch-method countsketch`): Fused BED-decode-normalize-scatter-add kernel, O(N×c) regardless of d. **3.6× faster than Rademacher** at biobank scale. Cost is flat in d until d≈√N, so d=200 has same speed as d=50 but much better accuracy.
+  - Accuracy depends on d: d=50 r≈0.81, d=100 r≈0.85, d=200 r≈0.93, d=500 r≈0.97
+  - **Automatically enables f32** — sketch entries (±1/√d or ±1) are exactly representable in f32, producing bit-identical output. `--fast-f32` is redundant with `--sketch`.
+  - Deterministic (seed=42). Same `--sketch d` on same data always produces identical output.
+
+- **`--stochastic <T>`** — Hutchinson's trace estimation with T random probes. ~7% median error at T=50. Best at 1000G scale (36.2s vs 41.1s exact). Incompatible with partitioned (`--annot`). T>50 causes cache thrashing regression.
+
+### Performance Summary (AWS EPYC 7R13 c6a.4xlarge, 16 vCPU, 1.66M SNPs)
+
+**1000G reference (N=2,490)** — Python baseline: 1548.5s
+
+| Mode | Time | vs Python |
+|------|------|-----------|
+| exact | 41.1s | 37.7× |
+| --stochastic 50 | 36.2s | 42.8× |
+| --sketch 50 | 15.3s | 101× |
+| --sketch 200 | 25.4s | 61× |
+
+**Biobank scale (N=50,000)** — Python baseline: ~1548s (extrapolated)
+
+| Mode | Time | vs exact-f64 |
+|------|------|-------------|
+| exact-f64 | 665.9s | 1.0× |
+| exact-f32 | 361.9s | 1.84× |
+| sketch-50 (Rademacher) | 118.4s | 5.6× |
+| sketch-200 (Rademacher) | 151.8s | 4.4× |
+| **countsketch-50** | **33.1s** | **20.1×** |
+| **countsketch-200** | **33.8s** | **19.7×** |
+| countsketch-500 | 36.2s | 18.4× |
+| countsketch-1000 | 39.7s | 16.8× |
+| subsample-5k+sketch50 | 24.9s | 26.7× |
+
+Key insight: Fused CountSketch eliminates the N×c intermediate buffer entirely — it reads packed BED bytes and scatter-adds directly into the d×c sketch buffer. Cost is O(N×c) independent of d, so d=200 is "free" accuracy vs d=50. Rademacher sketch is bounded by N×c→d×c GEMM.
 
 ## GPU
 
@@ -138,10 +195,33 @@ Documentation at `docs/gpu-feasibility.md`.
 - **Verification**: Start with verifying that the optimization makes sense logically.
 - **Implementation**: Then implement it in code.
 - **Adversarial Pass**: Then run an adversarial pass over your code to ensure there are no bugs. If you see any, fix them and run the adversarial pass until there are none.
-- **Local Parity/Perf**: Test with a smaller dataset parity with Python, and check for any obvious perf wins.
-- **HPC Perf Test**: Run a proper perf benchmark with hyperfine on the AWS HPC.
+- **Local Perf Gate**: Run `bash scripts/local-perf-gate.sh --full` and compare against known baselines below. **Do NOT submit AWS jobs until local numbers look sane.** For N-dependent changes (anything touching GEMM parallelism, tiling, or buffer allocation), also test with `--biobank` if data is available.
+- **HPC Perf Test**: Run a proper perf benchmark with hyperfine on the AWS HPC. Always confirm with the user before launching — each biobank run costs ~$1-2 and takes 2+ hours.
 - **Document**: Document all findings in `docs/perf-log.md`.
-- **Commit**: Commit all changes with an informative commit message in Conventional Commits syntax.ß
+- **Commit**: Commit all changes with an informative commit message in Conventional Commits syntax.
+
+### Local Perf Baselines (bench_200k, N=2490, `--ld-wind-kb 1000`)
+
+Reference timings (Ryzen 5 5600X, 2026-03-14):
+
+| Mode | Time | vs exact-f64 |
+|------|------|-------------|
+| exact-f64 | 13.6s | 1.0× |
+| exact-f32 | 12.0s | 1.13× |
+| sketch-50 (auto-f32) | 3.1s | 4.4× |
+| sketch-100 | 2.7s | 5.1× |
+| sketch-200 | 3.3s | 4.2× |
+| countsketch-50 | 1.7s | 8.0× |
+| countsketch-100 | 3.6s | 3.8× |
+| stochastic-50 | 68s | slow at small N (known) |
+
+**Red flags**: any mode >30% slower than these baselines, or sketch slower than exact.
+
+### Perf Regression Lessons Learned
+
+- **Never bypass the non-fused GEMM path for Rademacher sketch.** faer's single large `Par::rayon(0)` GEMM on P(d×N)×B(N×c) is dramatically faster than distributing many small `Par::Seq` tile GEMMs across rayon. The fused BED-decode-normalize-project kernel (512-individual tiles) caused a 2.2× regression at biobank scale (285s vs 130s). **Exception: fused CountSketch is validated** — its scatter-add kernel is O(N×c) not O(d×N×c), so it bypasses GEMM entirely and is 3.6× faster than Rademacher at biobank scale.
+- **Parallelism is N-dependent.** A change that's neutral at N=2,490 can be catastrophic at N=50,000. Always think about how parallelism scales with N before submitting HPC jobs.
+- **Diff the hot path against the last validated binary before any AWS run.** The sketch projection path in `compute.rs` (search for "Sketch projection: b_mat") must use `Par::rayon(0)` for the dense Rademacher GEMM.
 
 
 ## Release Process

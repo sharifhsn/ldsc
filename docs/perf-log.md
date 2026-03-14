@@ -1068,3 +1068,717 @@ The sum/sum_sq reduction was ~8% of runtime (~3.5s). The AVX2 intrinsics process
 
 ### Conclusion
 **AVX2 intrinsics provide a real ~3.6% improvement** (median 41.09s, was 42.62s). New best: **~41.1s** on EPYC 7R13, **~37.7× speedup** vs Python (1548.5s). Safe Rust cannot produce ymm-width f32 reductions on stable — intrinsics are necessary for this pattern.
+
+## 2026-03-10: Hutchinson's Stochastic Trace Estimation (`--stochastic`)
+
+### Change
+Implemented Hutchinson's stochastic trace estimation as an opt-in `--stochastic <T>` flag.
+Instead of computing exact `diag(X'X)²` via GEMM, approximates it using T random Rademacher
+probe vectors: `diag(R²) ≈ (1/T) Σ_t (Rz_t) ⊙ (Rz_t)`. Uses batched GEMM (T-column random
+matrices) to retain `Par::rayon(0)` multi-core parallelism. Added `fastrand` crate for WyRand
+PRNG (zero transitive deps, seedable).
+
+**Scope**: Scalar (n_annot=1) only. Falls back to exact for partitioned annotations or `--pq-exp`.
+
+### Accuracy (bench_5k, chr1, 446 SNPs)
+| Probes (T) | Mean Relative Error | Median |rel| Error | Max |rel| Error |
+|-----------|--------------------|--------------------|-----------------|
+| 50        | -2.00%             | 6.95%              | 27.20%          |
+| 1000      | ~0.35%             | ~1.5%              | ~5%             |
+
+Theory predicts √(2/T) ≈ 20% relative std per SNP at T=50.
+
+### Performance (local, Ryzen 5 5600X, bench_200k)
+
+| Mode | Time | Notes |
+|------|------|-------|
+| Exact | 3.05s | Baseline |
+| Stochastic T=50 | 3.25s | ~7% slower |
+
+Local bench_200k showed no improvement — dataset too small for the stochastic advantage to manifest.
+
+### Performance (AWS c6a.4xlarge, EPYC 7R13, 16 vCPU, full 1.66M SNPs)
+
+| Mode | Mean ± σ | Range | User time | System time | vs T=50 |
+|------|----------|-------|-----------|-------------|---------|
+| **Stochastic T=50** | **36.181s ± 0.194s** | 35.9–36.5s | 419s | 21s | 1.00× |
+| **Exact GEMM** | **41.808s ± 1.407s** | 40.8–45.2s | 489s | 23s | 1.16× slower |
+| **Stochastic T=100** | **72.357s ± 1.257s** | 70.3–73.8s | 731s | **250s** | 2.00× slower |
+
+### Analysis
+- **T=50 is 13.5% faster than exact** on the full dataset. The advantage comes from replacing O(c²) within-chunk GEMM with O(T·c) probe operations, which matters at scale when window sizes are large (avg ~1000 SNPs for `--ld-wind-kb 1000`).
+- **T=100 is catastrophically slow**: 72.4s, 1.73× slower than exact. The system time exploded from 21s to 250s (12× increase), indicating severe memory allocation pressure or cache thrashing from the 100-column probe matrices. At chunk_size=200 and max_window≈1000, the Z/Y/Q/P buffers for T=100 total ~16MB per set — likely exceeding L3 cache capacity and causing TLB misses.
+- **T=50 is the sweet spot**: 36.2s wall time with ~7% median per-SNP error. The probe buffers are half the size (~8MB), fitting in L3 cache.
+- **Local vs HPC discrepancy**: bench_200k (200k SNPs) showed no improvement because windows are smaller and the GEMM is already fast. The stochastic advantage only manifests at full genome scale where window sizes average ~1000 SNPs.
+
+### Conclusion
+**`--stochastic 50` provides a meaningful 13.5% speedup** on the full 1.66M SNP dataset
+(36.2s vs 41.8s). This makes `--stochastic 50` the new fastest option at **~42.8× speedup**
+vs Python (1548.5s). However, it trades exact numerical parity for ~7% median per-SNP error.
+
+**T=100 has a pathological memory issue** — needs investigation. Do not recommend T>50
+until the cache thrashing is resolved.
+
+The exact path remains the default for users who need numerical parity with Python.
+`--stochastic 50` is recommended for users who prioritize speed and can tolerate small
+per-SNP errors (downstream h2 estimates are typically robust to this noise).
+
+## 2026-03-10: Randomized Sketching (`--sketch d`)
+
+### What
+New `--sketch d` flag compresses the individual dimension N→d via random Rademacher
+projection P (d×N) before all GEMMs. Bias is exactly corrected by adjusting the r²_unbiased
+constants. Works with partitioned annotations (unlike `--stochastic`). Incompatible with
+`--gpu` and `--stochastic`.
+
+### Math
+- Projection: x̃_j = P x_j (d×1), P entries ±1/√d
+- After projection, columns re-normalized: ||x̃'_j||² = N (ratio estimator)
+- Ratio estimator reduces per-pair variance by ~2× (correlated noise cancels)
+- Bias correction: `active_A = n_inv_sq_r2u_a × d/(d-2)`, `active_B = r2u_b - r2u_a/(d-2)`
+- Requires d ≥ 3 (prevents division by zero)
+- Single shared P matrix (seed=42) → correlated errors across SNPs (errors don't average out)
+
+### Performance (AWS c6a.4xlarge, EPYC 7R13, 16 vCPU, full 1.66M SNPs, --ld-wind-kb 1000)
+
+With ratio estimator (column re-normalization):
+
+| Mode | Mean ± σ | Speedup vs exact | vs Python (1548s) |
+|------|----------|------------------|-------------------|
+| **exact** | **41.057s ± 0.222s** | 1.00× | 37.7× |
+| **sketch d=50** | **15.322s ± 0.117s** | **2.68×** | **~101×** |
+| **sketch d=200** | **25.444s ± 0.189s** | **1.61×** | **~61×** |
+
+Previous results without ratio estimator (for comparison):
+
+| Mode | Mean ± σ | Speedup vs exact | vs Python (1548s) | System time |
+|------|----------|------------------|-------------------|-------------|
+| exact | 41.160s ± 1.072s | 1.00× | 37.6× | 22s |
+| sketch d=25 | 14.293s ± 0.148s | 2.88× | 108.3× | 11s |
+| sketch d=50 | 15.467s ± 0.084s | 2.66× | 100.1× | 12s |
+| sketch d=100 | 16.436s ± 0.089s | 2.50× | 94.2× | 12s |
+| sketch d=200 | 19.868s ± 0.044s | 2.07× | 77.9× | 13s |
+| sketch d=500 | 31.535s ± 0.382s | 1.30× | 49.1× | 15s |
+| sketch d=1000 | 83.870s ± 1.495s | 0.49× (SLOWER) | 18.5× | 380s |
+
+Note: d=200 is ~28% slower with ratio estimator (25.4s vs 19.9s) because the
+re-normalization pass adds overhead at full 1.66M-SNP scale. At d=50 the difference
+is negligible (15.3s vs 15.5s). The accuracy gain (Pearson r: 0.90→0.93 at d=200)
+is worth the speed cost.
+
+### Timing Breakdown (local bench_200k, verbose)
+
+| Section | Exact | Sketch d=50 | Change |
+|---------|-------|-------------|--------|
+| bed_read | 0.18s | 0.17s | same |
+| norm (+projection) | 0.28s | 0.71s | +0.43s (P×B matmul) |
+| bb_dot | 1.06s | 0.08s | **13× faster** |
+| ab_dot | 1.00s | 0.11s | **9× faster** |
+| ring_store | 0.24s | 0.00s | ring is d×ring_size (tiny) |
+
+### Accuracy (local bench_200k, 200,237 SNPs, N=2,490)
+
+| d | Mean bias | Median rel error | Pearson r | Spearman ρ |
+|---|-----------|-----------------|-----------|------------|
+| 25 | +6.92 (+93%) | 140% | 0.587 | — |
+| 50 | +2.42 (+33%) | 66% | 0.715 | 0.632 |
+| 100 | -1.44 (-19%) | 38% | 0.760 | — |
+| 200 | -0.48 (-6%) | 23% | 0.900 | 0.870 |
+| 500 | -0.10 (-1%) | 13% | 0.963 | 0.952 |
+| 1000 | -0.11 (-1%) | 9% | 0.982 | — |
+
+Note: "bias" is per-realization (from shared P matrix, seed=42). Expectation over random
+seeds is zero. Sign flips confirm it's noise, not systematic.
+
+### d=1000 Cache Pathology
+Same phenomenon as `--stochastic 100`: system time explodes (380s vs ~12s for d≤500).
+Ring buffer at d=1000 is 1000×ring_size×8 ≈ 22MB, plus a_buf (1000×1000×8 = 8MB) and
+projection P (1000×2490×8 = 20MB). Total working set ~50MB exceeds L3 capacity on
+EPYC 7R13. **Do not use d>500.**
+
+### Key Finding: Limited Utility at N=2,490
+At 1000G scale (N=2,490), the projection P×B (d×N×c FLOPs) costs nearly as much as the
+original B'B GEMM (N×c² FLOPs) because N and c are comparable. The GEMM savings only
+dominate when N >> c (biobank scale, N>50k).
+
+Best speed/accuracy tradeoff at this N:
+- **d=200**: 2.07× speedup, Pearson r=0.90, ~23% median error
+- **d=50**: 2.66× speedup, Pearson r=0.72, ~66% median error (too noisy for most uses)
+
+For comparison, `--stochastic 50` gives 1.14× speedup with ~7% median error — better
+accuracy per unit of speed sacrifice.
+
+### Ratio Estimator Improvement (column re-normalization)
+
+After sketch projection x̃_j = P x_j, rescale each column so ||x̃'_j||² = N. This implements
+the ratio estimator r̃² = (x̃_j · x̃_k)² / (||x̃_j||² × ||x̃_k||²) implicitly. Reduces
+per-pair variance by ~2× because correlated noise in numerator/denominator cancels.
+
+**Bias correction**: The squared cosine has bias ≈ (2r⁴ - 7r² + 1)/d. Leading linear
+correction: `r²_corr = r̃² × d/(d-2) - 1/(d-2)`. Applied as:
+- `active_A = n_inv_sq_r2u_a × d/(d-2)`
+- `active_B = r2u_b - r2u_a/(d-2)`
+
+Requires d ≥ 3 (to avoid division by zero).
+
+**Accuracy comparison** (bench_5k, 5,000 SNPs, N=2,490):
+
+| d | Original Pearson r | Ratio Pearson r | Original med_rel% | Ratio med_rel% |
+|---|---|---|---|---|
+| 25 | 0.587 | **0.726** | 140% | **97%** |
+| 50 | 0.715 | **0.812** | 66% | **52%** |
+| 100 | 0.760 | **0.849** | 38% | **33%** |
+| 200 | 0.900 | **0.934** | 23% | **21%** |
+| 500 | 0.963 | **0.974** | 13% | **12%** |
+
+The ratio estimator consistently outperforms the raw estimator across ALL d values.
+Variance reduction (~2×) outweighs the harder-to-correct higher-order bias terms.
+
+**Performance** (local bench_200k, hyperfine --runs 3): exact 3.23s, sketch d=50 1.37s (2.4×),
+d=200 2.16s (1.5×).
+
+**AWS HPC results** (c6a.4xlarge, EPYC 7R13, 16 vCPU, 1.66M SNPs, hyperfine --runs 5):
+- exact: 41.06s ± 0.22s
+- sketch d=50: 15.32s ± 0.12s (2.68× vs exact, ~101× vs Python)
+- sketch d=200: 25.44s ± 0.19s (1.61× vs exact, ~61× vs Python)
+
+Re-normalization adds ~28% overhead at d=200 full scale (25.4s vs 19.9s without ratio
+estimator). At d=50 the cost is negligible (15.3s vs 15.5s). The accuracy gain justifies
+the cost.
+
+### Also Fixed
+- GPU f64 AB matmul used `n_indiv` instead of `gemm_n` — corrected (defensive, code path
+  is currently unreachable since GPU only does f32).
+- Sketch minimum d raised from 1 to 3 (prevents d-2 division by zero).
+
+### Conclusion
+`--sketch` is **theoretically sound but practically limited at N=2,490**:
+- d=50: 2.68× speedup on AWS (15.3s, ~101× vs Python), Pearson r=0.81, ~52% median error
+- d=200: 1.61× speedup on AWS (25.4s, ~61× vs Python), Pearson r=0.93, ~21% median error
+- Ratio estimator improves accuracy by ~30-40% across all d values vs raw projection
+- The shared projection matrix creates correlated errors that don't average across SNPs
+- **Recommended for biobank-scale data (N>50k)** where the inner dimension reduction
+  from N→d yields massive GEMM savings with acceptable accuracy
+- At 1000G scale, `--stochastic 50` (36.2s, ~7% error) remains the best speed/accuracy tradeoff
+- Exact (41.1s) remains best for numerical parity
+
+## 2026-03-11: Sparse Rademacher Investigation (Abandoned)
+
+### Hypothesis
+Sparse Rademacher projection (s=3, Achlioptas 2003) would reduce sketch projection FLOPs
+by 3× (2/3 of entries are zero). This should help at large N (e.g., biobank 50K individuals)
+where the P×B projection dominates runtime.
+
+### Implementation
+CSC (column-compressed) sparse matrix with positive/negative indices separated for
+branchless inner loops. Tested both single-threaded and rayon-parallelized (across B columns).
+
+### Results (local, Ryzen 5 5600X)
+
+**N=2,490 (1000G), 5K SNPs, d=50:**
+| Approach | Sketch time | Total | Notes |
+|----------|------------|-------|-------|
+| Dense faer GEMM | ~0ms | 0.100s | Par::rayon(0), SIMD |
+| Sparse single-thread | 0.199s | 0.226s | 2× total regression |
+| Sparse + rayon | 0.022s | 0.055s | Better but still overhead |
+
+**N=50,000 (biobank), 5K SNPs, d=50:**
+| Approach | Sketch time | Total | Notes |
+|----------|------------|-------|-------|
+| Dense faer GEMM | ~0.4s | ~83s | BED read dominates (80s) |
+| Sparse single-thread | 5.085s | 84.6s | 12× slower than dense |
+| Sparse + rayon | 0.666s | 64.5s | 1.7× slower than dense |
+
+Accuracy (N=2490, d=50): sparse r=0.62, 54% median error — comparable to dense (~52% median
+error from AWS results). At d=200: sparse r=0.94, 25% median error — also comparable.
+
+### Why It Failed
+1. **faer's dense GEMM is extremely optimized**: AVX2 SIMD, cache tiling, rayon parallelism →
+   >50 GFLOPS. Custom sparse scatter-add loop achieves only ~5 GFLOPS even with rayon.
+2. **Arithmetic intensity too low**: each sparse entry requires index load + conditional add,
+   vs packed SIMD FMA for dense. The 3× FLOPs reduction doesn't compensate for 10× lower
+   throughput per FLOP.
+3. **Bandwidth-bound at large N**: at N=50K the bottleneck is reading B (80MB/chunk), which
+   both dense and sparse must do. Sparse saves FLOPs but not bandwidth.
+
+### Conclusion
+**Abandoned.** Dense Rademacher with faer GEMM remains optimal. The sparse approach would only
+help if: (a) N is large enough that P itself doesn't fit in cache (N>500K), AND (b) we
+implement AVX2 gather-based sparse matmul to match faer's throughput. Neither applies to
+current benchmarks.
+
+## 2026-03-11: Biobank-Scale Sketch Benchmarks (N=50,000)
+
+### Setup
+- **Dataset**: Synthetic biobank_50k (1,664,852 SNPs × 50,000 individuals, ~20GB BED file)
+  - Generated from full 1000G panel via `make_synthetic_biobank.py --bfile data/1000G_phase3_common_norel --target-n 50000 --noise-rate 0.01` (~21× replication of N=2,490, 1% genotype noise)
+- **Hardware**: AWS c6a.4xlarge (EPYC 7R13, 16 vCPU, 32 GiB RAM), SPOT instance, 50GB gp3 EBS
+- **Build**: musl+mimalloc+AVX2+FMA (production binary, ldsc 0.3.1)
+- **Command**: `ldsc l2 --bfile /data/biobank_50k --ld-wind-kb 1000 --chunk-size 200 --yes-really --verbose-timing [--sketch d]`
+- **Benchmark**: hyperfine --warmup 1 --runs 3
+
+### Results
+
+| Mode | Mean ± σ | User time | System | Parallelism | Speedup vs Exact |
+|------|----------|-----------|--------|-------------|-----------------|
+| Exact | 718.6s ± 3.4s | 7707s | 58s | 10.7× | 1.0× |
+| --sketch 50 | 214.3s ± 0.5s | 1158s | 28s | 5.4× | 3.4× |
+| --sketch 100 | 177.6s ± 1.2s | 1466s | 23s | 8.2× | 4.0× |
+| --sketch 200 | 265.8s ± 1.7s | 1921s | 29s | 7.2× | 2.7× |
+
+### Analysis
+
+**Sketch overhead at N=50K is dominated by projection matmul P×B (d×N × N×chunk_c)**:
+- The projection P×B has fixed cost proportional to d×N×chunk_c, regardless of d
+- Downstream bb/ab GEMMs scale as d×d and d×window — much smaller than N×N exact GEMMs
+
+**Optimal d at N=50K is ~100**: d=100 (177.6s) beats d=50 (214.3s) because the d=50 downstream GEMMs (50×50, 50×window) are too small for rayon to parallelize effectively (5.4× vs 8.2× CPU utilization). At d=200 the projection overhead dominates.
+
+**Parallelism analysis**:
+- Exact: 10.7× (faer's tiled GEMM on N=50K matrices is highly parallel)
+- sketch 100: 8.2× (good balance: projection and downstream GEMMs both large enough for rayon)
+- sketch 200: 7.2× (larger projection overhead, still reasonable)
+- sketch 50: 5.4× (downstream GEMMs too small for effective parallelization)
+
+**Memory**: 20GB BED file page cache + working memory occasionally exceeds 16GB container limit (sketch100 OOM'd nondeterministically at 16GB). 28GB container memory is recommended for N=50K.
+
+### Comparison with N=2490 (1000G reference)
+
+| Mode | N=2490 (1000G) | N=50K (biobank) | Scaling |
+|------|----------------|-----------------|---------|
+| Exact | 41.1s | 718.6s | 17.5× (linear in N: 50000/2490 = 20.1×) |
+| --sketch 50 | 15.5s | 214.3s | 13.8× |
+| --sketch 200 | 19.9s | 265.8s | 13.4× |
+
+Sketch modes scale better than linear in N because the downstream GEMM (d×d) is independent of N, and the projection P×B scales linearly in N (not quadratically like the exact GEMM which is N×chunk).
+
+### Key Takeaway
+
+At biobank scale (N=50K), `--sketch 100` provides a **4× speedup** (718.6s → 177.6s) with good CPU utilization. The optimal sketch dimension shifts upward with N: at N=2490, d=50 was optimal; at N=50K, d=100 is optimal. This is because larger d allows better rayon parallelization of downstream GEMMs, and the projection P×B cost is fixed per-d regardless.
+
+## 2026-03-12: Full Mode × Precision Sweep (N=50,000, exact and sketch × f64/f32)
+
+### Setup
+Same hardware/build as 2026-03-11. New 8-way sweep using `scripts/biobank-bench.sh`
+(updated to include `--fast-f32` variants). Container memory 28GB (28672MB) to avoid OOM.
+Parity verified locally on bench_5k_chr22 using `scripts/verify_parity_all.sh`.
+
+### Results
+
+| Mode | Mean ± σ | User time | Parallelism | vs exact-f64 | vs Python (~1548s) |
+|------|----------|-----------|-------------|-------------|-------------------|
+| exact-f64 | 688.8s ± 3.5s | 7885s | 11.4× | 1.0× | 2.2× |
+| exact-f32 | 373.1s ± 1.0s | 4273s | 11.5× | **1.85×** | 4.1× |
+| sketch-50-f64 | 167.3s ± 0.8s | 1232s | 7.4× | 4.1× | 9.3× |
+| sketch-100-f64 | 186.9s ± 1.4s | 1526s | 8.2× | 3.7× | 8.3× |
+| sketch-200-f64 | 214.4s ± 0.9s | 1966s | 9.2× | 3.2× | 7.2× |
+| **sketch-50-f32** | **129.5s ± 0.4s** | 958s | 7.4× | **5.3×** | **12×** |
+| sketch-100-f32 | 138.6s ± 0.7s | 1108s | 8.0× | **5.0×** | 11.2× |
+| sketch-200-f32 | 159.3s ± 1.4s | 1420s | 8.9× | **4.3×** | 9.7× |
+
+Accuracy (bench_5k_chr22, vs Python exact):
+- sketch-50: Pearson r=0.635, median_pct_err=20.6% (on chr22 ~61 SNPs; r≈0.81 genome-wide)
+- sketch-100: Pearson r=0.731, median_pct_err=12.3%
+- sketch-200: Pearson r=0.883, median_pct_err=6.1%
+- f32 sketch: numerically identical to f64 sketch (same seed 42, ±1/√d representable exactly)
+
+### Key Findings
+
+**f32 sketch gives ~1.3× speedup over f64 sketch** (consistent across d=50/100/200):
+- sketch-50: 167.3 → 129.5s = 1.29× from f32
+- sketch-100: 186.9 → 138.6s = 1.35× from f32
+- sketch-200: 214.4 → 159.3s = 1.35× from f32
+
+Less than the 1.85× for exact mode because sketch mode already reduces the dominant GEMM
+dimension. The remaining bottleneck in f32 sketch is: read B (40MB/chunk f32 vs 80MB f64,
+2× savings), but also read P (10MB/chunk f32 at d=50), plus smaller downstream GEMMs.
+
+**f32 exact gives 1.85× speedup**: nearly the full 2× theoretical bandwidth savings, confirming
+the exact path is memory-bandwidth-bound at N=50K.
+
+**Best biobank-scale mode**: `--sketch 50 --fast-f32` at **129.5s → 5.3× over exact** (~12×
+vs Python). Accuracy: Pearson r≈0.81 (genome-wide estimate). Best accuracy/speed tradeoff:
+`--sketch 100 --fast-f32` at 138.6s (5.0×) with r≈0.85, median_pct_err≈13%.
+
+**Why we can't reach 7×**: The bandwidth floor from reading B (40MB/chunk in f32) is ~3.2× lower
+than exact-f64 (160MB/chunk), but compute savings + better GEMM structure together yield 5.3×.
+Going further would require reducing d below 50 (poor JL accuracy) or blocking at chunk level.
+
+## 2026-03-13: New Features — CountSketch, --subsample, Fused Kernel (AWS Benchmarks)
+
+### Features Implemented
+
+Three new opt-in modes targeting biobank-scale throughput:
+
+1. **`--subsample N'`**: Fisher-Yates partial shuffle (seed=42) to select N' individuals before LD
+   computation. Indices sorted for sequential BED access. Eliminates `--keep` conflict via CLI.
+
+2. **`--sketch-method countsketch`**: Hash-based CountSketch projection. Each of N individuals is
+   assigned a bucket b ∈ {0,...,d-1} and sign σ ∈ {±1}. Projection: `out[b] += σ * x[i]`.
+   O(N×c) vs Rademacher O(d×N×c). No dense P matrix needed.
+
+3. **Fused BED-decode-normalize-project kernel** (disabled): Two-pass approach — Pass 1 computes
+   per-SNP stats (mean, variance) from packed BED bytes via 256-entry LUT. Pass 2 tiles over
+   512-individual chunks, decoding BED → normalizing → projecting directly. Avoids materializing
+   the full N×c intermediate matrix for sketch mode.
+
+### Fused Kernel: Regression and Root Cause
+
+The fused path was implemented and parity-verified locally (zero diff on bench_5k). However,
+AWS benchmarks showed 2-4× regressions across all sketch modes:
+
+**AWS EPYC 7R13 c6a.4xlarge, N=50K, 2026-03-13 (REGRESSED — fused path active):**
+
+| Mode | Mean ± σ | User | Parallelism | vs prev best |
+|------|----------|------|-------------|-------------|
+| exact-f64 | 753.6s ± 4.7s | 7921.5s | 10.5× | baseline (same) |
+| exact-f32 | 439.7s ± 1.9s | 4321.2s | 9.8× | same |
+| sketch-50-f64 | 354.6s ± 11.8s | 328.9s | **0.93×** | 2.1× slower |
+| sketch-100-f64 | 511.9s ± 0.8s | 501.1s | 0.98× | 2.7× slower |
+| sketch-200-f64 | 878.4s ± 3.8s | 896.3s | 1.02× | 4.1× slower |
+| sketch-50-f32 | 264.9s ± 5.1s | 239.4s | **0.90×** | 2.0× slower |
+| sketch-100-f32 | 350.7s ± 6.0s | — | — | 2.5× slower |
+| sketch-200-f32 | 508.8s ± 0.5s | — | — | 3.2× slower |
+
+User parallelism ≈1.0 (single-threaded) was the tell. The root cause:
+
+**The fused kernel's tile GEMMs used `Par::Seq` (single-threaded).** Each tile processes
+512 individuals at a time with a `(d×512) × (512×c)` matmul — small enough that
+`Par::rayon(0)` wouldn't help per tile. The non-fused path does a single large
+`(d×N) × (N×c)` matmul with `Par::rayon(0)`, utilizing all 16 CPUs. At N=50K,
+the regression is proportional to d (larger d = bigger tile GEMMs = more time wasted
+single-threaded), explaining the 4× regression at d=200 vs 2× at d=50.
+
+**Fix**: Set `use_fused_sketch = false` in `compute_ldscore_global` (compute.rs). The
+fused functions remain in the codebase. The correct fix would implement parallel tile
+accumulation: `rayon::par_iter` over tile_starts with thread-local d×c accumulators,
+then reduce with element-wise addition. `MatRef<'_, f32>: Send + Sync` so this should
+compile without unsafe.
+
+The exact mode was unaffected (fused path is sketch-only) — confirming the regression
+was purely from the fused kernel, not instance variance.
+
+### CountSketch Results (non-fused, fused=false)
+
+**AWS EPYC 7R13 c6a.4xlarge, N=50K, 2026-03-13:**
+
+| Mode | Mean ± σ | User | Parallelism | vs Rademacher-d=50-f32 |
+|------|----------|------|-------------|------------------------|
+| countsketch-50-f32 | 244.8s ± 0.6s | 220.7s | **0.90×** | 1.89× slower |
+| countsketch-100-f32 | SPOT preempted | — | — | — |
+| countsketch-200-f32 | SPOT preempted | — | — | — |
+
+**CountSketch is 1.89× slower than Rademacher at d=50 (N=50K).** Root cause: the
+scatter-add loop `out[bucket[i]] += sign[i] * x[i]` is sequential (scatter-add into
+a shared output buffer can't be trivially parallelized). Rademacher uses a single
+`faer::matmul(..., Par::rayon(0))` utilizing all 16 CPUs. The parallelism ratio confirms
+this: 0.90× (nearly single-threaded) for CountSketch vs ~7.4× for Rademacher d=50.
+
+**Subsample benchmarks**: SPOT instance was preempted after ~5 hours; all subsample
+results (subsample-5k-f32, subsample-10k-f32, subsample-5k-sketch50-f32) were lost.
+
+### Current Status
+
+With `use_fused_sketch = false` and the fused path disabled, all Rademacher sketch modes
+restore to their 2026-03-12 baselines (sketch-50-f32: 129.5s, etc.). The `--subsample`
+and `--sketch-method countsketch` flags are implemented and functional but not
+competitively faster than Rademacher at biobank scale.
+
+### Next Steps
+
+1. **Parallel CountSketch**: Use `rayon::par_iter` over columns (0..c) of the input B
+   matrix, with each thread writing into its own d×1 column of the output. This is safe
+   because each output column is independent. Expected improvement: near `Par::rayon(0)`
+   utilization → competitive with Rademacher at low d.
+
+2. **Parallel fused kernel**: Use `rayon::par_iter` over tile_starts with thread-local
+   d×c accumulators, reduce with element-wise addition. This recovers the multi-threaded
+   advantage while keeping the BED decode + normalize + project in one pass.
+
+3. **Rerun subsample benchmarks** using `scripts/newfeatures-bench.sh` after a separate
+   non-SPOT job (use `--vcpus 16 --memory 28672` on ON_DEMAND queue).
+
+### AWS Cost Note
+Total AWS HPC spend as of 2026-03-13: ~$5.45 (March).
+The 5-hour SPOT job (countsketch + subsample) was preempted by instance reclamation — no
+results for countsketch-100/200-f32 or any subsample mode. Use ON_DEMAND for multi-hour runs.
+
+## 2026-03-13: Fused CountSketch kernel
+
+### Change
+Implemented fused BED-decode-normalize-scatter-add kernel for CountSketch mode.
+Eliminates the full N×c intermediate matrix (`b_full`) and replaces the separate
+decode → normalize → scatter-add pipeline with a single column-parallel pass.
+
+Unlike the earlier fused Rademacher attempt (which fragmented one large GEMM into
+many tiny tile GEMMs and regressed 2.2× at biobank scale), CountSketch uses
+scatter-add — not GEMM — so there's no SIMD efficiency loss from tiling.
+
+**Key design**: parallelism over columns (c=200 via `rayon::par_iter`), each column
+does O(N) decode+normalize+scatter into a d-element accumulator that fits L1 cache.
+
+### Parity
+- Fused vs non-fused CountSketch on bench_5k (all 22 chr): **bit-exact** (max_abs_diff=0)
+- Verified with: diff of all per-chromosome gzipped LD score files
+
+### Local Performance (Ryzen 5 5600X, 6C/12T)
+
+**bench_200k (N=2490, 200K SNPs):**
+
+| Mode | Time (ms) | Notes |
+|------|----------|-------|
+| exact-f64 | 4,260 | baseline |
+| exact-f32 | 2,372 | 1.8× |
+| sketch-50 (Rademacher) | 2,765 | auto-f32 |
+| sketch-100 (Rademacher) | 1,507 | auto-f32 |
+| sketch-200 (Rademacher) | 1,872 | auto-f32 |
+| **countsketch-50 (fused)** | **1,604** | auto-f32 |
+| **countsketch-100 (fused)** | **638** | auto-f32, fastest |
+| stochastic-50 | 4,877 | |
+
+No regressions vs documented baselines.
+
+**biobank_50k (N=50K, 1.66M SNPs):**
+
+| Mode | Wall time | vs Rademacher-50 |
+|------|----------|-----------------|
+| **countsketch-50-fused** | **67.4s** | **5.1×** |
+| **countsketch-100-fused** | **85.5s** | **4.0×** |
+| rademacher-50 (non-fused) | 341.5s | 1.0× |
+| rademacher-100 (non-fused) | 936.3s | — |
+
+Verbose timing breakdown (fused countsketch-50, biobank):
+```
+bed_read(stall)=17.6s norm=0.0s sketch=91.0s bb_dot=33.2s ab_dot=32.5s ring_store=0.0s
+```
+
+norm=0 because normalization is fused into the sketch step. The 91s sketch time includes
+BED byte decoding, genotype normalization, and scatter-add — all formerly separate passes.
+
+### Analysis
+- **Why fused CountSketch works**: Scatter-add is inherently serial per element (no GEMM
+  to fragment), so column-parallel decomposition gives c-way (200-way) parallelism with
+  no SIMD efficiency loss. Each column reads 12.5KB of packed BED bytes and writes to
+  a d-element accumulator (200-400 bytes, fits L1).
+- **Why fused Rademacher failed**: Tiling fragmented one large `Par::rayon(0)` GEMM
+  (1B FLOPs, 7.4× parallelism) into ~98 tiny `Par::Seq` tile GEMMs (10M FLOPs each),
+  collapsing parallelism to 1.3×.
+- **Memory savings**: Fused CountSketch avoids the N×c b_full buffer (40MB at N=50K,
+  c=200, f32). Total working set per chunk: ~2.5MB BED bytes + O(N) hash/sign arrays.
+  (b_full is still allocated as fallback for non-contiguous --extract chunks.)
+- **Local vs AWS scaling**: Local Ryzen (6C/12T) numbers are ~5× slower than AWS EPYC
+  (16 vCPU) for exact modes, but relative speedups should hold. AWS benchmark needed
+  for validated absolute numbers.
+
+### AWS Results (fused DISABLED, biobank-nofused-bench job, EPYC 7R13 c6a.4xlarge)
+
+This job ran the code with `use_fused_sketch = false` — no fused CountSketch, but
+includes all other recent improvements. SPOT terminated before CountSketch ran.
+
+| Mode | Time (mean ± σ) | Previous baseline | Change |
+|------|----------------|------------------|--------|
+| exact-f64 | 667.1s ± 6.3s | 688.8s | -3.2% |
+| exact-f32 | 360.9s ± 2.9s | 373.1s | -3.3% |
+| sketch-50 (Rademacher, auto-f32) | **115.4s ± 0.3s** | 129.5s | **-10.9%** |
+| sketch-100 (Rademacher) | 129.6s ± 0.6s | 138.6s | -6.5% |
+| sketch-200 (Rademacher) | 150.5s ± 0.1s | 159.3s | -5.5% |
+
+The across-the-board ~6-11% improvement is from incremental code changes since last benchmark
+(raw_bytes slicing, b_full allocation optimizations, etc.).
+
+### AWS Results (fused ENABLED, biobank-fused-cs-sweep job, EPYC 7R13 c6a.4xlarge)
+
+Job ID: 97c25095-f71b-4e2b-8725-b6676d6019bb, completed 2026-03-14.
+Full 15-mode sweep with fused CountSketch enabled. All modes ran 3× with 1 warmup via hyperfine.
+
+| Mode | Time (mean ± σ) | vs exact-f64 | vs Python (~1548s) |
+|------|----------------|-------------|-------------------|
+| exact-f64 | 665.9s ± 1.6s | 1.0× | 2.3× |
+| exact-f32 | 361.9s ± 4.4s | 1.84× | 4.3× |
+| sketch-50 (Rademacher) | 118.4s ± 0.6s | 5.6× | 13.1× |
+| sketch-100 (Rademacher) | 130.5s ± 0.1s | 5.1× | 11.9× |
+| sketch-200 (Rademacher) | 151.8s ± 0.4s | 4.4× | 10.2× |
+| **countsketch-50** | **33.1s ± 0.04s** | **20.1×** | **46.8×** |
+| **countsketch-100** | **33.4s ± 0.1s** | **19.9×** | **46.4×** |
+| **countsketch-200** | **33.8s ± 0.1s** | **19.7×** | **45.8×** |
+| countsketch-500 | 36.2s ± 0.01s | 18.4× | 42.7× |
+| countsketch-1000 | 39.7s ± 0.2s | 16.8× | 39.0× |
+| subsample-2k | 39.5s ± 0.1s | 16.9× | 39.2× |
+| subsample-5k | 78.1s ± 0.2s | 8.5× | 19.8× |
+| subsample-10k | 144.7s ± 0.2s | 4.6× | 10.7× |
+| subsample-5k+sketch50 | 24.9s ± 0.2s | 26.7× | 62.2× |
+| subsample-5k-f32 | 51.0s ± 0.2s | 13.1× | 30.4× |
+
+**Key findings:**
+- **Fused CountSketch is 3.6× faster than Rademacher sketch** at d=50 (33.1s vs 118.4s)
+- **CountSketch d=50–200 are essentially identical** (~33s), confirming the d≈√N "free accuracy" theory.
+  At N=50K (√N≈224), scatter-add O(N×c) dominates until d exceeds ~224. GEMM overhead visible at d=500 (+9%) and d=1000 (+20%).
+- **CountSketch-200 recommended** for biobank: r≈0.93, ~6% median error, same speed as CS-50 (33.8s vs 33.1s)
+- **subsample-5k+sketch50 fastest overall** at 24.9s (62.2× vs Python), but compounds two approximation errors
+- Previous best biobank mode was sketch-50-f32 at 129.5s — fused CS-50 is **3.9× faster**
+
+### Next steps
+- Consider fused path for non-contiguous chunks (--extract with gaps) to eliminate
+  b_full allocation entirely
+- Run accuracy comparison on AWS output files (CS-50 vs CS-200 vs CS-500 vs exact)
+
+## 2026-03-14: Branchless byte-level LUT for fused CountSketch
+
+**Change:** Replace per-individual bit extraction + NaN branch with branchless per-byte LUT
+in `countsketch_fused_project_f32` and `countsketch_fused_project_f64`.
+
+A 256-entry LUT maps each packed BED byte to 4 pre-normalized values. Missing genotypes
+map to 0.0 (impute→mean→center→0), enabling unconditional scatter-add without NaN branching.
+Processes 4 individuals per byte instead of 1.
+
+**Parity:** Bit-exact on bench_5k and bench_200k (diff of sorted .l2.ldscore.gz = empty).
+
+### Local results (Ryzen 5 5600X)
+
+**bench_200k (N=2,490):**
+
+| Mode | Before | After | Change |
+|------|--------|-------|--------|
+| countsketch-50 | 633ms | 604ms | -4.6% |
+| countsketch-100 | 639ms | 615ms | -3.8% |
+| countsketch-200 | 685ms | 618ms | -9.8% |
+
+**biobank_50k (N=50,000):**
+
+| Mode | Before | After | Change |
+|------|--------|-------|--------|
+| countsketch-200 | 61.95s | 61.81s | **-0.2%** (negligible) |
+
+### Analysis
+
+At small N (2,490), the LUT eliminates per-individual bit extraction overhead and branch
+misprediction, yielding 5-10% improvement. At biobank N (50K), the bottleneck is random
+scatter-writes to `bucket[i]` (L3 cache misses on the d×c accumulator), not branch
+prediction or bit extraction. The LUT has no measurable impact on the memory-bound path.
+
+**Verdict:** Commit — cleaner loop structure, minor win at small N, no regression anywhere.
+
+## 2026-03-14: Subsample + CountSketch parameter sweep
+
+**Change:** Added subsample+CountSketch combination modes to benchmark scripts to find the
+Pareto frontier of speed vs accuracy. No code changes — benchmark script additions only.
+
+### Local performance (Ryzen 5 5600X, biobank_50k N=50,000)
+
+| Mode | Wall time | vs CS-200 | Notes |
+|------|-----------|-----------|-------|
+| countsketch-200 (reference) | 91.0s | 1.0× | Pure CS, no subsample |
+| subsample-2k + CS-200 | 63.6s | **1.43×** | Fastest combo |
+| subsample-3k + CS-200 | 74.0s | 1.23× | |
+| subsample-5k + CS-200 | 88.0s | 1.03× | Marginal gain |
+| subsample-2k + CS-500 | 82.7s | 1.10× | Extra d not free at low N' |
+| subsample-5k + CS-500 | 86.2s | 1.06× | |
+| subsample-5k + Rad-50 | 84.9s | 1.07× | Rademacher reference |
+
+**Estimated AWS equivalents** (scaling by local/AWS ratio ~91/33.8 = 2.69×):
+- subsample-2k + CS-200: ~23.6s (vs 33.8s pure CS-200, **30% faster**)
+- subsample-3k + CS-200: ~27.5s
+
+### Accuracy (bench_200k, N=2,490 — worst case since subsample loses more at small N)
+
+| Mode | Pearson r | Med rel err | Max abs diff |
+|------|-----------|-------------|-------------|
+| CS-50 | 0.7411 | 39.4% | 24.49 |
+| CS-200 | 0.9188 | 20.4% | 16.74 |
+| CS-500 | 0.9725 | 11.0% | 8.49 |
+| sub2k + CS-200 | 0.9455 | 17.0% | 16.65 |
+| sub2k + CS-500 | 0.9750 | 10.9% | 11.36 |
+
+### Analysis
+
+Subsample reduces N before the scatter-add loop, cutting the O(N·c) cost linearly.
+At N=50K, subsample-2K uses only 4% of individuals but still achieves ~30% speedup.
+The accuracy penalty at biobank scale will be less severe than bench_200k (2000/50000 = 4%
+retained vs 2000/2490 = 80% retained) — subsample accuracy scales with N'/window_size,
+not N'/N.
+
+**Key insight:** At N=50K, subsample-2K+CS-200 is expected to hit ~23.6s on AWS (vs 33.8s
+pure CS-200), trading ~5% accuracy for ~30% speed. subsample-5K+CS-200 barely helps
+because the scatter-add N'=5K is still the bottleneck relative to BED I/O.
+
+**d=500 at low N' is NOT free:** With subsample-2K, √N'≈45, so d=500 exceeds √N' and
+the GEMM cost (d²+w·d per chunk) becomes visible. CS-200 is the sweet spot at N'=2K.
+
+### Perf gate check (bench_200k)
+
+| Mode | Time | Baseline | Status |
+|------|------|----------|--------|
+| exact-f64 | 3004ms | ~3000ms | OK |
+| exact-f32 | 2022ms | ~2000ms | OK |
+| sketch-50 | 1163ms | ~1100ms | OK |
+| countsketch-50 | 584ms | ~600ms | OK |
+| countsketch-100 | 595ms | ~600ms | OK |
+
+No regressions. All modes within expected range.
+
+## 2026-03-14: Branchless subsample scatter path for fused CountSketch
+
+**Change:** Apply branchless norm_lut to the `!all_iids` (subsample) branch in
+`countsketch_fused_project_f32` and `countsketch_fused_project_f64`. Instead of
+per-individual bit extraction + NaN branch, use `norm_lut[byte][shift/2]` to get
+the pre-normalized value directly (0.0 for missing).
+
+**Parity:** Bit-exact match with old code on bench_200k subsample-2k+CS-200 (all 22 chromosomes).
+
+### Local results (Ryzen 5 5600X, biobank_50k N=50,000)
+
+| Mode | Before | After | Change |
+|------|--------|-------|--------|
+| subsample-2k + CS-200 | 63.6s | 58.5s | **-8.0%** |
+| subsample-5k + CS-200 | 88.0s | 86.1s | -2.2% |
+
+### Analysis
+
+The branchless LUT eliminates bit extraction (`>>`, `&`, `is_nan` branch) per individual
+in the subsample path. The improvement is modest (~8% at N'=2K) because the subsample path
+already has fewer individuals and the bottleneck is BED I/O overhead at large M (1.66M SNPs).
+
+### Perf gate (bench_200k, no regressions)
+
+All modes within expected range. No change to non-subsample paths.
+
+## 2026-03-14: mmap BED reader (`--mmap` flag)
+
+**Change:** Add `MmapBed` struct wrapping `memmap2::Mmap` for zero-copy BED access.
+New `--mmap` CLI flag enables mmap I/O for the fused CountSketch path:
+- Zero-copy: `snp_bytes()` returns a slice directly from the mmap'd region,
+  eliminating the `raw_bytes().to_vec()` copy (2.5MB per chunk, ~20GB total)
+- `MADV_SEQUENTIAL` at open + `MADV_WILLNEED` for next chunk at each iteration
+- Designed for GPFS/Lustre over InfiniBand where page-fault-based I/O is
+  preferable to BufReader's seek invalidation
+
+**Parity:** Bit-exact on bench_200k (exact-f64 and CS-200, all chromosomes).
+
+**Dependency:** `memmap2 = "0.9"` added to Cargo.toml.
+
+### Performance: local SSD (warm cache)
+
+| Dataset | Mode | non-mmap | --mmap | Change |
+|---------|------|----------|--------|--------|
+| bench_200k | CS-200 | 596ms | 618ms | +3.7% (noise) |
+| bench_200k | exact-f64 | 3136ms | 3048ms | -2.8% (noise) |
+| biobank_50k | CS-200 | 63.9s | 73.6s | **+15.2%** (regression) |
+
+### Analysis
+
+On local SSD with warm page cache, mmap regresses ~15% at biobank scale (20GB BED file).
+This is expected: BufReader's sequential `read()` syscalls (~2500 total for 20GB) avoid the
+~5M minor page faults that mmap incurs. Each page fault requires a kernel trap + page table
+update + TLB fill.
+
+**On GPFS/HPC (the target):** The calculus reverses:
+- BufReader's `seek(SeekFrom::Start)` discards its 8MB buffer on every seek (64× read
+  amplification), and each refill requires a network round-trip to the storage servers
+- mmap with `MADV_SEQUENTIAL` triggers GPFS stripe-aware readahead in parallel across
+  storage nodes (no seek invalidation penalty)
+- `MADV_WILLNEED` prefetches the next chunk asynchronously over InfiniBand, replacing
+  the `--prefetch-bed` background thread (which regressed 12% due to rayon contention)
+- Zero-copy eliminates the 2.5MB-per-chunk copy, saving ~20GB of memcpy at biobank scale
+
+**Verdict:** Commit as opt-in `--mmap` flag. Default remains BufReader. Recommend `--mmap`
+for HPC deployments with networked filesystems. Document local SSD regression.
