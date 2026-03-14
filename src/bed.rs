@@ -360,9 +360,9 @@ fn resolve_indices(raw: Option<&[isize]>, max: usize) -> Result<Vec<usize>> {
 }
 
 #[derive(Clone, Copy)]
-struct IidPos {
-    byte_idx: usize,
-    shift: u8,
+pub(crate) struct IidPos {
+    pub byte_idx: usize,
+    pub shift: u8,
 }
 
 fn precompute_iid_positions(iid_indices: &[usize]) -> Vec<IidPos> {
@@ -485,6 +485,53 @@ impl<T: BedVal> ChunkReader<T> {
         bed.read_next_block(count, &mut self.block_buf[..total_bytes])?;
         self.decode_block(count);
         Ok(&self.out)
+    }
+
+    /// Read the next `count` SNPs into the raw byte buffer without decoding.
+    /// Use `raw_bytes()` to access the packed BED bytes afterwards.
+    pub fn read_next_raw_only(&mut self, bed: &mut Bed, count: usize) -> Result<()> {
+        let total_bytes = count * self.bytes_per_snp;
+        bed.read_next_block(count, &mut self.block_buf[..total_bytes])?;
+        Ok(())
+    }
+
+    /// Read a contiguous block of `count` SNPs starting at `start_sid` into the raw byte
+    /// buffer without decoding. Use `raw_bytes()` to access the packed BED bytes afterwards.
+    pub fn read_contiguous_raw_only(
+        &mut self,
+        bed: &mut Bed,
+        start_sid: usize,
+        count: usize,
+    ) -> Result<()> {
+        let total_bytes = count * self.bytes_per_snp;
+        bed.read_snp_block(start_sid, count, &mut self.block_buf[..total_bytes])?;
+        Ok(())
+    }
+
+    /// Raw packed BED bytes from the last `read_next_raw_only` / `read_contiguous_raw_only` call.
+    /// Contains `count * bytes_per_snp` bytes in SNP-major order.
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.block_buf
+    }
+
+    /// Number of bytes per SNP in the packed BED format: `(n_iid_full + 3) / 4`.
+    pub fn bytes_per_snp_val(&self) -> usize {
+        self.bytes_per_snp
+    }
+
+    /// Number of selected individuals (after iid_index filtering).
+    pub fn n_iid(&self) -> usize {
+        self.out.nrows()
+    }
+
+    /// Precomputed byte/shift positions for selected individuals.
+    pub fn iid_positions_ref(&self) -> &[IidPos] {
+        &self.iid_positions
+    }
+
+    /// True when all individuals are used in order — enables fast 4-per-byte decode path.
+    pub fn all_iids_flag(&self) -> bool {
+        self.all_iids
     }
 
     /// Read a contiguous block of `count` SNPs starting at `start_sid` (with seek).

@@ -1,85 +1,17 @@
-use crate::bed::{Bed, ChunkReader, ReadOptions};
-use crate::cli::L2Args;
-use crate::cts_annot;
+use super::normalize::{normalize_col_f32_with_stats, normalize_col_f64_with_stats, sum_sumsq_f32};
+use super::window::{WindowMode, get_block_lefts_by_chr};
+use crate::bed::{Bed, ChunkReader, IidPos, ReadOptions};
 #[cfg(feature = "gpu")]
 use crate::gpu::GpuContext;
 use crate::la::{
     MatF, MatF32, mat_add_in_place, mat_copy_from, mat_slice, mat_slice_f32, mat_slice_mut,
     mat_slice_mut_f32, matmul_tn_to, matmul_tn_to_f32, matmul_to,
 };
-use crate::parse;
+use crate::parse::BimRecord;
 use anyhow::{Context, Result};
 use faer::{Accum, Par};
-use std::collections::{HashSet, VecDeque};
-use std::fs::File;
-use std::io::{BufRead, BufReader, Write as IoWrite};
-
-/// AVX2+FMA vectorized sum and sum-of-squares for f32 slices.
-/// Returns (sum, sum_sq) as f64. BED values are {0,1,2,NaN} so f32
-/// accumulation is exact (max partial sum < 2^23).
-///
-/// # Safety
-/// Requires AVX2 and FMA CPU features to be available.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn sum_sumsq_f32(data: &[f32]) -> (f64, f64) {
-    use std::arch::x86_64::*;
-    unsafe {
-        let n = data.len();
-        let n8 = n / 8 * 8;
-        let ptr = data.as_ptr();
-
-        let mut sum_v = _mm256_setzero_ps();
-        let mut sq_v = _mm256_setzero_ps();
-
-        let mut i = 0usize;
-        while i < n8 {
-            let v = _mm256_loadu_ps(ptr.add(i));
-            sum_v = _mm256_add_ps(sum_v, v);
-            sq_v = _mm256_fmadd_ps(v, v, sq_v); // v*v + sq_v
-            i += 8;
-        }
-
-        // Horizontal reduction: ymm → scalar f32
-        let lo = _mm256_castps256_ps128(sum_v);
-        let hi = _mm256_extractf128_ps(sum_v, 1);
-        let sum4 = _mm_add_ps(lo, hi);
-        let sum4_hi = _mm_movehl_ps(sum4, sum4);
-        let sum2 = _mm_add_ps(sum4, sum4_hi);
-        let sum1 = _mm_add_ss(sum2, _mm_shuffle_ps(sum2, sum2, 1));
-        let mut sum = _mm_cvtss_f32(sum1) as f64;
-
-        let lo = _mm256_castps256_ps128(sq_v);
-        let hi = _mm256_extractf128_ps(sq_v, 1);
-        let sq4 = _mm_add_ps(lo, hi);
-        let sq4_hi = _mm_movehl_ps(sq4, sq4);
-        let sq2 = _mm_add_ps(sq4, sq4_hi);
-        let sq1 = _mm_add_ss(sq2, _mm_shuffle_ps(sq2, sq2, 1));
-        let mut sum_sq = _mm_cvtss_f32(sq1) as f64;
-
-        // Scalar remainder
-        for j in n8..n {
-            let v = *ptr.add(j);
-            sum += v as f64;
-            sum_sq += (v * v) as f64;
-        }
-
-        (sum, sum_sq)
-    }
-}
-
-/// Fallback for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn sum_sumsq_f32(data: &[f32]) -> (f64, f64) {
-    let mut sum = 0f64;
-    let mut sum_sq = 0f64;
-    for &v in data {
-        let vf = v as f64;
-        sum += vf;
-        sum_sq += vf * vf;
-    }
-    (sum, sum_sq)
-}
+use rayon::prelude::*;
+use std::collections::VecDeque;
 
 /// Fill a slice with Rademacher random values (+1.0 or -1.0) using bits from `rng`.
 fn fill_rademacher_f64(rng: &mut fastrand::Rng, buf: &mut [f64]) {
@@ -233,248 +165,868 @@ fn write_gpu_result_f64_native(
     }
 }
 
-pub use crate::parse::{BimRecord, parse_bim};
-
-/// Count the number of individuals in a PLINK .fam file (one row per individual).
-pub fn count_fam(path: &str) -> Result<usize> {
-    let f = File::open(path).with_context(|| format!("opening FAM file '{}'", path))?;
-    Ok(BufReader::new(f).lines().count())
-}
-
-/// Parse (FID, IID) pairs from a PLINK .fam file in order.
-pub fn parse_fam(path: &str) -> Result<Vec<(String, String)>> {
-    let f = File::open(path).with_context(|| format!("opening FAM file '{}'", path))?;
-    let reader = BufReader::new(f);
-    let mut ids = Vec::new();
-    for (i, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("reading FAM line {}", i + 1))?;
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        anyhow::ensure!(
-            cols.len() >= 2,
-            "FAM line {}: expected ≥ 2 columns (FID IID ...), got {}",
-            i + 1,
-            cols.len()
-        );
-        ids.push((cols[0].to_string(), cols[1].to_string()));
+// ── SendPtr wrapper for raw pointers across rayon threads ──────────────────
+/// Wrapper that implements Send+Sync for raw pointers. The caller is
+/// responsible for ensuring disjoint access (each thread touches a
+/// different column of the matrix).
+#[derive(Clone, Copy)]
+struct SendPtr<T>(*mut T);
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+impl<T> SendPtr<T> {
+    /// Return the raw pointer. Using a method instead of `.0` field access
+    /// prevents Rust 2021 disjoint-field capture from stripping the
+    /// Send+Sync wrapper in closures.
+    #[inline(always)]
+    fn ptr(self) -> *mut T {
+        self.0
     }
-    Ok(ids)
 }
 
-/// Load the 0-based FAM indices for individuals listed in a keep file (FID IID per line).
-fn load_individual_indices(keep_path: &str, fam_ids: &[(String, String)]) -> Result<Vec<isize>> {
-    let file =
-        File::open(keep_path).with_context(|| format!("opening keep file '{}'", keep_path))?;
-    let keep_set: HashSet<(String, String)> = BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .filter_map(|l| {
-            let mut cols = l.split_whitespace();
-            let fid = cols.next()?.to_string();
-            let iid = cols.next()?.to_string();
-            Some((fid, iid))
+// ── CountSketch projection ──────────────────────────────────────────────────
+// Hash each individual to a random bucket with a random sign.
+// Replaces the dense d×N Rademacher matrix with O(N) hash + sign arrays.
+// Application: O(N×c) scatter-add vs O(d×N×c) for dense GEMM.
+
+/// CountSketch projection: hash each individual to a bucket with a random sign.
+struct CountSketchProj {
+    bucket: Vec<u32>, // h(i) ∈ {0,...,d-1} for each individual
+    sign_f64: Vec<f64>,
+    sign_f32: Vec<f32>,
+    d: usize,
+}
+
+impl CountSketchProj {
+    fn new(n_indiv: usize, d: usize, seed: u64) -> Self {
+        let mut rng = fastrand::Rng::with_seed(seed);
+        let bucket: Vec<u32> = (0..n_indiv).map(|_| rng.u32(..d as u32)).collect();
+        let sign_f64: Vec<f64> = (0..n_indiv)
+            .map(|_| if rng.bool() { 1.0 } else { -1.0 })
+            .collect();
+        let sign_f32: Vec<f32> = sign_f64.iter().map(|&s| s as f32).collect();
+        Self {
+            bucket,
+            sign_f64,
+            sign_f32,
+            d,
+        }
+    }
+
+    /// Project b_full_f64[n_indiv x c] into out[d x c] via scatter-add, then
+    /// apply ratio estimator renormalization so ||out[:,j]||^2 = n.
+    ///
+    /// Parallelized over columns (j=0..c) via rayon. Each column's scatter-add
+    /// is independent, giving c-way parallelism (c=chunk_size, typically 200).
+    fn project_f64(&self, b_full: &MatF, n_indiv: usize, c: usize, n: f64, out: &mut MatF) {
+        let d = self.d;
+        let bucket = &self.bucket;
+        let sign = &self.sign_f64;
+
+        // Get raw pointer + stride for parallel column access.
+        // Safety: faer Mat is column-major; columns at ptr + j*col_stride are
+        // disjoint memory regions of length >= d. Each rayon task writes only
+        // to its own column j, so no data races.
+        let out_ptr = out.as_mut().as_ptr_mut();
+        let out_col_stride = out.col_stride();
+        let src_ptr = b_full.as_ref().as_ptr();
+        let src_col_stride = b_full.col_stride();
+
+        // Wrap raw pointers for Send across rayon threads.
+        let out_send = SendPtr(out_ptr);
+        let src_send = SendPtr(src_ptr as *mut f64);
+
+        (0..c).into_par_iter().for_each(|j| {
+            // Safety: each thread accesses a disjoint column of out and reads
+            // a disjoint column of b_full.
+            unsafe {
+                let dst = std::slice::from_raw_parts_mut(
+                    out_send.ptr().offset(j as isize * out_col_stride),
+                    d,
+                );
+                let src = std::slice::from_raw_parts(
+                    (src_send.ptr() as *const f64).offset(j as isize * src_col_stride),
+                    n_indiv,
+                );
+
+                // Zero output column.
+                for v in dst.iter_mut() {
+                    *v = 0.0;
+                }
+
+                // Scatter-add: out[bucket[i], j] += sign[i] * src[i]
+                for i in 0..n_indiv {
+                    *dst.get_unchecked_mut(bucket[i] as usize) += sign[i] * src[i];
+                }
+
+                // Ratio estimator renorm: rescale so ||col||^2 = n
+                let mut nrm_sq = 0.0f64;
+                for &v in dst.iter() {
+                    nrm_sq += v * v;
+                }
+                if nrm_sq > 0.0 {
+                    let scale = (n / nrm_sq).sqrt();
+                    for v in dst.iter_mut() {
+                        *v *= scale;
+                    }
+                }
+            }
+        });
+    }
+
+    /// f32 variant. Parallelized over columns via rayon.
+    fn project_f32(&self, b_full: &MatF32, n_indiv: usize, c: usize, n: f64, out: &mut MatF32) {
+        let d = self.d;
+        let bucket = &self.bucket;
+        let sign = &self.sign_f32;
+
+        let out_ptr = out.as_mut().as_ptr_mut();
+        let out_col_stride = out.col_stride();
+        let src_ptr = b_full.as_ref().as_ptr();
+        let src_col_stride = b_full.col_stride();
+
+        let out_send = SendPtr(out_ptr);
+        let src_send = SendPtr(src_ptr as *mut f32);
+
+        (0..c).into_par_iter().for_each(|j| {
+            unsafe {
+                let dst = std::slice::from_raw_parts_mut(
+                    out_send.ptr().offset(j as isize * out_col_stride),
+                    d,
+                );
+                let src = std::slice::from_raw_parts(
+                    (src_send.ptr() as *const f32).offset(j as isize * src_col_stride),
+                    n_indiv,
+                );
+
+                for v in dst.iter_mut() {
+                    *v = 0.0;
+                }
+
+                for i in 0..n_indiv {
+                    *dst.get_unchecked_mut(bucket[i] as usize) += sign[i] * src[i];
+                }
+
+                // Ratio estimator renorm (accumulate in f64 for precision).
+                let mut nrm_sq = 0.0f64;
+                for &v in dst.iter() {
+                    nrm_sq += (v as f64) * (v as f64);
+                }
+                if nrm_sq > 0.0 {
+                    let scale = (n / nrm_sq).sqrt() as f32;
+                    for v in dst.iter_mut() {
+                        *v *= scale;
+                    }
+                }
+            }
+        });
+    }
+}
+
+// ── Fused BED-decode-normalize-project ─────────────────────────────────────
+// Avoids materializing the full N×c intermediate matrix (b_full).
+// Pass 1: compute per-SNP stats (mean, inv_std, maf) from packed BED bytes.
+// Pass 2: tiled decode+normalize+project, accumulating into out[d×c].
+
+// BED decode LUT: bits → genotype value (or NaN for missing).
+// BED bits 0b00=2, 0b01=missing, 0b10=1, 0b11=0 (count_a1=true convention).
+const GENO_LUT_F64: [f64; 4] = [2.0, f64::NAN, 1.0, 0.0];
+const GENO_LUT_F32: [f32; 4] = [2.0, f32::NAN, 1.0, 0.0];
+
+// Byte-level stats LUT: each of the 256 possible BED byte values encodes 4
+// genotypes; this LUT gives (sum, count, sum_sq) for the full byte.
+#[derive(Clone, Copy)]
+struct BedByteStats {
+    sum: u8,
+    count: u8,
+    sum_sq: u8,
+}
+
+fn build_bed_byte_lut() -> [BedByteStats; 256] {
+    std::array::from_fn(|b| {
+        let byte = b as u8;
+        let (mut sum, mut count, mut sum_sq) = (0u8, 0u8, 0u8);
+        for k in 0..4 {
+            match (byte >> (2 * k)) & 0b11 {
+                0 => {
+                    sum += 2;
+                    count += 1;
+                    sum_sq += 4;
+                } // hom A1 = 2
+                1 => {} // missing
+                2 => {
+                    sum += 1;
+                    count += 1;
+                    sum_sq += 1;
+                } // het = 1
+                3 => {
+                    count += 1;
+                } // hom A2 = 0
+                _ => {}
+            }
+        }
+        BedByteStats { sum, count, sum_sq }
+    })
+}
+
+/// Compute (sum, count, sum_sq) of non-missing genotypes for one SNP from raw bytes.
+/// Genotypes are 0, 1, 2 (count_a1=true convention).
+fn snp_stats_from_bytes(
+    snp_bytes: &[u8],
+    n_indiv: usize,
+    iid_positions: &[IidPos],
+    all_iids: bool,
+    byte_lut: &[BedByteStats; 256],
+) -> (u32, u32, u32) {
+    if all_iids {
+        let full_bytes = n_indiv / 4;
+        let rem = n_indiv % 4;
+        let (mut sum, mut count, mut sum_sq) = (0u32, 0u32, 0u32);
+        for &byte in &snp_bytes[..full_bytes] {
+            let s = byte_lut[byte as usize];
+            sum += s.sum as u32;
+            count += s.count as u32;
+            sum_sq += s.sum_sq as u32;
+        }
+        if rem > 0 {
+            let byte = snp_bytes[full_bytes];
+            for k in 0..rem {
+                match (byte >> (2 * k)) & 0b11 {
+                    0 => {
+                        sum += 2;
+                        count += 1;
+                        sum_sq += 4;
+                    }
+                    1 => {}
+                    2 => {
+                        sum += 1;
+                        count += 1;
+                        sum_sq += 1;
+                    }
+                    3 => {
+                        count += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (sum, count, sum_sq)
+    } else {
+        let (mut sum, mut count, mut sum_sq) = (0u32, 0u32, 0u32);
+        for pos in iid_positions {
+            let byte = snp_bytes[pos.byte_idx];
+            match (byte >> pos.shift) & 0b11 {
+                0 => {
+                    sum += 2;
+                    count += 1;
+                    sum_sq += 4;
+                }
+                1 => {}
+                2 => {
+                    sum += 1;
+                    count += 1;
+                    sum_sq += 1;
+                }
+                3 => {
+                    count += 1;
+                }
+                _ => {}
+            }
+        }
+        (sum, count, sum_sq)
+    }
+}
+
+/// Fused BED-decode-normalize-project (f64).
+/// Reads raw packed BED bytes, computes per-SNP statistics, then tiles over
+/// individuals to decode+normalize+project without materializing the full N×c
+/// intermediate matrix.
+///
+/// Pass 2 parallelizes over tiles via rayon: each thread decodes a tile of
+/// individuals, computes P_tile × B_tile (a d×c partial result), and the
+/// partial results are summed via `reduce`.
+///
+/// On return, `out[0..d, 0..c]` contains the projected+renormalized columns,
+/// and `maf_out[0..c]` contains the per-SNP MAF.
+#[allow(clippy::too_many_arguments)]
+fn sketch_fused_project_f64(
+    raw_bytes: &[u8],
+    bytes_per_snp: usize,
+    n_indiv: usize,
+    c: usize,
+    d: usize,
+    proj: &MatF,
+    n: f64,
+    iid_positions: &[IidPos],
+    all_iids: bool,
+    maf_out: &mut [f64],
+    out: &mut MatF,
+) {
+    use rayon::prelude::*;
+
+    let byte_lut = build_bed_byte_lut();
+
+    // --- Pass 1: per-SNP statistics from packed bytes ---
+    struct SnpStats {
+        mean: f64,
+        inv_std: f64,
+        maf: f64,
+    }
+    let stats: Vec<SnpStats> = (0..c)
+        .map(|j| {
+            let snp_bytes = &raw_bytes[j * bytes_per_snp..(j + 1) * bytes_per_snp];
+            let (sum, count, sum_sq) =
+                snp_stats_from_bytes(snp_bytes, n_indiv, iid_positions, all_iids, &byte_lut);
+            let mean = if count > 0 {
+                sum as f64 / count as f64
+            } else {
+                0.0
+            };
+            let freq = (mean / 2.0).clamp(0.0, 1.0);
+            let maf = freq.min(1.0 - freq);
+            let centered_ss = sum_sq as f64 - count as f64 * mean * mean;
+            let var = centered_ss / n_indiv as f64;
+            let std = var.sqrt();
+            let inv_std = if std > 0.0 { 1.0 / std } else { 0.0 };
+            SnpStats { mean, inv_std, maf }
         })
         .collect();
 
-    let indices: Vec<isize> = fam_ids
-        .iter()
-        .enumerate()
-        .filter(|(_, (fid, iid))| keep_set.contains(&(fid.clone(), iid.clone())))
-        .map(|(i, _)| i as isize)
+    for (j, s) in stats.iter().enumerate() {
+        maf_out[j] = s.maf;
+    }
+
+    // --- Pass 2: parallel tiled decode + normalize + project ---
+    const TILE: usize = 512;
+    let tile_starts: Vec<usize> = (0..n_indiv).step_by(TILE).collect();
+
+    // Each tile produces a d×c partial result; reduce by summing.
+    let summed = tile_starts
+        .par_iter()
+        .map(|&tile_start| {
+            let tile_end = (tile_start + TILE).min(n_indiv);
+            let tile_n = tile_end - tile_start;
+
+            let mut b_tile = MatF::zeros(tile_n, c);
+            let mut partial = MatF::zeros(d, c);
+
+            // Decode + normalize tile into b_tile[tile_n × c]
+            for j in 0..c {
+                let snp_bytes = &raw_bytes[j * bytes_per_snp..(j + 1) * bytes_per_snp];
+                let mean = stats[j].mean;
+                let inv_std = stats[j].inv_std;
+                let col = b_tile
+                    .col_mut(j)
+                    .try_as_col_major_mut()
+                    .unwrap()
+                    .as_slice_mut();
+                if all_iids {
+                    for (i, v) in col[..tile_n].iter_mut().enumerate() {
+                        let iid = tile_start + i;
+                        let byte = snp_bytes[iid / 4];
+                        let bits = (byte >> ((iid % 4) * 2)) & 0b11;
+                        let g = GENO_LUT_F64[bits as usize];
+                        *v = if g.is_nan() {
+                            0.0
+                        } else {
+                            (g - mean) * inv_std
+                        };
+                    }
+                } else {
+                    for (v, pos) in col[..tile_n]
+                        .iter_mut()
+                        .zip(iid_positions[tile_start..tile_end].iter())
+                    {
+                        let byte = snp_bytes[pos.byte_idx];
+                        let bits = (byte >> pos.shift) & 0b11;
+                        let g = GENO_LUT_F64[bits as usize];
+                        *v = if g.is_nan() {
+                            0.0
+                        } else {
+                            (g - mean) * inv_std
+                        };
+                    }
+                }
+            }
+
+            // Project: partial[d × c] = P[:, tile_start..tile_end] × b_tile[tile_n × c]
+            matmul_to(
+                mat_slice_mut(partial.as_mut(), 0..d, 0..c),
+                mat_slice(proj.as_ref(), 0..d, tile_start..tile_end),
+                mat_slice(b_tile.as_ref(), 0..tile_n, 0..c),
+                1.0,
+                Accum::Replace,
+                Par::Seq,
+            );
+
+            partial
+        })
+        .reduce(
+            || MatF::zeros(d, c),
+            |mut acc, part| {
+                mat_add_in_place(acc.as_mut(), part.as_ref());
+                acc
+            },
+        );
+
+    // Copy summed result into out
+    mat_copy_from(
+        mat_slice_mut(out.as_mut(), 0..d, 0..c),
+        mat_slice(summed.as_ref(), 0..d, 0..c),
+    );
+
+    // Ratio estimator renorm: rescale each column so ||out[:,j]||² = n
+    for j in 0..c {
+        let col = out.col(j).try_as_col_major().unwrap().as_slice();
+        let mut nrm_sq = 0.0f64;
+        for &v in &col[..d] {
+            nrm_sq += v * v;
+        }
+        if nrm_sq > 0.0 {
+            let scale = (n / nrm_sq).sqrt();
+            let col_mut = out
+                .col_mut(j)
+                .try_as_col_major_mut()
+                .unwrap()
+                .as_slice_mut();
+            for v in &mut col_mut[..d] {
+                *v *= scale;
+            }
+        }
+    }
+}
+
+/// Fused BED-decode-normalize-project (f32 variant).
+/// Same parallel tile strategy as the f64 variant — see `sketch_fused_project_f64`.
+#[allow(clippy::too_many_arguments)]
+fn sketch_fused_project_f32(
+    raw_bytes: &[u8],
+    bytes_per_snp: usize,
+    n_indiv: usize,
+    c: usize,
+    d: usize,
+    proj: &MatF32,
+    n: f64,
+    iid_positions: &[IidPos],
+    all_iids: bool,
+    maf_out: &mut [f64],
+    out: &mut MatF32,
+) {
+    use rayon::prelude::*;
+
+    let byte_lut = build_bed_byte_lut();
+
+    // --- Pass 1: per-SNP statistics from packed bytes ---
+    struct SnpStats {
+        mean: f32,
+        inv_std: f32,
+        maf: f64,
+    }
+    let stats: Vec<SnpStats> = (0..c)
+        .map(|j| {
+            let snp_bytes = &raw_bytes[j * bytes_per_snp..(j + 1) * bytes_per_snp];
+            let (sum, count, sum_sq) =
+                snp_stats_from_bytes(snp_bytes, n_indiv, iid_positions, all_iids, &byte_lut);
+            let mean_f64 = if count > 0 {
+                sum as f64 / count as f64
+            } else {
+                0.0
+            };
+            let freq = (mean_f64 / 2.0).clamp(0.0, 1.0);
+            let maf = freq.min(1.0 - freq);
+            let centered_ss = sum_sq as f64 - count as f64 * mean_f64 * mean_f64;
+            let var = centered_ss / n_indiv as f64;
+            let std = var.sqrt();
+            let inv_std = if std > 0.0 {
+                (1.0 / std) as f32
+            } else {
+                0.0f32
+            };
+            SnpStats {
+                mean: mean_f64 as f32,
+                inv_std,
+                maf,
+            }
+        })
         .collect();
 
-    anyhow::ensure!(
-        !indices.is_empty(),
-        "--keep '{}': none of {} individuals matched the FAM ({} individuals)",
-        keep_path,
-        keep_set.len(),
-        fam_ids.len()
-    );
-    println!(
-        "  --keep: retaining {}/{} individuals",
-        indices.len(),
-        fam_ids.len()
-    );
-    Ok(indices)
-}
-
-/// Window mode for LD score computation.
-#[derive(Debug, Clone, Copy)]
-pub enum WindowMode {
-    /// Window defined by genetic distance in cM.
-    Cm(f64),
-    /// Window defined by physical distance in kb.
-    Kb(f64),
-    /// Window defined by a fixed number of flanking SNPs.
-    Snp(usize),
-}
-
-/// For each SNP, compute the leftmost SNP index within `max_dist`.
-fn get_block_lefts_f64(coords: &[f64], max_dist: f64) -> Vec<usize> {
-    let m = coords.len();
-    let mut block_left = vec![0usize; m];
-    let mut j = 0usize;
-
-    for i in 0..m {
-        while j < m && (coords[i] - coords[j]).abs() > max_dist {
-            j += 1;
-        }
-        block_left[i] = j;
+    for (j, s) in stats.iter().enumerate() {
+        maf_out[j] = s.maf;
     }
 
-    block_left
-}
+    // --- Pass 2: parallel tiled decode + normalize + project ---
+    const TILE: usize = 512;
+    let tile_starts: Vec<usize> = (0..n_indiv).step_by(TILE).collect();
 
-/// Compute block_left per chromosome to avoid cross-chromosome LD windows.
-/// Returns (block_left, any_full_chr_window).
-fn get_block_lefts_by_chr(all_snps: &[BimRecord], mode: WindowMode) -> (Vec<usize>, bool) {
-    let m = all_snps.len();
-    let mut block_left = vec![0usize; m];
-    let mut any_full_chr_window = false;
+    let summed = tile_starts
+        .par_iter()
+        .map(|&tile_start| {
+            let tile_end = (tile_start + TILE).min(n_indiv);
+            let tile_n = tile_end - tile_start;
 
-    let mut start = 0usize;
-    while start < m {
-        let chr = all_snps[start].chr;
-        let mut end = start + 1;
-        while end < m && all_snps[end].chr == chr {
-            end += 1;
-        }
-        let len = end - start;
-        if len == 0 {
-            break;
-        }
+            let mut b_tile = MatF32::zeros(tile_n, c);
+            let mut partial = MatF32::zeros(d, c);
 
-        match mode {
-            WindowMode::Snp(half) => {
-                if half >= len.saturating_sub(1) {
-                    any_full_chr_window = true;
-                }
-                for i in 0..len {
-                    block_left[start + i] = start + i.saturating_sub(half);
+            for j in 0..c {
+                let snp_bytes = &raw_bytes[j * bytes_per_snp..(j + 1) * bytes_per_snp];
+                let mean = stats[j].mean;
+                let inv_std = stats[j].inv_std;
+                let col = b_tile
+                    .col_mut(j)
+                    .try_as_col_major_mut()
+                    .unwrap()
+                    .as_slice_mut();
+                if all_iids {
+                    for (i, v) in col[..tile_n].iter_mut().enumerate() {
+                        let iid = tile_start + i;
+                        let byte = snp_bytes[iid / 4];
+                        let bits = (byte >> ((iid % 4) * 2)) & 0b11;
+                        let g = GENO_LUT_F32[bits as usize];
+                        *v = if g.is_nan() {
+                            0.0
+                        } else {
+                            (g - mean) * inv_std
+                        };
+                    }
+                } else {
+                    for (v, pos) in col[..tile_n]
+                        .iter_mut()
+                        .zip(iid_positions[tile_start..tile_end].iter())
+                    {
+                        let byte = snp_bytes[pos.byte_idx];
+                        let bits = (byte >> pos.shift) & 0b11;
+                        let g = GENO_LUT_F32[bits as usize];
+                        *v = if g.is_nan() {
+                            0.0
+                        } else {
+                            (g - mean) * inv_std
+                        };
+                    }
                 }
             }
-            WindowMode::Cm(max_cm) => {
-                let coords: Vec<f64> = all_snps[start..end].iter().map(|s| s.cm).collect();
-                let local = get_block_lefts_f64(&coords, max_cm);
-                if local.last().copied().unwrap_or(0) == 0 {
-                    any_full_chr_window = true;
-                }
-                for (i, left) in local.into_iter().enumerate() {
-                    block_left[start + i] = start + left;
-                }
-            }
-            WindowMode::Kb(max_kb) => {
-                let coords: Vec<f64> = all_snps[start..end]
-                    .iter()
-                    .map(|s| s.bp as f64 / 1000.0)
-                    .collect();
-                let local = get_block_lefts_f64(&coords, max_kb);
-                if local.last().copied().unwrap_or(0) == 0 {
-                    any_full_chr_window = true;
-                }
-                for (i, left) in local.into_iter().enumerate() {
-                    block_left[start + i] = start + left;
-                }
-            }
-        }
 
-        start = end;
+            faer::linalg::matmul::matmul(
+                mat_slice_mut_f32(partial.as_mut(), 0..d, 0..c),
+                Accum::Replace,
+                mat_slice_f32(proj.as_ref(), 0..d, tile_start..tile_end),
+                mat_slice_f32(b_tile.as_ref(), 0..tile_n, 0..c),
+                1.0f32,
+                Par::Seq,
+            );
+
+            partial
+        })
+        .reduce(
+            || MatF32::zeros(d, c),
+            |mut acc, part| {
+                for j in 0..c {
+                    let acc_col = acc
+                        .col_mut(j)
+                        .try_as_col_major_mut()
+                        .unwrap()
+                        .as_slice_mut();
+                    let part_col = part.col(j).try_as_col_major().unwrap().as_slice();
+                    for (a, &p) in acc_col[..d].iter_mut().zip(part_col[..d].iter()) {
+                        *a += p;
+                    }
+                }
+                acc
+            },
+        );
+
+    // Copy summed result into out
+    for j in 0..c {
+        let out_col = out
+            .col_mut(j)
+            .try_as_col_major_mut()
+            .unwrap()
+            .as_slice_mut();
+        let sum_col = summed.col(j).try_as_col_major().unwrap().as_slice();
+        out_col[..d].copy_from_slice(&sum_col[..d]);
     }
 
-    (block_left, any_full_chr_window)
+    // Ratio estimator renorm
+    for j in 0..c {
+        let col = out.col(j).try_as_col_major().unwrap().as_slice();
+        let mut nrm_sq = 0.0f64;
+        for &v in &col[..d] {
+            nrm_sq += (v as f64) * (v as f64);
+        }
+        if nrm_sq > 0.0 {
+            let scale = (n / nrm_sq).sqrt() as f32;
+            let col_mut = out
+                .col_mut(j)
+                .try_as_col_major_mut()
+                .unwrap()
+                .as_slice_mut();
+            for v in &mut col_mut[..d] {
+                *v *= scale;
+            }
+        }
+    }
 }
 
-/// Normalize genotype column in-place (impute NaN→mean, centre, scale). Returns MAF.
-/// When pre-computed sum/count/sum_sq are available (fused with copy), does center+scale
-/// in a single pass using variance from raw moments: var = E[X²] - E[X]².
-fn normalize_col_f64_with_stats(
-    col: &mut [f64],
-    n: usize,
-    sum: f64,
-    count: usize,
-    sum_sq: f64,
-) -> f64 {
-    let avg = if count > 0 { sum / count as f64 } else { 0.0 };
-    let freq = (avg / 2.0).clamp(0.0, 1.0);
-    let maf = freq.min(1.0 - freq);
+// ── Fused CountSketch: BED-decode-normalize-scatter-add ─────────────────────
+// Avoids materializing the full N×c intermediate matrix AND avoids any GEMM.
+// Pass 1: compute per-SNP stats (mean, inv_std, maf) from packed BED bytes.
+// Pass 2: parallel over columns — decode each genotype, normalize, scatter-add
+//         to the appropriate bucket. O(N×c) total, column-parallel via rayon.
+//
+// Unlike fused Rademacher (which fragments one large GEMM into many tiny tile
+// GEMMs), fused CountSketch has NO GEMM at all — just scatter-adds. The column-
+// parallel pattern gives c-way (c=200) parallelism with no SIMD efficiency loss.
 
-    // Variance from raw moments: Var(X) = E[X²] - E[X]²
-    // After centering, sum of (x-μ)² = Σx² - n*μ² = sum_sq - count*avg²
-    // NaN elements become 0 after imputation, contributing avg² each to centered sum.
-    let centered_sum_sq = sum_sq - count as f64 * avg * avg;
-    // Missing (NaN→0) elements contribute 0² = 0 to centered col, but we used
-    // count*avg² above which only covers non-NaN. The NaN positions are set to 0
-    // (centered mean), so they contribute nothing extra.
-    let var = centered_sum_sq / n as f64;
-    let std = var.sqrt();
-    let inv_std = if std > 0.0 { 1.0 / std } else { 0.0 };
+/// Fused BED-decode-normalize-CountSketch (f32 variant, primary path since sketch auto-enables f32).
+/// Reads raw packed BED bytes, computes per-SNP statistics, then scatter-adds
+/// normalized genotypes into d-bucket sketch vectors — all without materializing
+/// the full N×c genotype matrix.
+///
+/// Parallelized over columns (j=0..c) via rayon. Each column's scatter-add is
+/// independent, giving c-way parallelism (c=chunk_size, typically 200).
+///
+/// On return, `out[0..d, 0..c]` contains the projected+renormalized columns,
+/// and `maf_out[0..c]` contains the per-SNP MAF.
+#[allow(clippy::too_many_arguments)]
+fn countsketch_fused_project_f32(
+    raw_bytes: &[u8],
+    bytes_per_snp: usize,
+    n_indiv: usize,
+    c: usize,
+    cs: &CountSketchProj,
+    n: f64,
+    iid_positions: &[IidPos],
+    all_iids: bool,
+    maf_out: &mut [f64],
+    out: &mut MatF32,
+) {
+    let d = cs.d;
+    let byte_lut = build_bed_byte_lut();
 
-    // Single fused pass: impute NaN, center, and scale
-    if count == col.len() {
-        // Fast path: no NaN — tight branchless loop, auto-vectorizes
-        for v in col.iter_mut() {
-            *v = (*v - avg) * inv_std;
-        }
-    } else {
-        // Slow path: has NaN
-        for v in col.iter_mut() {
-            if v.is_nan() {
-                *v = 0.0;
+    // --- Pass 1: per-SNP statistics from packed bytes ---
+    struct SnpStats {
+        mean: f32,
+        inv_std: f32,
+        maf: f64,
+    }
+    let stats: Vec<SnpStats> = (0..c)
+        .map(|j| {
+            let snp_bytes = &raw_bytes[j * bytes_per_snp..(j + 1) * bytes_per_snp];
+            let (sum, count, sum_sq) =
+                snp_stats_from_bytes(snp_bytes, n_indiv, iid_positions, all_iids, &byte_lut);
+            let mean_f64 = if count > 0 {
+                sum as f64 / count as f64
             } else {
-                *v = (*v - avg) * inv_std;
+                0.0
+            };
+            let freq = (mean_f64 / 2.0).clamp(0.0, 1.0);
+            let maf = freq.min(1.0 - freq);
+            let centered_ss = sum_sq as f64 - count as f64 * mean_f64 * mean_f64;
+            let var = centered_ss / n_indiv as f64;
+            let std = var.sqrt();
+            let inv_std = if std > 0.0 {
+                (1.0 / std) as f32
+            } else {
+                0.0f32
+            };
+            SnpStats {
+                mean: mean_f64 as f32,
+                inv_std,
+                maf,
+            }
+        })
+        .collect();
+
+    for (j, s) in stats.iter().enumerate() {
+        maf_out[j] = s.maf;
+    }
+
+    // --- Pass 2: column-parallel fused decode + normalize + scatter-add ---
+    // Each column j is independent: read BED bytes for SNP j, decode each
+    // individual's genotype, normalize, and scatter-add to out[bucket[i], j].
+    let out_ptr = out.as_mut().as_ptr_mut();
+    let out_col_stride = out.col_stride();
+    let out_send = SendPtr(out_ptr);
+    let bucket = &cs.bucket;
+    let sign = &cs.sign_f32;
+
+    (0..c).into_par_iter().for_each(|j| {
+        let snp_bytes = &raw_bytes[j * bytes_per_snp..(j + 1) * bytes_per_snp];
+        let mean = stats[j].mean;
+        let inv_std = stats[j].inv_std;
+
+        // Safety: each thread writes to a disjoint column of out.
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(
+                out_send.ptr().offset(j as isize * out_col_stride),
+                d,
+            );
+
+            // Zero output column.
+            for v in dst.iter_mut() {
+                *v = 0.0;
+            }
+
+            // Fused decode + normalize + scatter-add
+            if all_iids {
+                for i in 0..n_indiv {
+                    let byte = snp_bytes[i / 4];
+                    let bits = (byte >> ((i % 4) * 2)) & 0b11;
+                    let g = GENO_LUT_F32[bits as usize];
+                    if !g.is_nan() {
+                        let val = (g - mean) * inv_std;
+                        *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
+                            *sign.get_unchecked(i) * val;
+                    }
+                }
+            } else {
+                for (i, pos) in iid_positions.iter().enumerate() {
+                    let byte = snp_bytes[pos.byte_idx];
+                    let bits = (byte >> pos.shift) & 0b11;
+                    let g = GENO_LUT_F32[bits as usize];
+                    if !g.is_nan() {
+                        let val = (g - mean) * inv_std;
+                        *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
+                            *sign.get_unchecked(i) * val;
+                    }
+                }
+            }
+
+            // Ratio estimator renorm: rescale so ||col||^2 = n (accumulate in f64)
+            let mut nrm_sq = 0.0f64;
+            for &v in dst.iter() {
+                nrm_sq += (v as f64) * (v as f64);
+            }
+            if nrm_sq > 0.0 {
+                let scale = (n / nrm_sq).sqrt() as f32;
+                for v in dst.iter_mut() {
+                    *v *= scale;
+                }
             }
         }
-    }
-    maf
+    });
 }
 
-/// f32 variant: normalize in-place using f64 accumulators for precision.
-/// When pre-computed sum/count/sum_sq are available (fused with copy), does center+scale
-/// in a single pass.
-fn normalize_col_f32_with_stats(
-    col: &mut [f32],
-    n: usize,
-    sum: f64,
-    count: usize,
-    sum_sq: f64,
-) -> f32 {
-    let avg = if count > 0 { sum / count as f64 } else { 0.0 };
-    let freq = (avg / 2.0).clamp(0.0, 1.0);
-    let maf = freq.min(1.0 - freq);
+/// Fused BED-decode-normalize-CountSketch (f64 variant).
+/// Same algorithm as the f32 variant — see `countsketch_fused_project_f32`.
+#[allow(clippy::too_many_arguments)]
+fn countsketch_fused_project_f64(
+    raw_bytes: &[u8],
+    bytes_per_snp: usize,
+    n_indiv: usize,
+    c: usize,
+    cs: &CountSketchProj,
+    n: f64,
+    iid_positions: &[IidPos],
+    all_iids: bool,
+    maf_out: &mut [f64],
+    out: &mut MatF,
+) {
+    let d = cs.d;
+    let byte_lut = build_bed_byte_lut();
 
-    // Variance from raw moments: Var(X) = E[X²] - E[X]²
-    let centered_sum_sq = sum_sq - count as f64 * avg * avg;
-    let var = centered_sum_sq / n as f64;
-    let std = var.sqrt();
-    let inv_std_f32 = if std > 0.0 {
-        (1.0 / std) as f32
-    } else {
-        0.0f32
-    };
-    let avg_f32 = avg as f32;
-
-    // Single fused pass: impute NaN, center, and scale
-    if count == col.len() {
-        // Fast path: no NaN — tight branchless loop, auto-vectorizes
-        for v in col.iter_mut() {
-            *v = (*v - avg_f32) * inv_std_f32;
-        }
-    } else {
-        // Slow path: has NaN
-        for v in col.iter_mut() {
-            if v.is_nan() {
-                *v = 0.0;
+    // --- Pass 1: per-SNP statistics from packed bytes ---
+    struct SnpStats {
+        mean: f64,
+        inv_std: f64,
+        maf: f64,
+    }
+    let stats: Vec<SnpStats> = (0..c)
+        .map(|j| {
+            let snp_bytes = &raw_bytes[j * bytes_per_snp..(j + 1) * bytes_per_snp];
+            let (sum, count, sum_sq) =
+                snp_stats_from_bytes(snp_bytes, n_indiv, iid_positions, all_iids, &byte_lut);
+            let mean = if count > 0 {
+                sum as f64 / count as f64
             } else {
-                *v = (*v - avg_f32) * inv_std_f32;
+                0.0
+            };
+            let freq = (mean / 2.0).clamp(0.0, 1.0);
+            let maf = freq.min(1.0 - freq);
+            let centered_ss = sum_sq as f64 - count as f64 * mean * mean;
+            let var = centered_ss / n_indiv as f64;
+            let std = var.sqrt();
+            let inv_std = if std > 0.0 { 1.0 / std } else { 0.0 };
+            SnpStats { mean, inv_std, maf }
+        })
+        .collect();
+
+    for (j, s) in stats.iter().enumerate() {
+        maf_out[j] = s.maf;
+    }
+
+    // --- Pass 2: column-parallel fused decode + normalize + scatter-add ---
+    let out_ptr = out.as_mut().as_ptr_mut();
+    let out_col_stride = out.col_stride();
+    let out_send = SendPtr(out_ptr);
+    let bucket = &cs.bucket;
+    let sign = &cs.sign_f64;
+
+    (0..c).into_par_iter().for_each(|j| {
+        let snp_bytes = &raw_bytes[j * bytes_per_snp..(j + 1) * bytes_per_snp];
+        let mean = stats[j].mean;
+        let inv_std = stats[j].inv_std;
+
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(
+                out_send.ptr().offset(j as isize * out_col_stride),
+                d,
+            );
+
+            for v in dst.iter_mut() {
+                *v = 0.0;
+            }
+
+            if all_iids {
+                for i in 0..n_indiv {
+                    let byte = snp_bytes[i / 4];
+                    let bits = (byte >> ((i % 4) * 2)) & 0b11;
+                    let g = GENO_LUT_F64[bits as usize];
+                    if !g.is_nan() {
+                        let val = (g - mean) * inv_std;
+                        *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
+                            *sign.get_unchecked(i) * val;
+                    }
+                }
+            } else {
+                for (i, pos) in iid_positions.iter().enumerate() {
+                    let byte = snp_bytes[pos.byte_idx];
+                    let bits = (byte >> pos.shift) & 0b11;
+                    let g = GENO_LUT_F64[bits as usize];
+                    if !g.is_nan() {
+                        let val = (g - mean) * inv_std;
+                        *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
+                            *sign.get_unchecked(i) * val;
+                    }
+                }
+            }
+
+            // Ratio estimator renorm
+            let mut nrm_sq = 0.0f64;
+            for &v in dst.iter() {
+                nrm_sq += v * v;
+            }
+            if nrm_sq > 0.0 {
+                let scale = (n / nrm_sq).sqrt();
+                for v in dst.iter_mut() {
+                    *v *= scale;
+                }
             }
         }
-    }
-    maf as f32
+    });
+}
+
+/// Unbiased r² estimator: r² − (1−r²)/(n−2) [Bulik-Sullivan 2015].
+/// Inlined as `r*r * r2u_a + r2u_b` in hot path for constant n.
+#[inline]
+#[allow(dead_code)]
+pub(super) fn r2_unbiased(r: f64, n: usize) -> f64 {
+    let sq = r * r;
+    let denom = if n > 2 { n as f64 - 2.0 } else { n as f64 };
+    sq - (1.0 - sq) / denom
 }
 
 /// Compute LD scores for all SNPs. Returns `(l2, maf)`.
 #[allow(clippy::too_many_arguments, clippy::unnecessary_cast)]
-fn compute_ldscore_global(
+pub(super) fn compute_ldscore_global(
     all_snps: &[BimRecord],
     bed_path: &str,
     n_indiv: usize,
@@ -493,6 +1045,7 @@ fn compute_ldscore_global(
     verbose_timing: bool,
     stochastic: Option<usize>,
     sketch: Option<usize>,
+    sketch_method: &str,
 ) -> Result<(MatF, Vec<f64>)> {
     let m = all_snps.len();
     if m == 0 {
@@ -552,55 +1105,61 @@ fn compute_ldscore_global(
         active_n_inv_sq_r2u_a = n_inv_sq_r2u_a * d_f / dm2;
         active_r2u_b = r2u_b - r2u_a / dm2;
 
-        let inv_sqrt_d = 1.0 / d_f.sqrt();
-        let mut rng_proj = fastrand::Rng::with_seed(42);
-
-        if use_f32 {
-            let mut p = MatF32::zeros(d, n_indiv);
-            for col in 0..n_indiv {
-                let sl = p
-                    .col_mut(col)
-                    .try_as_col_major_mut()
-                    .unwrap()
-                    .as_slice_mut();
-                for chunk in sl[..d].chunks_mut(64) {
-                    let bits = rng_proj.u64(..);
-                    for (j, v) in chunk.iter_mut().enumerate() {
-                        *v = if (bits >> j) & 1 == 0 {
-                            inv_sqrt_d as f32
-                        } else {
-                            -(inv_sqrt_d as f32)
-                        };
-                    }
-                }
-            }
-            proj_f32 = Some(p);
+        // Only allocate the dense Rademacher P matrix when actually needed.
+        // CountSketch uses hash arrays instead; fused path uses P at projection time.
+        if sketch_method == "countsketch" {
             proj_f64 = None;
+            proj_f32 = None;
         } else {
-            let mut p = MatF::zeros(d, n_indiv);
-            for col in 0..n_indiv {
-                let sl = p
-                    .col_mut(col)
-                    .try_as_col_major_mut()
-                    .unwrap()
-                    .as_slice_mut();
-                for chunk in sl[..d].chunks_mut(64) {
-                    let bits = rng_proj.u64(..);
-                    for (j, v) in chunk.iter_mut().enumerate() {
-                        *v = if (bits >> j) & 1 == 0 {
-                            inv_sqrt_d
-                        } else {
-                            -inv_sqrt_d
-                        };
+            let inv_sqrt_d = 1.0 / d_f.sqrt();
+            let mut rng_proj = fastrand::Rng::with_seed(42);
+            if use_f32 {
+                let mut p = MatF32::zeros(d, n_indiv);
+                for col in 0..n_indiv {
+                    let sl = p
+                        .col_mut(col)
+                        .try_as_col_major_mut()
+                        .unwrap()
+                        .as_slice_mut();
+                    for chunk in sl[..d].chunks_mut(64) {
+                        let bits = rng_proj.u64(..);
+                        for (j, v) in chunk.iter_mut().enumerate() {
+                            *v = if (bits >> j) & 1 == 0 {
+                                inv_sqrt_d as f32
+                            } else {
+                                -(inv_sqrt_d as f32)
+                            };
+                        }
                     }
                 }
+                proj_f32 = Some(p);
+                proj_f64 = None;
+            } else {
+                let mut p = MatF::zeros(d, n_indiv);
+                for col in 0..n_indiv {
+                    let sl = p
+                        .col_mut(col)
+                        .try_as_col_major_mut()
+                        .unwrap()
+                        .as_slice_mut();
+                    for chunk in sl[..d].chunks_mut(64) {
+                        let bits = rng_proj.u64(..);
+                        for (j, v) in chunk.iter_mut().enumerate() {
+                            *v = if (bits >> j) & 1 == 0 {
+                                inv_sqrt_d
+                            } else {
+                                -inv_sqrt_d
+                            };
+                        }
+                    }
+                }
+                proj_f64 = Some(p);
+                proj_f32 = None;
             }
-            proj_f64 = Some(p);
-            proj_f32 = None;
         }
         println!(
-            "Sketch mode: projecting N={} → d={} (bias-corrected)",
-            n_indiv, d
+            "Sketch mode: projecting N={} → d={} (bias-corrected, method={})",
+            n_indiv, d, sketch_method
         );
     } else {
         gemm_n = n_indiv;
@@ -609,6 +1168,27 @@ fn compute_ldscore_global(
         proj_f64 = None;
         proj_f32 = None;
     }
+
+    // CountSketch projection (allocated only when sketch_method == "countsketch").
+    // Uses seed 42, same as Rademacher (only one is active at a time).
+    let count_sketch: Option<CountSketchProj> = sketch_dim.and_then(|d| {
+        if sketch_method == "countsketch" {
+            Some(CountSketchProj::new(n_indiv, d, 42))
+        } else {
+            None
+        }
+    });
+
+    // Fused BED-decode-normalize-project for Rademacher: DISABLED.
+    // The tiled approach (512-individual tiles with Par::Seq GEMMs + rayon across tiles)
+    // saves ~40MB (N×c buffer) but is 2.2× slower than the non-fused path at biobank scale
+    // (285s vs 130s). The non-fused path uses a single large P×B GEMM with Par::rayon(0),
+    // which is far more efficient due to faer's SIMD panel scheduling.
+    //
+    // Fused CountSketch: ENABLED. CountSketch is a scatter-add (not a GEMM), so the
+    // tile-fragmentation problem doesn't apply. Column-parallel (c-way) scatter-add
+    // gives good parallelism without any GEMM overhead.
+    let use_fused_sketch = sketch_dim.is_some() && sketch_method == "countsketch";
 
     let mut maf_per_snp = vec![0.0f64; m];
 
@@ -729,14 +1309,16 @@ fn compute_ldscore_global(
     };
 
     // Sketch: temporary full-size buffer for normalization before projection.
-    // When sketching, BED data is normalized into b_full (n_indiv × chunk_c),
-    // then projected: b_mat (d × chunk_c) = P × b_full.
-    let mut b_full_f64: MatF = if sketch_dim.is_some() && !use_f32 {
+    // Fused CountSketch bypasses b_full for contiguous chunks, but non-contiguous
+    // chunks (--extract with gaps) fall back to the standard decode+project path
+    // which requires b_full. Allocate b_full whenever sketch is active.
+    let need_b_full = sketch_dim.is_some();
+    let mut b_full_f64: MatF = if need_b_full && !use_f32 {
         MatF::zeros(n_indiv, chunk_c)
     } else {
         MatF::zeros(0, 0)
     };
-    let mut b_full_f32: MatF32 = if sketch_dim.is_some() && use_f32 {
+    let mut b_full_f32: MatF32 = if need_b_full && use_f32 {
         MatF32::zeros(n_indiv, chunk_c)
     } else {
         MatF32::zeros(0, 0)
@@ -910,224 +1492,353 @@ fn compute_ldscore_global(
         }
 
         let t0 = Instant::now();
-        // Use a reference to avoid moving the owned Mat from prefetch path
-        let prefetch_raw: MatF32;
-        let raw_ref: &MatF32 = if let Some(ref rx) = prefetch_rx {
-            // Prefetch path: receive pre-read chunk from reader thread.
-            let (cs, ce, r) = rx.recv().context("prefetch reader closed early")??;
-            debug_assert_eq!(cs, chunk_start);
-            debug_assert_eq!(ce, chunk_end);
-            prefetch_raw = r;
-            &prefetch_raw
-        } else if all_bed_sequential {
-            // Fast path: sequential BED — no seek, BufReader stays warm.
-            let bed = seq_bed.as_mut().unwrap();
-            let cr = chunk_reader.as_mut().unwrap();
-            cr.read_next(bed, c)
-                .with_context(|| format!("reading BED chunk [{},{})", chunk_start, chunk_end))?
-        } else {
-            // Per-chunk contiguous check (--extract with some contiguous ranges)
+        // When using the fused sketch path (sequential reader + CountSketch), read raw bytes
+        // and skip b_full materialization. Otherwise use the existing decoded-Mat path.
+        let sketching = sketch_dim.is_some();
+        // Determine if this chunk qualifies for the fused path.
+        // Fused requires: (a) sequential mode OR contiguous chunk, (b) not prefetch.
+        let chunk_is_contiguous = if !prefetch_bed && !all_bed_sequential {
             let start_bed_idx = all_snps[chunk_start].bed_idx;
-            let is_bed_contiguous = all_snps[chunk_end - 1].bed_idx == start_bed_idx + c - 1;
-            if is_bed_contiguous {
-                let bed = seq_bed.as_mut().unwrap();
-                let cr = chunk_reader.as_mut().unwrap();
-                cr.read_contiguous(bed, start_bed_idx, c)
-                    .with_context(|| format!("reading BED chunk [{},{})", chunk_start, chunk_end))?
-            } else {
-                // Fallback: non-contiguous BED indices (--extract with gaps)
-                let bed_indices: Vec<isize> = all_snps[chunk_start..chunk_end]
-                    .iter()
-                    .map(|s| s.bed_idx as isize)
-                    .collect();
-                let bed = seq_bed.as_mut().unwrap();
-                let mut ro = ReadOptions::builder();
-                let mut builder = ro.sid_index(&bed_indices).f32();
-                let result = if let Some(iids) = iid_indices {
-                    builder.iid_index(iids).read(bed)
-                } else {
-                    builder.read(bed)
-                };
-                prefetch_raw = result.with_context(|| {
+            all_snps[chunk_end - 1].bed_idx == start_bed_idx + c - 1
+        } else {
+            all_bed_sequential
+        };
+        let do_fused = use_fused_sketch && chunk_is_contiguous;
+
+        if do_fused {
+            // ── Fused path: read raw bytes, fuse decode+normalize+project ──────────
+            let cr = chunk_reader.as_mut().unwrap();
+            let bed = seq_bed.as_mut().unwrap();
+            if all_bed_sequential {
+                cr.read_next_raw_only(bed, c).with_context(|| {
                     format!("reading BED chunk [{},{})", chunk_start, chunk_end)
                 })?;
-                &prefetch_raw
+            } else {
+                let start_bed_idx = all_snps[chunk_start].bed_idx;
+                cr.read_contiguous_raw_only(bed, start_bed_idx, c)
+                    .with_context(|| {
+                        format!("reading BED chunk [{},{})", chunk_start, chunk_end)
+                    })?;
             }
-        };
-        t_bed_read += t0.elapsed();
+            t_bed_read += t0.elapsed();
 
-        let t0 = Instant::now();
-        // When sketching, normalize into b_full (n_indiv rows), then project into b_mat (d rows).
-        // When not sketching, normalize directly into b_mat (n_indiv rows).
-        let sketching = sketch_dim.is_some();
-        for j in 0..c {
-            // Get raw column as contiguous slice (1 bounds check vs 2 per element)
-            let raw_col = raw_ref.col(j).try_as_col_major().unwrap().as_slice();
-            match bufs {
-                GemmBufs::F32 { ref mut b_mat, .. } => {
-                    let col = if sketching {
-                        b_full_f32
-                            .col_mut(j)
-                            .try_as_col_major_mut()
-                            .unwrap()
-                            .as_slice_mut()
-                    } else {
-                        b_mat
-                            .col_mut(j)
-                            .try_as_col_major_mut()
-                            .unwrap()
-                            .as_slice_mut()
-                    };
-                    col[..n_indiv].copy_from_slice(&raw_col[..n_indiv]);
-                    // SAFETY: we build with +avx2,+fma for the musl target;
-                    // native builds have AVX2 on any modern x86_64 CPU.
-                    let (sum, sum_sq) = unsafe { sum_sumsq_f32(&raw_col[..n_indiv]) };
-                    // NaN propagates: if any element was NaN, sum is NaN
-                    let (sum, count, sum_sq) = if sum.is_nan() {
-                        // Rare slow path: recompute excluding NaN
-                        let mut s = 0f64;
-                        let mut sq = 0f64;
-                        let mut c = 0usize;
-                        for &v in col.iter() {
-                            if !v.is_nan() {
-                                let vf = v as f64;
-                                s += vf;
-                                sq += vf * vf;
-                                c += 1;
-                            }
-                        }
-                        (s, c, sq)
-                    } else {
-                        (sum, n_indiv, sum_sq)
-                    };
-                    let snp_maf = normalize_col_f32_with_stats(col, n_indiv, sum, count, sum_sq);
-                    maf_per_snp[chunk_start + j] = snp_maf as f64;
-                    if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
-                        let maf_f64 = snp_maf as f64;
-                        let pq = (maf_f64 * (1.0 - maf_f64)).powf(exp);
-                        pq_vec[chunk_start + j] = pq;
-                    }
-                }
-                GemmBufs::F64 { ref mut b_mat, .. } => {
-                    let col = if sketching {
-                        b_full_f64
-                            .col_mut(j)
-                            .try_as_col_major_mut()
-                            .unwrap()
-                            .as_slice_mut()
-                    } else {
-                        b_mat
-                            .col_mut(j)
-                            .try_as_col_major_mut()
-                            .unwrap()
-                            .as_slice_mut()
-                    };
-                    // SAFETY: see above.
-                    let (sum, sum_sq) = unsafe { sum_sumsq_f32(&raw_col[..n_indiv]) };
-                    // Widening copy (f32 → f64) — vectorizes to vcvtps2pd + vmovupd
-                    for (dst, &src) in col[..n_indiv].iter_mut().zip(raw_col[..n_indiv].iter()) {
-                        *dst = src as f64;
-                    }
-                    // NaN propagates: if any element was NaN, sum is NaN
-                    let (sum, count, sum_sq) = if sum.is_nan() {
-                        // Rare slow path: recompute excluding NaN
-                        let mut s = 0f64;
-                        let mut sq = 0f64;
-                        let mut c = 0usize;
-                        for &v in col.iter() {
-                            if !v.is_nan() {
-                                s += v;
-                                sq += v * v;
-                                c += 1;
-                            }
-                        }
-                        (s, c, sq)
-                    } else {
-                        (sum, n_indiv, sum_sq)
-                    };
-                    let snp_maf = normalize_col_f64_with_stats(col, n_indiv, sum, count, sum_sq);
-                    maf_per_snp[chunk_start + j] = snp_maf;
-                    if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
-                        let pq = (snp_maf * (1.0 - snp_maf)).powf(exp);
-                        pq_vec[chunk_start + j] = pq;
-                    }
-                }
-            }
-        }
-
-        t_norm += t0.elapsed();
-
-        // Sketch projection: b_mat (d × c) = P (d × N) × b_full (N × c)
-        if sketching {
             let t0 = Instant::now();
-            match bufs {
-                GemmBufs::F32 { ref mut b_mat, .. } => {
-                    let p = proj_f32.as_ref().unwrap();
-                    let d = sketch_dim.unwrap();
-                    faer::linalg::matmul::matmul(
-                        mat_slice_mut_f32(b_mat.as_mut(), 0..d, 0..c),
-                        Accum::Replace,
-                        mat_slice_f32(p.as_ref(), 0..d, 0..n_indiv),
-                        mat_slice_f32(b_full_f32.as_ref(), 0..n_indiv, 0..c),
-                        1.0f32,
-                        Par::rayon(0),
-                    );
-                    // Re-normalize: ||x̃'_j||² = N (ratio estimator).
-                    // Reduces per-pair variance by cancelling correlated noise
-                    // in the numerator (dot product) and denominator (norms).
-                    for j in 0..c {
-                        let col = b_mat.col(j).try_as_col_major().unwrap().as_slice();
-                        let mut nrm_sq = 0.0f64;
-                        for &v in &col[..d] {
-                            nrm_sq += (v as f64) * (v as f64);
-                        }
-                        if nrm_sq > 0.0 {
-                            let scale = ((n / nrm_sq).sqrt()) as f32;
-                            let col_mut = b_mat
-                                .col_mut(j)
-                                .try_as_col_major_mut()
-                                .unwrap()
-                                .as_slice_mut();
-                            for v in &mut col_mut[..d] {
-                                *v *= scale;
-                            }
-                        }
+            let bps = cr.bytes_per_snp_val();
+            let raw = cr.raw_bytes()[..c * bps].to_vec(); // copy to avoid borrow conflict
+            let n_i = cr.n_iid();
+            let ipos = cr.iid_positions_ref().to_vec();
+            let ai = cr.all_iids_flag();
+            if let Some(ref cs) = count_sketch {
+                // Fused CountSketch: decode + normalize + scatter-add (no GEMM)
+                match bufs {
+                    GemmBufs::F32 { ref mut b_mat, .. } => {
+                        countsketch_fused_project_f32(
+                            &raw,
+                            bps,
+                            n_i,
+                            c,
+                            cs,
+                            n,
+                            &ipos,
+                            ai,
+                            &mut maf_per_snp[chunk_start..chunk_start + c],
+                            b_mat,
+                        );
+                    }
+                    GemmBufs::F64 { ref mut b_mat, .. } => {
+                        countsketch_fused_project_f64(
+                            &raw,
+                            bps,
+                            n_i,
+                            c,
+                            cs,
+                            n,
+                            &ipos,
+                            ai,
+                            &mut maf_per_snp[chunk_start..chunk_start + c],
+                            b_mat,
+                        );
                     }
                 }
-                GemmBufs::F64 { ref mut b_mat, .. } => {
-                    let p = proj_f64.as_ref().unwrap();
-                    let d = sketch_dim.unwrap();
-                    matmul_to(
-                        mat_slice_mut(b_mat.as_mut(), 0..d, 0..c),
-                        mat_slice(p.as_ref(), 0..d, 0..n_indiv),
-                        mat_slice(b_full_f64.as_ref(), 0..n_indiv, 0..c),
-                        1.0,
-                        Accum::Replace,
-                        Par::rayon(0),
-                    );
-                    // Re-normalize: ||x̃'_j||² = N (ratio estimator)
-                    for j in 0..c {
-                        let col = b_mat.col(j).try_as_col_major().unwrap().as_slice();
-                        let mut nrm_sq = 0.0f64;
-                        for &v in &col[..d] {
-                            nrm_sq += v * v;
-                        }
-                        if nrm_sq > 0.0 {
-                            let scale = (n / nrm_sq).sqrt();
-                            let col_mut = b_mat
-                                .col_mut(j)
-                                .try_as_col_major_mut()
-                                .unwrap()
-                                .as_slice_mut();
-                            for v in &mut col_mut[..d] {
-                                *v *= scale;
-                            }
-                        }
+            } else {
+                // Fused Rademacher (currently disabled via use_fused_sketch)
+                let d = sketch_dim.unwrap();
+                match bufs {
+                    GemmBufs::F32 { ref mut b_mat, .. } => {
+                        sketch_fused_project_f32(
+                            &raw,
+                            bps,
+                            n_i,
+                            c,
+                            d,
+                            proj_f32.as_ref().unwrap(),
+                            n,
+                            &ipos,
+                            ai,
+                            &mut maf_per_snp[chunk_start..chunk_start + c],
+                            b_mat,
+                        );
                     }
+                    GemmBufs::F64 { ref mut b_mat, .. } => {
+                        sketch_fused_project_f64(
+                            &raw,
+                            bps,
+                            n_i,
+                            c,
+                            d,
+                            proj_f64.as_ref().unwrap(),
+                            n,
+                            &ipos,
+                            ai,
+                            &mut maf_per_snp[chunk_start..chunk_start + c],
+                            b_mat,
+                        );
+                    }
+                }
+            }
+            // pq_exp: derive from the MAF we just computed
+            if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
+                for j in 0..c {
+                    let maf = maf_per_snp[chunk_start + j];
+                    pq_vec[chunk_start + j] = (maf * (1.0 - maf)).powf(exp);
                 }
             }
             t_sketch += t0.elapsed();
-        }
+        } else {
+            // ── Standard path: read decoded Mat<f32>, normalize, then project ────────
+            // Use a reference to avoid moving the owned Mat from prefetch path
+            let prefetch_raw: MatF32;
+            let raw_ref: &MatF32 = if let Some(ref rx) = prefetch_rx {
+                // Prefetch path: receive pre-read chunk from reader thread.
+                let (cs, ce, r) = rx.recv().context("prefetch reader closed early")??;
+                debug_assert_eq!(cs, chunk_start);
+                debug_assert_eq!(ce, chunk_end);
+                prefetch_raw = r;
+                &prefetch_raw
+            } else if all_bed_sequential {
+                // Fast path: sequential BED — no seek, BufReader stays warm.
+                let bed = seq_bed.as_mut().unwrap();
+                let cr = chunk_reader.as_mut().unwrap();
+                cr.read_next(bed, c)
+                    .with_context(|| format!("reading BED chunk [{},{})", chunk_start, chunk_end))?
+            } else {
+                // Per-chunk contiguous check (--extract with some contiguous ranges)
+                let start_bed_idx = all_snps[chunk_start].bed_idx;
+                let is_bed_contiguous = all_snps[chunk_end - 1].bed_idx == start_bed_idx + c - 1;
+                if is_bed_contiguous {
+                    let bed = seq_bed.as_mut().unwrap();
+                    let cr = chunk_reader.as_mut().unwrap();
+                    cr.read_contiguous(bed, start_bed_idx, c).with_context(|| {
+                        format!("reading BED chunk [{},{})", chunk_start, chunk_end)
+                    })?
+                } else {
+                    // Fallback: non-contiguous BED indices (--extract with gaps)
+                    let bed_indices: Vec<isize> = all_snps[chunk_start..chunk_end]
+                        .iter()
+                        .map(|s| s.bed_idx as isize)
+                        .collect();
+                    let bed = seq_bed.as_mut().unwrap();
+                    let mut ro = ReadOptions::builder();
+                    let mut builder = ro.sid_index(&bed_indices).f32();
+                    let result = if let Some(iids) = iid_indices {
+                        builder.iid_index(iids).read(bed)
+                    } else {
+                        builder.read(bed)
+                    };
+                    prefetch_raw = result.with_context(|| {
+                        format!("reading BED chunk [{},{})", chunk_start, chunk_end)
+                    })?;
+                    &prefetch_raw
+                }
+            };
+            t_bed_read += t0.elapsed();
+
+            let t0 = Instant::now();
+            // When sketching, normalize into b_full (n_indiv rows), then project into b_mat (d rows).
+            // When not sketching, normalize directly into b_mat (n_indiv rows).
+            for j in 0..c {
+                // Get raw column as contiguous slice (1 bounds check vs 2 per element)
+                let raw_col = raw_ref.col(j).try_as_col_major().unwrap().as_slice();
+                match bufs {
+                    GemmBufs::F32 { ref mut b_mat, .. } => {
+                        let col = if sketching {
+                            b_full_f32
+                                .col_mut(j)
+                                .try_as_col_major_mut()
+                                .unwrap()
+                                .as_slice_mut()
+                        } else {
+                            b_mat
+                                .col_mut(j)
+                                .try_as_col_major_mut()
+                                .unwrap()
+                                .as_slice_mut()
+                        };
+                        col[..n_indiv].copy_from_slice(&raw_col[..n_indiv]);
+                        // SAFETY: we build with +avx2,+fma for the musl target;
+                        // native builds have AVX2 on any modern x86_64 CPU.
+                        let (sum, sum_sq) = unsafe { sum_sumsq_f32(&raw_col[..n_indiv]) };
+                        // NaN propagates: if any element was NaN, sum is NaN
+                        let (sum, count, sum_sq) = if sum.is_nan() {
+                            // Rare slow path: recompute excluding NaN
+                            let mut s = 0f64;
+                            let mut sq = 0f64;
+                            let mut c = 0usize;
+                            for &v in col.iter() {
+                                if !v.is_nan() {
+                                    let vf = v as f64;
+                                    s += vf;
+                                    sq += vf * vf;
+                                    c += 1;
+                                }
+                            }
+                            (s, c, sq)
+                        } else {
+                            (sum, n_indiv, sum_sq)
+                        };
+                        let snp_maf =
+                            normalize_col_f32_with_stats(col, n_indiv, sum, count, sum_sq);
+                        maf_per_snp[chunk_start + j] = snp_maf as f64;
+                        if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
+                            let maf_f64 = snp_maf as f64;
+                            let pq = (maf_f64 * (1.0 - maf_f64)).powf(exp);
+                            pq_vec[chunk_start + j] = pq;
+                        }
+                    }
+                    GemmBufs::F64 { ref mut b_mat, .. } => {
+                        let col = if sketching {
+                            b_full_f64
+                                .col_mut(j)
+                                .try_as_col_major_mut()
+                                .unwrap()
+                                .as_slice_mut()
+                        } else {
+                            b_mat
+                                .col_mut(j)
+                                .try_as_col_major_mut()
+                                .unwrap()
+                                .as_slice_mut()
+                        };
+                        // SAFETY: see above.
+                        let (sum, sum_sq) = unsafe { sum_sumsq_f32(&raw_col[..n_indiv]) };
+                        // Widening copy (f32 → f64) — vectorizes to vcvtps2pd + vmovupd
+                        for (dst, &src) in col[..n_indiv].iter_mut().zip(raw_col[..n_indiv].iter())
+                        {
+                            *dst = src as f64;
+                        }
+                        // NaN propagates: if any element was NaN, sum is NaN
+                        let (sum, count, sum_sq) = if sum.is_nan() {
+                            // Rare slow path: recompute excluding NaN
+                            let mut s = 0f64;
+                            let mut sq = 0f64;
+                            let mut c = 0usize;
+                            for &v in col.iter() {
+                                if !v.is_nan() {
+                                    s += v;
+                                    sq += v * v;
+                                    c += 1;
+                                }
+                            }
+                            (s, c, sq)
+                        } else {
+                            (sum, n_indiv, sum_sq)
+                        };
+                        let snp_maf =
+                            normalize_col_f64_with_stats(col, n_indiv, sum, count, sum_sq);
+                        maf_per_snp[chunk_start + j] = snp_maf;
+                        if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
+                            let pq = (snp_maf * (1.0 - snp_maf)).powf(exp);
+                            pq_vec[chunk_start + j] = pq;
+                        }
+                    }
+                }
+            }
+
+            t_norm += t0.elapsed();
+
+            // Sketch projection: b_mat (d × c) = proj(b_full)
+            // Dispatches to CountSketch (O(N) scatter-add) or Rademacher dense GEMM.
+            if sketching {
+                let t0 = Instant::now();
+                let d = sketch_dim.unwrap();
+                if let Some(ref cs) = count_sketch {
+                    // CountSketch: O(N×c) scatter-add, includes ratio renorm.
+                    match bufs {
+                        GemmBufs::F32 { ref mut b_mat, .. } => {
+                            cs.project_f32(&b_full_f32, n_indiv, c, n, b_mat);
+                        }
+                        GemmBufs::F64 { ref mut b_mat, .. } => {
+                            cs.project_f64(&b_full_f64, n_indiv, c, n, b_mat);
+                        }
+                    }
+                } else {
+                    // Rademacher: dense GEMM + ratio renorm.
+                    match bufs {
+                        GemmBufs::F32 { ref mut b_mat, .. } => {
+                            let p = proj_f32.as_ref().unwrap();
+                            faer::linalg::matmul::matmul(
+                                mat_slice_mut_f32(b_mat.as_mut(), 0..d, 0..c),
+                                Accum::Replace,
+                                mat_slice_f32(p.as_ref(), 0..d, 0..n_indiv),
+                                mat_slice_f32(b_full_f32.as_ref(), 0..n_indiv, 0..c),
+                                1.0f32,
+                                Par::rayon(0),
+                            );
+                            // Re-normalize: ||x̃'_j||² = N (ratio estimator).
+                            for j in 0..c {
+                                let col = b_mat.col(j).try_as_col_major().unwrap().as_slice();
+                                let mut nrm_sq = 0.0f64;
+                                for &v in &col[..d] {
+                                    nrm_sq += (v as f64) * (v as f64);
+                                }
+                                if nrm_sq > 0.0 {
+                                    let scale = ((n / nrm_sq).sqrt()) as f32;
+                                    let col_mut = b_mat
+                                        .col_mut(j)
+                                        .try_as_col_major_mut()
+                                        .unwrap()
+                                        .as_slice_mut();
+                                    for v in &mut col_mut[..d] {
+                                        *v *= scale;
+                                    }
+                                }
+                            }
+                        }
+                        GemmBufs::F64 { ref mut b_mat, .. } => {
+                            let p = proj_f64.as_ref().unwrap();
+                            matmul_to(
+                                mat_slice_mut(b_mat.as_mut(), 0..d, 0..c),
+                                mat_slice(p.as_ref(), 0..d, 0..n_indiv),
+                                mat_slice(b_full_f64.as_ref(), 0..n_indiv, 0..c),
+                                1.0,
+                                Accum::Replace,
+                                Par::rayon(0),
+                            );
+                            // Re-normalize: ||x̃'_j||² = N (ratio estimator)
+                            for j in 0..c {
+                                let col = b_mat.col(j).try_as_col_major().unwrap().as_slice();
+                                let mut nrm_sq = 0.0f64;
+                                for &v in &col[..d] {
+                                    nrm_sq += v * v;
+                                }
+                                if nrm_sq > 0.0 {
+                                    let scale = (n / nrm_sq).sqrt();
+                                    let col_mut = b_mat
+                                        .col_mut(j)
+                                        .try_as_col_major_mut()
+                                        .unwrap()
+                                        .as_slice_mut();
+                                    for v in &mut col_mut[..d] {
+                                        *v *= scale;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                t_sketch += t0.elapsed();
+            }
+        } // end standard path else (do_fused was false)
 
         let annot_chunk = mat_slice(annot.as_ref(), chunk_start..chunk_end, 0..n_annot);
         let (annot_chunk_eff, chunk_all_zero) = if let Some(ref pq_vec) = pq_per_snp {
@@ -2122,871 +2833,4 @@ fn compute_ldscore_global(
     }
 
     Ok((l2, maf_per_snp))
-}
-
-fn compute_snp_stats(
-    all_snps: &[BimRecord],
-    bed: &mut Bed,
-    n_indiv: usize,
-    chunk_c: usize,
-    iid_indices: Option<&[isize]>,
-) -> Result<(Vec<f64>, Vec<bool>)> {
-    let m = all_snps.len();
-    if m == 0 {
-        return Ok((vec![], vec![]));
-    }
-
-    #[derive(Clone, Copy)]
-    struct ByteStats {
-        sum: u8,
-        count: u8,
-        het: u8,
-    }
-
-    let lut: [ByteStats; 256] = std::array::from_fn(|b| {
-        let byte = b as u8;
-        let mut sum = 0u8;
-        let mut count = 0u8;
-        let mut het = 0u8;
-        for k in 0..4 {
-            let bits = (byte >> (2 * k)) & 0b11;
-            match bits {
-                0 => {
-                    sum += 2;
-                    count += 1;
-                }
-                1 => {}
-                2 => {
-                    sum += 1;
-                    count += 1;
-                    het += 1;
-                }
-                3 => {
-                    count += 1;
-                }
-                _ => {}
-            }
-        }
-        ByteStats { sum, count, het }
-    });
-
-    let bed_indices: Vec<usize> = all_snps.iter().map(|s| s.bed_idx).collect();
-    let keep_iids: Option<Vec<usize>> =
-        iid_indices.map(|idxs| idxs.iter().map(|&i| i as usize).collect());
-    let keep_locs: Option<Vec<(usize, u8)>> = keep_iids.as_ref().map(|idxs| {
-        idxs.iter()
-            .map(|&iid| (iid / 4, ((iid % 4) * 2) as u8))
-            .collect()
-    });
-    if let Some(ref idxs) = keep_iids {
-        debug_assert_eq!(idxs.len(), n_indiv);
-    }
-
-    let mut maf_per_snp = vec![0.0f64; m];
-    let mut het_miss_ok = vec![true; m];
-
-    let full_bytes = n_indiv / 4;
-    let rem = n_indiv % 4;
-    let bytes_per_snp = bed.bytes_per_snp();
-    let mut buf = vec![0u8; bytes_per_snp];
-    let mut block_buf: Vec<u8> = Vec::new();
-    let chunk_c = chunk_c.max(1);
-
-    let compute_stats = |bytes: &[u8],
-                         keep_locs: Option<&Vec<(usize, u8)>>,
-                         lut: &[ByteStats; 256],
-                         full_bytes: usize,
-                         rem: usize|
-     -> (u32, u32, u32) {
-        let mut sum = 0u32;
-        let mut count = 0u32;
-        let mut het = 0u32;
-        if let Some(locs) = keep_locs {
-            for &(byte_idx, shift) in locs {
-                let bits = (bytes[byte_idx] >> shift) & 0b11;
-                match bits {
-                    0 => {
-                        sum += 2;
-                        count += 1;
-                    }
-                    1 => {}
-                    2 => {
-                        sum += 1;
-                        count += 1;
-                        het += 1;
-                    }
-                    3 => {
-                        count += 1;
-                    }
-                    _ => {}
-                }
-            }
-        } else {
-            for &byte in &bytes[..full_bytes] {
-                let stats = lut[byte as usize];
-                sum += stats.sum as u32;
-                count += stats.count as u32;
-                het += stats.het as u32;
-            }
-            if rem > 0 {
-                let byte = bytes[full_bytes];
-                for k in 0..rem {
-                    let bits = (byte >> (2 * k)) & 0b11;
-                    match bits {
-                        0 => {
-                            sum += 2;
-                            count += 1;
-                        }
-                        1 => {}
-                        2 => {
-                            sum += 1;
-                            count += 1;
-                            het += 1;
-                        }
-                        3 => {
-                            count += 1;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        (sum, count, het)
-    };
-
-    for chunk_start in (0..m).step_by(chunk_c) {
-        let chunk_end = (chunk_start + chunk_c).min(m);
-        let c = chunk_end - chunk_start;
-        if c == 0 {
-            continue;
-        }
-
-        let chunk_bed = &bed_indices[chunk_start..chunk_end];
-        let contiguous = chunk_bed
-            .iter()
-            .enumerate()
-            .skip(1)
-            .all(|(i, &v)| v == chunk_bed[0] + i);
-
-        if contiguous {
-            let start_sid = chunk_bed[0];
-            let total_bytes = c * bytes_per_snp;
-            block_buf.resize(total_bytes, 0u8);
-            bed.read_snp_block(start_sid, c, &mut block_buf)
-                .with_context(|| format!("reading BED block [{},{})", chunk_start, chunk_end))?;
-            for j in 0..c {
-                let start = j * bytes_per_snp;
-                let end = start + bytes_per_snp;
-                let bytes = &block_buf[start..end];
-                let (sum, count, het) =
-                    compute_stats(bytes, keep_locs.as_ref(), &lut, full_bytes, rem);
-                let count_usize = count as usize;
-                let missing = n_indiv.saturating_sub(count_usize);
-                let het_miss = het as usize + missing;
-                let freq = if count > 0 {
-                    sum as f64 / (2.0 * count as f64)
-                } else {
-                    0.0
-                };
-                let maf = freq.min(1.0 - freq);
-                maf_per_snp[chunk_start + j] = maf;
-                het_miss_ok[chunk_start + j] = het_miss < n_indiv;
-            }
-        } else {
-            for (j, &sid) in chunk_bed.iter().enumerate() {
-                bed.read_snp_bytes(sid, &mut buf)
-                    .with_context(|| format!("reading BED SNP {}", sid))?;
-                let (sum, count, het) =
-                    compute_stats(&buf, keep_locs.as_ref(), &lut, full_bytes, rem);
-                let count_usize = count as usize;
-                let missing = n_indiv.saturating_sub(count_usize);
-                let het_miss = het as usize + missing;
-                let freq = if count > 0 {
-                    sum as f64 / (2.0 * count as f64)
-                } else {
-                    0.0
-                };
-                let maf = freq.min(1.0 - freq);
-                maf_per_snp[chunk_start + j] = maf;
-                het_miss_ok[chunk_start + j] = het_miss < n_indiv;
-            }
-        }
-    }
-
-    Ok((maf_per_snp, het_miss_ok))
-}
-
-/// Unbiased r² estimator: r² − (1−r²)/(n−2) [Bulik-Sullivan 2015].
-/// Inlined as `r*r * r2u_a + r2u_b` in hot path for constant n.
-#[inline]
-#[allow(dead_code)]
-fn r2_unbiased(r: f64, n: usize) -> f64 {
-    let sq = r * r;
-    let denom = if n > 2 { n as f64 - 2.0 } else { n as f64 };
-    sq - (1.0 - sq) / denom
-}
-
-/// Write per-SNP LD scores to a gzip TSV.  `col_names` is `["L2"]` or `["{ANNOT}L2", …]`.
-fn write_ldscore_refs(
-    path: &str,
-    snps: &[&BimRecord],
-    l2: &MatF,
-    col_names: &[String],
-) -> Result<()> {
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
-    use std::io::BufWriter;
-
-    let file = File::create(path).with_context(|| format!("creating output '{}'", path))?;
-    let gz = GzEncoder::new(file, Compression::fast());
-    let mut writer = BufWriter::new(gz);
-
-    write!(writer, "CHR\tSNP\tBP")?;
-    for name in col_names {
-        write!(writer, "\t{}", name)?;
-    }
-    writeln!(writer)?;
-
-    for (i, snp) in snps.iter().enumerate() {
-        write!(writer, "{}\t{}\t{}", snp.chr, snp.snp, snp.bp)?;
-        for k in 0..col_names.len() {
-            write!(writer, "\t{:.3}", l2[(i, k)])?;
-        }
-        writeln!(writer)?;
-    }
-
-    let gz = writer.into_inner().context("flushing gzip buffer")?;
-    gz.finish().context("finalising gzip output")?;
-    Ok(())
-}
-
-/// Write an annotation matrix to a gzip TSV (CHR, SNP, BP, CM, ...).
-fn write_annot_matrix(
-    path: &str,
-    snps: &[BimRecord],
-    annot: &MatF,
-    col_names: &[String],
-) -> Result<()> {
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
-    use std::io::BufWriter;
-
-    let file = File::create(path).with_context(|| format!("creating output '{}'", path))?;
-    let gz = GzEncoder::new(file, Compression::fast());
-    let mut writer = BufWriter::new(gz);
-
-    write!(writer, "CHR\tSNP\tBP\tCM")?;
-    for name in col_names {
-        write!(writer, "\t{}", name)?;
-    }
-    writeln!(writer)?;
-
-    for (i, snp) in snps.iter().enumerate() {
-        write!(writer, "{}\t{}\t{}\t{}", snp.chr, snp.snp, snp.bp, snp.cm)?;
-        for k in 0..col_names.len() {
-            write!(writer, "\t{}", annot[(i, k)])?;
-        }
-        writeln!(writer)?;
-    }
-
-    let gz = writer.into_inner().context("flushing gzip buffer")?;
-    gz.finish().context("finalising gzip output")?;
-    Ok(())
-}
-
-fn format_m_vals(vals: &[f64]) -> String {
-    let joined = vals
-        .iter()
-        .map(|v| format!("{v}"))
-        .collect::<Vec<_>>()
-        .join("\t");
-    format!("{joined}\n")
-}
-
-/// Load SNP IDs from a file (one per line; first token used; `#` lines skipped).
-fn load_snp_set(path: &str) -> Result<HashSet<String>> {
-    let file = File::open(path).with_context(|| format!("opening SNP list '{}'", path))?;
-    let reader = BufReader::new(file);
-    let set: HashSet<String> = reader
-        .lines()
-        .map_while(Result::ok)
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .filter_map(|l| {
-            l.split_whitespace()
-                .next()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-        })
-        .collect();
-    println!("  Loaded {} SNP IDs from '{}'", set.len(), path);
-    Ok(set)
-}
-
-/// Load SNP IDs from a file with exactly one column (Python --print-snps behavior).
-fn load_print_snps(path: &str) -> Result<HashSet<String>> {
-    let resolved = parse::resolve_text_path(path)?;
-    let file = File::open(&resolved).with_context(|| format!("opening SNP list '{}'", path))?;
-    let reader = BufReader::new(file);
-    let mut set: HashSet<String> = HashSet::new();
-    for (i, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("reading SNP line {}", i + 1))?;
-        if line.trim_start().starts_with('#') {
-            continue;
-        }
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.is_empty() {
-            continue;
-        }
-        if cols.len() != 1 {
-            anyhow::bail!("--print-snps must refer to a file with a one column of SNP IDs.");
-        }
-        set.insert(cols[0].to_string());
-    }
-    println!("  Loaded {} SNP IDs from '{}'", set.len(), path);
-    Ok(set)
-}
-
-pub fn run(args: L2Args) -> Result<()> {
-    if args.per_allele && args.pq_exp.is_some() {
-        anyhow::bail!(
-            "Cannot set both --per-allele and --pq-exp (--per-allele is equivalent to --pq-exp 1)."
-        );
-    }
-    if args.annot.is_some() && args.cts_bin.is_some() {
-        anyhow::bail!("--annot and --cts-bin are currently incompatible.");
-    }
-    if args.cts_bin.is_some() && args.extract.is_some() {
-        anyhow::bail!("--cts-bin and --extract are currently incompatible.");
-    }
-    if (args.cts_bin.is_some()) != (args.cts_breaks.is_some()) {
-        anyhow::bail!("Must set both or neither of --cts-bin and --cts-breaks.");
-    }
-
-    let pq_exp = if args.per_allele {
-        Some(1.0)
-    } else {
-        args.pq_exp
-    };
-    let mut wind_flags = 0u8;
-    if args.ld_wind_cm.is_some() {
-        wind_flags += 1;
-    }
-    if args.ld_wind_kb.is_some() {
-        wind_flags += 1;
-    }
-    if args.ld_wind_snp.is_some() {
-        wind_flags += 1;
-    }
-    if wind_flags > 1 {
-        anyhow::bail!("Must specify exactly one --ld-wind option");
-    }
-    let mode = if let Some(kb) = args.ld_wind_kb {
-        WindowMode::Kb(kb)
-    } else if let Some(snp) = args.ld_wind_snp {
-        WindowMode::Snp(snp)
-    } else {
-        WindowMode::Cm(args.ld_wind_cm.unwrap_or(1.0))
-    };
-
-    let bim_path = format!("{}.bim", args.bfile);
-    let fam_path = format!("{}.fam", args.bfile);
-    let bed_path = format!("{}.bed", args.bfile);
-
-    let all_snps_raw =
-        parse_bim(&bim_path).with_context(|| format!("parsing BIM '{}'", bim_path))?;
-    let n_indiv = count_fam(&fam_path).with_context(|| format!("counting FAM '{}'", fam_path))?;
-
-    println!(
-        "Loaded {} SNPs, {} individuals from '{}'",
-        all_snps_raw.len(),
-        n_indiv,
-        args.bfile
-    );
-
-    // --extract: pre-filter BIM (also shrinks LD windows).
-    let all_snps: Vec<BimRecord> = if let Some(ref extract_path) = args.extract {
-        let extract_set = load_snp_set(extract_path)
-            .with_context(|| format!("loading --extract file '{}'", extract_path))?;
-        let filtered: Vec<BimRecord> = all_snps_raw
-            .into_iter()
-            .filter(|s| extract_set.contains(&s.snp))
-            .collect();
-        println!("  After --extract: {} SNPs", filtered.len());
-        filtered
-    } else {
-        all_snps_raw
-    };
-
-    // --print-snps: output filter only; all SNPs still in LD windows.
-    let print_set: Option<HashSet<String>> = if let Some(ref ps_path) = args.print_snps {
-        Some(
-            load_print_snps(ps_path)
-                .with_context(|| format!("loading --print-snps file '{}'", ps_path))?,
-        )
-    } else {
-        None
-    };
-
-    if args.annot.is_some() && args.extract.is_some() {
-        println!(
-            "WARNING: --annot with --extract is not supported. \
-             Ensure your annot files match the extracted SNP set."
-        );
-    }
-
-    let mut cts_bin_active = false;
-    let mut annot_result: Option<(MatF, Vec<String>)> = if let Some(ref prefix) = args.annot {
-        let explicit = prefix.ends_with(".annot")
-            || prefix.ends_with(".annot.gz")
-            || prefix.ends_with(".annot.bz2");
-        if explicit {
-            let path = parse::resolve_annot_path(prefix)?;
-            let (mat, names) = parse::read_annot_path(&path, args.thin_annot)?;
-            anyhow::ensure!(
-                mat.nrows() == all_snps.len(),
-                "Annotation file has {} rows but BIM has {} SNPs — they must match exactly",
-                mat.nrows(),
-                all_snps.len()
-            );
-            println!(
-                "Read {} annotations for {} SNPs from '{}'",
-                names.len(),
-                mat.nrows(),
-                path
-            );
-            Some((mat, names))
-        } else if let Ok(path) = parse::resolve_annot_path(prefix) {
-            let (mat, names) = parse::read_annot_path(&path, args.thin_annot)?;
-            anyhow::ensure!(
-                mat.nrows() == all_snps.len(),
-                "Annotation file has {} rows but BIM has {} SNPs — they must match exactly",
-                mat.nrows(),
-                all_snps.len()
-            );
-            println!(
-                "Read {} annotations for {} SNPs from '{}'",
-                names.len(),
-                mat.nrows(),
-                path
-            );
-            Some((mat, names))
-        } else {
-            // Collect unique chromosomes in BIM order.
-            let mut chrs_seen: HashSet<u8> = HashSet::new();
-            let mut chrs: Vec<u8> = Vec::new();
-            for snp in &all_snps {
-                if chrs_seen.insert(snp.chr) {
-                    chrs.push(snp.chr);
-                }
-            }
-            chrs.sort_unstable();
-
-            // Read per-chromosome annotation files (prefix{chr}.annot[.gz]).
-            let mut mats: Vec<MatF> = Vec::new();
-            let mut col_names: Vec<String> = Vec::new();
-            for chr in &chrs {
-                let chr_prefix = format!("{}{}", prefix, chr);
-                let (mat, names) =
-                    parse::read_annot(&chr_prefix, args.thin_annot).with_context(|| {
-                        format!("reading annotation for chr{} (prefix '{}')", chr, prefix)
-                    })?;
-                if col_names.is_empty() {
-                    col_names = names;
-                }
-                mats.push(mat);
-            }
-
-            let total_rows: usize = mats.iter().map(|m| m.nrows()).sum();
-            let n_cols = mats.first().map(|m| m.ncols()).unwrap_or(0);
-            let mut combined = MatF::zeros(total_rows, n_cols);
-            let mut row_offset = 0usize;
-            for mat in &mats {
-                let rows = mat.nrows();
-                for i in 0..rows {
-                    for j in 0..n_cols {
-                        combined[(row_offset + i, j)] = mat[(i, j)];
-                    }
-                }
-                row_offset += rows;
-            }
-            anyhow::ensure!(
-                combined.nrows() == all_snps.len(),
-                "Annotation file has {} rows but BIM has {} SNPs — they must match exactly",
-                combined.nrows(),
-                all_snps.len()
-            );
-            println!(
-                "Read {} annotations for {} SNPs from '{}*'",
-                col_names.len(),
-                combined.nrows(),
-                prefix
-            );
-            Some((combined, col_names))
-        }
-    } else if let Some(ref cts_bin) = args.cts_bin {
-        let breaks = args
-            .cts_breaks
-            .as_deref()
-            .context("--cts-breaks required with --cts-bin")?;
-        let snp_ids: Vec<String> = all_snps.iter().map(|s| s.snp.clone()).collect();
-        let (mat, names) =
-            cts_annot::build_cts_matrix(&snp_ids, cts_bin, breaks, args.cts_names.as_deref())?;
-        println!(
-            "Read {} annotations for {} SNPs from --cts-bin",
-            names.len(),
-            mat.nrows()
-        );
-        cts_bin_active = true;
-        Some((mat, names))
-    } else {
-        None
-    };
-    // --keep: subset individuals for LD computation.
-    let iid_indices: Option<Vec<isize>> = if let Some(ref keep_path) = args.keep {
-        let fam_ids =
-            parse_fam(&fam_path).with_context(|| format!("parsing FAM '{}'", fam_path))?;
-        Some(
-            load_individual_indices(keep_path, &fam_ids)
-                .with_context(|| format!("loading keep file '{}'", keep_path))?,
-        )
-    } else {
-        None
-    };
-    let n_indiv_actual = iid_indices.as_ref().map(|idx| idx.len()).unwrap_or(n_indiv);
-
-    let mut all_snps = all_snps;
-    let maf_pre = args.maf_pre;
-
-    // Pre-filter SNPs with all-het/missing genotypes (Python behavior).
-    // Skip when --maf and --pq-exp are both absent: the filter removes essentially no SNPs
-    // from well-filtered data (1000G), and costs an extra full BED pass (~4s).
-    let verbose_timing = args.verbose_timing;
-    let t_run_start = std::time::Instant::now();
-    let mut maf_prefilter: Option<Vec<f64>> = None;
-    if maf_pre && (args.maf.is_some() || pq_exp.is_some()) {
-        let mut bed = Bed::builder(bed_path.as_str())
-            .build()
-            .context("opening BED file for SNP prefilter")?;
-        let (maf_all, het_miss_ok) = compute_snp_stats(
-            &all_snps,
-            &mut bed,
-            n_indiv_actual,
-            args.chunk_size,
-            iid_indices.as_deref(),
-        )
-        .context("computing SNP prefilter stats")?;
-
-        let thr = args.maf.unwrap_or(0.0);
-        let mut keep_mask: Vec<bool> = Vec::with_capacity(all_snps.len());
-        let mut kept_snps: Vec<BimRecord> = Vec::new();
-        for (i, snp) in all_snps.iter().enumerate() {
-            let mut keep = het_miss_ok[i];
-            keep &= maf_all[i] > thr;
-            keep_mask.push(keep);
-            if keep {
-                kept_snps.push(snp.clone());
-            }
-        }
-
-        if kept_snps.is_empty() {
-            anyhow::bail!("SNP prefilter removed all SNPs");
-        }
-
-        if kept_snps.len() != all_snps.len() {
-            if let Some((annot, names)) = annot_result.take() {
-                let rows: Vec<usize> = keep_mask
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, &k)| if k { Some(i) } else { None })
-                    .collect();
-                let mut filtered = MatF::zeros(rows.len(), annot.ncols());
-                for (ri, &src) in rows.iter().enumerate() {
-                    for j in 0..annot.ncols() {
-                        filtered[(ri, j)] = annot[(src, j)];
-                    }
-                }
-                annot_result = Some((filtered, names));
-            }
-            all_snps = kept_snps;
-        }
-
-        let maf_kept: Vec<f64> = keep_mask
-            .iter()
-            .zip(maf_all.iter())
-            .filter_map(|(k, v)| if *k { Some(*v) } else { None })
-            .collect();
-        if args.maf.is_some() {
-            println!(
-                "--maf-pre: kept {} / {} SNPs (MAF > {})",
-                all_snps.len(),
-                keep_mask.len(),
-                thr
-            );
-        }
-        maf_prefilter = Some(maf_kept);
-    }
-
-    let mut pq_scaled_annot = false;
-    if let (Some(exp), Some(maf_vals)) = (pq_exp, maf_prefilter.as_ref())
-        && let Some((annot, names)) = annot_result.take()
-    {
-        anyhow::ensure!(
-            maf_vals.len() == annot.nrows(),
-            "MAF length {} does not match annot rows {}",
-            maf_vals.len(),
-            annot.nrows()
-        );
-        let mut scaled = annot;
-        for (i, maf) in maf_vals.iter().enumerate() {
-            let pq = (maf * (1.0 - maf)).powf(exp);
-            for j in 0..scaled.ncols() {
-                scaled[(i, j)] *= pq;
-            }
-        }
-        annot_result = Some((scaled, names));
-        pq_scaled_annot = true;
-    }
-
-    let pq_exp_for_compute = if pq_scaled_annot { None } else { pq_exp };
-
-    let annot_ref: Option<&MatF> = annot_result.as_ref().map(|(m, _)| m);
-
-    let chunk_c = args.chunk_size;
-
-    let t_maf_pre = t_run_start.elapsed();
-    if verbose_timing {
-        eprintln!("[perf] maf_prefilter={:.3}s", t_maf_pre.as_secs_f64());
-    }
-
-    let t_compute_start = std::time::Instant::now();
-    let (l2, maf_per_snp) = compute_ldscore_global(
-        &all_snps,
-        bed_path.as_str(),
-        n_indiv_actual,
-        mode,
-        chunk_c,
-        annot_ref,
-        iid_indices.as_deref(),
-        pq_exp_for_compute,
-        args.yes_really,
-        args.gpu,
-        args.gpu_tile_cols,
-        args.gpu_flex32,
-        args.gpu_f64,
-        args.fast_f32,
-        args.prefetch_bed,
-        args.verbose_timing,
-        args.stochastic,
-        args.sketch,
-    )
-    .context("computing LD scores")?;
-
-    if verbose_timing {
-        eprintln!(
-            "[perf] compute_ldscore_total={:.3}s",
-            t_compute_start.elapsed().as_secs_f64()
-        );
-    }
-
-    let t_write_start = std::time::Instant::now();
-    // bed_idx (original BIM row) != position in all_snps when --extract is active.
-    let bed_idx_to_pos: std::collections::HashMap<usize, usize> = all_snps
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.bed_idx, i))
-        .collect();
-
-    let scale_suffix = pq_exp.map(|exp| format!("_S{}", exp)).unwrap_or_default();
-    let col_names: Vec<String> = match &annot_result {
-        None => vec![format!("L2{}", scale_suffix)],
-        Some((_, names)) => names
-            .iter()
-            .map(|n| format!("{}L2{}", n, scale_suffix))
-            .collect(),
-    };
-
-    let pq_per_snp: Option<Vec<f64>> = pq_exp.map(|exp| {
-        maf_per_snp
-            .iter()
-            .map(|&p| (p * (1.0 - p)).powf(exp))
-            .collect()
-    });
-    let pq_for_m = if pq_scaled_annot {
-        None
-    } else {
-        pq_per_snp.as_ref()
-    };
-
-    if cts_bin_active
-        && !args.no_print_annot
-        && let Some((annot, _)) = annot_result.as_ref()
-    {
-        let annot_path = format!("{}.annot.gz", args.out);
-        write_annot_matrix(&annot_path, &all_snps, annot, &col_names)
-            .with_context(|| format!("writing annot matrix '{}'", annot_path))?;
-        println!(
-            "Writing annot matrix produced by --cts-bin to {}",
-            annot_path
-        );
-    }
-
-    let mut chrs: Vec<u8> = all_snps
-        .iter()
-        .map(|s| s.chr)
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    chrs.sort();
-
-    let should_output = |s: &BimRecord| -> bool {
-        let pos = bed_idx_to_pos[&s.bed_idx];
-        let maf_ok = args.maf.map(|thr| maf_per_snp[pos] > thr).unwrap_or(true);
-        let print_ok = print_set
-            .as_ref()
-            .map(|set| set.contains(&s.snp))
-            .unwrap_or(true);
-        maf_ok && print_ok
-    };
-
-    let out_positions: Vec<usize> = all_snps
-        .iter()
-        .filter(|s| should_output(s))
-        .map(|s| bed_idx_to_pos[&s.bed_idx])
-        .collect();
-    if print_set.is_some() && out_positions.is_empty() {
-        anyhow::bail!("After merging with --print-snps, no SNPs remain.");
-    }
-
-    let extract_rows = |positions: &[usize], n_cols: usize| -> MatF {
-        let mut mat = MatF::zeros(positions.len(), n_cols);
-        for (row, &pos) in positions.iter().enumerate() {
-            for k in 0..n_cols {
-                mat[(row, k)] = l2[(pos, k)];
-            }
-        }
-        mat
-    };
-    let compute_m_vals = |positions: &[usize]| -> (Vec<f64>, Vec<f64>) {
-        match &annot_result {
-            Some((annot, _)) => {
-                let mut m_vals = vec![0.0f64; col_names.len()];
-                let mut m_5_50_vals = vec![0.0f64; col_names.len()];
-                for &pos in positions {
-                    let maf = maf_per_snp[pos];
-                    for k in 0..col_names.len() {
-                        let mut base = annot[(pos, k)];
-                        if let Some(pq) = pq_for_m {
-                            base *= pq[pos];
-                        }
-                        m_vals[k] += base;
-                        if maf > 0.05 {
-                            m_5_50_vals[k] += base;
-                        }
-                    }
-                }
-                (m_vals, m_5_50_vals)
-            }
-            None => {
-                let m_val = if let Some(pq) = pq_per_snp.as_ref() {
-                    positions.iter().map(|&pos| pq[pos]).sum::<f64>()
-                } else {
-                    positions.len() as f64
-                };
-                let m_5_50_val = if let Some(pq) = pq_per_snp.as_ref() {
-                    positions
-                        .iter()
-                        .filter(|&&pos| maf_per_snp[pos] > 0.05)
-                        .map(|&pos| pq[pos])
-                        .sum::<f64>()
-                } else {
-                    positions
-                        .iter()
-                        .filter(|&&pos| maf_per_snp[pos] > 0.05)
-                        .count() as f64
-                };
-                (vec![m_val], vec![m_5_50_val])
-            }
-        }
-    };
-
-    let out_snps: Vec<&BimRecord> = all_snps.iter().filter(|s| should_output(s)).collect();
-    let out_l2 = extract_rows(&out_positions, col_names.len());
-    let out_path = format!("{}.l2.ldscore.gz", args.out);
-    write_ldscore_refs(&out_path, &out_snps, &out_l2, &col_names)
-        .with_context(|| "writing combined LD score output".to_string())?;
-
-    let all_positions: Vec<usize> = (0..all_snps.len()).collect();
-    let (m_vals_all, m_5_50_vals_all) = compute_m_vals(&all_positions);
-    let m_path = format!("{}.l2.M", args.out);
-    std::fs::write(&m_path, format_m_vals(&m_vals_all))
-        .with_context(|| format!("writing M file '{}'", m_path))?;
-    let m_5_50_path = format!("{}.l2.M_5_50", args.out);
-    std::fs::write(&m_5_50_path, format_m_vals(&m_5_50_vals_all))
-        .with_context(|| format!("writing M_5_50 file '{}'", m_5_50_path))?;
-
-    use rayon::prelude::*;
-    let chr_messages: Vec<String> = chrs
-        .par_iter()
-        .map(|chr| -> Result<String> {
-            let chr_snps_all: Vec<&BimRecord> = all_snps.iter().filter(|s| s.chr == *chr).collect();
-            let chr_positions_all: Vec<usize> = chr_snps_all
-                .iter()
-                .map(|s| bed_idx_to_pos[&s.bed_idx])
-                .collect();
-
-            let chr_snps: Vec<&BimRecord> = chr_snps_all
-                .iter()
-                .copied()
-                .filter(|s| should_output(s))
-                .collect();
-            let chr_positions_out: Vec<usize> = chr_snps
-                .iter()
-                .map(|s| bed_idx_to_pos[&s.bed_idx])
-                .collect();
-            let n_chr = chr_snps.len();
-
-            let chr_l2 = extract_rows(&chr_positions_out, col_names.len());
-            let out_path = format!("{}{}.l2.ldscore.gz", args.out, chr);
-            write_ldscore_refs(&out_path, &chr_snps, &chr_l2, &col_names)
-                .with_context(|| format!("writing output for chr {}", chr))?;
-
-            let (m_vals, m_5_50_vals) = compute_m_vals(&chr_positions_all);
-            let m_path = format!("{}{}.l2.M", args.out, chr);
-            std::fs::write(&m_path, format_m_vals(&m_vals))
-                .with_context(|| format!("writing M file '{}'", m_path))?;
-
-            let m_5_50_path = format!("{}{}.l2.M_5_50", args.out, chr);
-            std::fs::write(&m_5_50_path, format_m_vals(&m_5_50_vals))
-                .with_context(|| format!("writing M_5_50 file '{}'", m_5_50_path))?;
-
-            Ok(format!(
-                "chr {}: {} SNPs → {} (M={}, M_5_50={})",
-                chr,
-                n_chr,
-                out_path,
-                m_vals
-                    .iter()
-                    .map(|v| format!("{v}"))
-                    .collect::<Vec<_>>()
-                    .join(","),
-                m_5_50_vals
-                    .iter()
-                    .map(|v| format!("{v}"))
-                    .collect::<Vec<_>>()
-                    .join(","),
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    for msg in chr_messages {
-        println!("{}", msg);
-    }
-
-    if verbose_timing {
-        eprintln!(
-            "[perf] write_outputs={:.3}s total={:.3}s",
-            t_write_start.elapsed().as_secs_f64(),
-            t_run_start.elapsed().as_secs_f64(),
-        );
-    }
-    Ok(())
 }
