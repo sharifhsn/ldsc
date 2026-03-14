@@ -88,3 +88,75 @@ pub(super) fn get_block_lefts_by_chr(
 
     (block_left, any_full_chr_window)
 }
+
+/// For each SNP, compute the rightmost SNP index within `max_dist`.
+/// Reverse analogue of `get_block_lefts_f64`.
+#[allow(dead_code)]
+fn get_block_rights_f64(coords: &[f64], max_dist: f64) -> Vec<usize> {
+    let m = coords.len();
+    if m == 0 {
+        return vec![];
+    }
+    let mut block_right = vec![m - 1; m];
+    let mut j = m - 1;
+
+    for i in (0..m).rev() {
+        while j > i && (coords[j] - coords[i]).abs() > max_dist {
+            j -= 1;
+        }
+        block_right[i] = j;
+    }
+
+    block_right
+}
+
+/// Compute block_right per chromosome (mirror of `get_block_lefts_by_chr`).
+/// For each SNP j, block_right[j] = largest k in same chromosome such that
+/// |coord_k - coord_j| ≤ max_dist.
+#[allow(dead_code)]
+pub(super) fn get_block_rights_by_chr(all_snps: &[BimRecord], mode: WindowMode) -> Vec<usize> {
+    let m = all_snps.len();
+    let mut block_right = vec![0usize; m];
+
+    let mut start = 0usize;
+    while start < m {
+        let chr = all_snps[start].chr;
+        let mut end = start + 1;
+        while end < m && all_snps[end].chr == chr {
+            end += 1;
+        }
+        let len = end - start;
+        if len == 0 {
+            break;
+        }
+
+        match mode {
+            WindowMode::Snp(half) => {
+                for i in 0..len {
+                    block_right[start + i] = start + (i + half).min(len - 1);
+                }
+            }
+            WindowMode::Cm(max_cm) => {
+                let coords: Vec<f64> = all_snps[start..end].iter().map(|s| s.cm).collect();
+                let local = get_block_rights_f64(&coords, max_cm);
+                for (i, right) in local.into_iter().enumerate() {
+                    block_right[start + i] = start + right;
+                }
+            }
+            WindowMode::Kb(max_kb) => {
+                let coords: Vec<f64> = all_snps[start..end]
+                    .iter()
+                    .map(|s| s.bp as f64 / 1000.0)
+                    .collect();
+                let local = get_block_rights_f64(&coords, max_kb);
+                for (i, right) in local.into_iter().enumerate() {
+                    block_right[start + i] = start + right;
+                }
+            }
+        }
+
+        start = end;
+    }
+
+    block_right
+}

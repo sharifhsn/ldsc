@@ -1782,3 +1782,52 @@ update + TLB fill.
 
 **Verdict:** Commit as opt-in `--mmap` flag. Default remains BufReader. Recommend `--mmap`
 for HPC deployments with networked filesystems. Document local SSD regression.
+
+## 2026-03-14: Gram matrix fast path for CountSketch (`--gram`)
+
+**Problem:** CountSketch with full-chromosome windows (e.g. `--ld-wind-cm 1` on 1000G data
+where all CM=0) is slow because the A×B cross-window GEMM grows as O(d × W × M) where
+W ≈ M_chr for full-chromosome windows, giving O(d × M²) total cost.
+
+**Solution:** Exploit the identity Σ_k (s_j^T s_k)² = s_j^T G s_j where G = Σ_k s_k s_k^T
+(d×d Gram matrix). Two-pass algorithm:
+1. Forward pass: BED decode + CountSketch + Gram accumulation (rank-1 updates)
+2. Backward pass: stored sketch vectors only (no BED I/O), reverse Gram accumulation
+3. Combine: l2[j] = l2_fwd[j] + l2_bwd[j] + 1.0
+
+Cost: O(d² × M) per pass, making full-chromosome windows essentially free when d² << M_chr.
+Memory: stores all sketch vectors (d × M × 4 bytes, ~332 MB at d=50 M=1.66M).
+
+**Implementation:** `countsketch_gram_path()` in `src/l2/compute.rs` (~430 lines). Dispatched
+via `--gram` CLI flag (opt-in, only applies with `--sketch-method countsketch`).
+
+**Correctness:**
+- Full-chromosome windows (`--ld-wind-cm 1`): max_abs_diff = 0.0000000000 vs old path (5K SNPs)
+- Windowed mode (`--ld-wind-kb 1000`): 1/5000 SNPs with 0.001 diff (output rounding at 3dp)
+- `verify_parity_all.sh` 8-mode sweep: all pass (exact/Rademacher modes unaffected)
+
+**Performance (local Ryzen 5 5600X):**
+
+Full 1000G (1.66M SNPs, `--ld-wind-cm 1`, full-chromosome windows):
+
+| Mode | Old path | Gram path | Speedup |
+|------|----------|-----------|---------|
+| CS-50 | 136.4s | 11.7s | **11.7×** |
+| CS-100 | (est. ~200s) | 36.7s | ~5.5× |
+| CS-200 | (est. ~400s) | 138.5s | ~2.9× |
+
+bench_200k (200K SNPs, `--ld-wind-kb 1000`, windowed):
+
+| Mode | Old path | Gram path | Notes |
+|------|----------|-----------|-------|
+| CS-50 | 1.7s | 1.35s | 20% faster |
+| CS-100 | 3.6s | 4.4s | 22% slower (d²=10K > avg_window) |
+
+The Gram path is optimal when d² << average window size. At d=50 (d²=2500), it benefits
+both windowed and full-chromosome modes. At d≥100, it regresses in windowed mode but
+still dramatically helps full-chromosome windows.
+
+**Local perf gate (default path, --gram off):** No regressions in any mode.
+
+**Verdict:** Commit as opt-in `--gram` flag. Recommended for `--ld-wind-cm` with CM=0 data
+(full-chromosome windows) at d≤100. Not recommended for narrow windowed modes at d≥100.
