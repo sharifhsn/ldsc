@@ -1311,7 +1311,7 @@ current benchmarks.
 
 ### Setup
 - **Dataset**: Synthetic biobank_50k (1,664,852 SNPs × 50,000 individuals, ~20GB BED file)
-  - Generated from bench_5k via `make_synthetic_biobank.py` (10× replication, 1% genotype noise)
+  - Generated from full 1000G panel via `make_synthetic_biobank.py --bfile data/1000G_phase3_common_norel --target-n 50000 --noise-rate 0.01` (~21× replication of N=2,490, 1% genotype noise)
 - **Hardware**: AWS c6a.4xlarge (EPYC 7R13, 16 vCPU, 32 GiB RAM), SPOT instance, 50GB gp3 EBS
 - **Build**: musl+mimalloc+AVX2+FMA (production binary, ldsc 0.3.1)
 - **Command**: `ldsc l2 --bfile /data/biobank_50k --ld-wind-kb 1000 --chunk-size 200 --yes-really --verbose-timing [--sketch d]`
@@ -1403,3 +1403,221 @@ vs Python). Accuracy: Pearson r≈0.81 (genome-wide estimate). Best accuracy/spe
 **Why we can't reach 7×**: The bandwidth floor from reading B (40MB/chunk in f32) is ~3.2× lower
 than exact-f64 (160MB/chunk), but compute savings + better GEMM structure together yield 5.3×.
 Going further would require reducing d below 50 (poor JL accuracy) or blocking at chunk level.
+
+## 2026-03-13: New Features — CountSketch, --subsample, Fused Kernel (AWS Benchmarks)
+
+### Features Implemented
+
+Three new opt-in modes targeting biobank-scale throughput:
+
+1. **`--subsample N'`**: Fisher-Yates partial shuffle (seed=42) to select N' individuals before LD
+   computation. Indices sorted for sequential BED access. Eliminates `--keep` conflict via CLI.
+
+2. **`--sketch-method countsketch`**: Hash-based CountSketch projection. Each of N individuals is
+   assigned a bucket b ∈ {0,...,d-1} and sign σ ∈ {±1}. Projection: `out[b] += σ * x[i]`.
+   O(N×c) vs Rademacher O(d×N×c). No dense P matrix needed.
+
+3. **Fused BED-decode-normalize-project kernel** (disabled): Two-pass approach — Pass 1 computes
+   per-SNP stats (mean, variance) from packed BED bytes via 256-entry LUT. Pass 2 tiles over
+   512-individual chunks, decoding BED → normalizing → projecting directly. Avoids materializing
+   the full N×c intermediate matrix for sketch mode.
+
+### Fused Kernel: Regression and Root Cause
+
+The fused path was implemented and parity-verified locally (zero diff on bench_5k). However,
+AWS benchmarks showed 2-4× regressions across all sketch modes:
+
+**AWS EPYC 7R13 c6a.4xlarge, N=50K, 2026-03-13 (REGRESSED — fused path active):**
+
+| Mode | Mean ± σ | User | Parallelism | vs prev best |
+|------|----------|------|-------------|-------------|
+| exact-f64 | 753.6s ± 4.7s | 7921.5s | 10.5× | baseline (same) |
+| exact-f32 | 439.7s ± 1.9s | 4321.2s | 9.8× | same |
+| sketch-50-f64 | 354.6s ± 11.8s | 328.9s | **0.93×** | 2.1× slower |
+| sketch-100-f64 | 511.9s ± 0.8s | 501.1s | 0.98× | 2.7× slower |
+| sketch-200-f64 | 878.4s ± 3.8s | 896.3s | 1.02× | 4.1× slower |
+| sketch-50-f32 | 264.9s ± 5.1s | 239.4s | **0.90×** | 2.0× slower |
+| sketch-100-f32 | 350.7s ± 6.0s | — | — | 2.5× slower |
+| sketch-200-f32 | 508.8s ± 0.5s | — | — | 3.2× slower |
+
+User parallelism ≈1.0 (single-threaded) was the tell. The root cause:
+
+**The fused kernel's tile GEMMs used `Par::Seq` (single-threaded).** Each tile processes
+512 individuals at a time with a `(d×512) × (512×c)` matmul — small enough that
+`Par::rayon(0)` wouldn't help per tile. The non-fused path does a single large
+`(d×N) × (N×c)` matmul with `Par::rayon(0)`, utilizing all 16 CPUs. At N=50K,
+the regression is proportional to d (larger d = bigger tile GEMMs = more time wasted
+single-threaded), explaining the 4× regression at d=200 vs 2× at d=50.
+
+**Fix**: Set `use_fused_sketch = false` in `compute_ldscore_global` (compute.rs). The
+fused functions remain in the codebase. The correct fix would implement parallel tile
+accumulation: `rayon::par_iter` over tile_starts with thread-local d×c accumulators,
+then reduce with element-wise addition. `MatRef<'_, f32>: Send + Sync` so this should
+compile without unsafe.
+
+The exact mode was unaffected (fused path is sketch-only) — confirming the regression
+was purely from the fused kernel, not instance variance.
+
+### CountSketch Results (non-fused, fused=false)
+
+**AWS EPYC 7R13 c6a.4xlarge, N=50K, 2026-03-13:**
+
+| Mode | Mean ± σ | User | Parallelism | vs Rademacher-d=50-f32 |
+|------|----------|------|-------------|------------------------|
+| countsketch-50-f32 | 244.8s ± 0.6s | 220.7s | **0.90×** | 1.89× slower |
+| countsketch-100-f32 | SPOT preempted | — | — | — |
+| countsketch-200-f32 | SPOT preempted | — | — | — |
+
+**CountSketch is 1.89× slower than Rademacher at d=50 (N=50K).** Root cause: the
+scatter-add loop `out[bucket[i]] += sign[i] * x[i]` is sequential (scatter-add into
+a shared output buffer can't be trivially parallelized). Rademacher uses a single
+`faer::matmul(..., Par::rayon(0))` utilizing all 16 CPUs. The parallelism ratio confirms
+this: 0.90× (nearly single-threaded) for CountSketch vs ~7.4× for Rademacher d=50.
+
+**Subsample benchmarks**: SPOT instance was preempted after ~5 hours; all subsample
+results (subsample-5k-f32, subsample-10k-f32, subsample-5k-sketch50-f32) were lost.
+
+### Current Status
+
+With `use_fused_sketch = false` and the fused path disabled, all Rademacher sketch modes
+restore to their 2026-03-12 baselines (sketch-50-f32: 129.5s, etc.). The `--subsample`
+and `--sketch-method countsketch` flags are implemented and functional but not
+competitively faster than Rademacher at biobank scale.
+
+### Next Steps
+
+1. **Parallel CountSketch**: Use `rayon::par_iter` over columns (0..c) of the input B
+   matrix, with each thread writing into its own d×1 column of the output. This is safe
+   because each output column is independent. Expected improvement: near `Par::rayon(0)`
+   utilization → competitive with Rademacher at low d.
+
+2. **Parallel fused kernel**: Use `rayon::par_iter` over tile_starts with thread-local
+   d×c accumulators, reduce with element-wise addition. This recovers the multi-threaded
+   advantage while keeping the BED decode + normalize + project in one pass.
+
+3. **Rerun subsample benchmarks** using `scripts/newfeatures-bench.sh` after a separate
+   non-SPOT job (use `--vcpus 16 --memory 28672` on ON_DEMAND queue).
+
+### AWS Cost Note
+Total AWS HPC spend as of 2026-03-13: ~$5.45 (March).
+The 5-hour SPOT job (countsketch + subsample) was preempted by instance reclamation — no
+results for countsketch-100/200-f32 or any subsample mode. Use ON_DEMAND for multi-hour runs.
+
+## 2026-03-13: Fused CountSketch kernel
+
+### Change
+Implemented fused BED-decode-normalize-scatter-add kernel for CountSketch mode.
+Eliminates the full N×c intermediate matrix (`b_full`) and replaces the separate
+decode → normalize → scatter-add pipeline with a single column-parallel pass.
+
+Unlike the earlier fused Rademacher attempt (which fragmented one large GEMM into
+many tiny tile GEMMs and regressed 2.2× at biobank scale), CountSketch uses
+scatter-add — not GEMM — so there's no SIMD efficiency loss from tiling.
+
+**Key design**: parallelism over columns (c=200 via `rayon::par_iter`), each column
+does O(N) decode+normalize+scatter into a d-element accumulator that fits L1 cache.
+
+### Parity
+- Fused vs non-fused CountSketch on bench_5k (all 22 chr): **bit-exact** (max_abs_diff=0)
+- Verified with: diff of all per-chromosome gzipped LD score files
+
+### Local Performance (Ryzen 5 5600X, 6C/12T)
+
+**bench_200k (N=2490, 200K SNPs):**
+
+| Mode | Time (ms) | Notes |
+|------|----------|-------|
+| exact-f64 | 4,260 | baseline |
+| exact-f32 | 2,372 | 1.8× |
+| sketch-50 (Rademacher) | 2,765 | auto-f32 |
+| sketch-100 (Rademacher) | 1,507 | auto-f32 |
+| sketch-200 (Rademacher) | 1,872 | auto-f32 |
+| **countsketch-50 (fused)** | **1,604** | auto-f32 |
+| **countsketch-100 (fused)** | **638** | auto-f32, fastest |
+| stochastic-50 | 4,877 | |
+
+No regressions vs documented baselines.
+
+**biobank_50k (N=50K, 1.66M SNPs):**
+
+| Mode | Wall time | vs Rademacher-50 |
+|------|----------|-----------------|
+| **countsketch-50-fused** | **67.4s** | **5.1×** |
+| **countsketch-100-fused** | **85.5s** | **4.0×** |
+| rademacher-50 (non-fused) | 341.5s | 1.0× |
+| rademacher-100 (non-fused) | 936.3s | — |
+
+Verbose timing breakdown (fused countsketch-50, biobank):
+```
+bed_read(stall)=17.6s norm=0.0s sketch=91.0s bb_dot=33.2s ab_dot=32.5s ring_store=0.0s
+```
+
+norm=0 because normalization is fused into the sketch step. The 91s sketch time includes
+BED byte decoding, genotype normalization, and scatter-add — all formerly separate passes.
+
+### Analysis
+- **Why fused CountSketch works**: Scatter-add is inherently serial per element (no GEMM
+  to fragment), so column-parallel decomposition gives c-way (200-way) parallelism with
+  no SIMD efficiency loss. Each column reads 12.5KB of packed BED bytes and writes to
+  a d-element accumulator (200-400 bytes, fits L1).
+- **Why fused Rademacher failed**: Tiling fragmented one large `Par::rayon(0)` GEMM
+  (1B FLOPs, 7.4× parallelism) into ~98 tiny `Par::Seq` tile GEMMs (10M FLOPs each),
+  collapsing parallelism to 1.3×.
+- **Memory savings**: Fused CountSketch avoids the N×c b_full buffer (40MB at N=50K,
+  c=200, f32). Total working set per chunk: ~2.5MB BED bytes + O(N) hash/sign arrays.
+  (b_full is still allocated as fallback for non-contiguous --extract chunks.)
+- **Local vs AWS scaling**: Local Ryzen (6C/12T) numbers are ~5× slower than AWS EPYC
+  (16 vCPU) for exact modes, but relative speedups should hold. AWS benchmark needed
+  for validated absolute numbers.
+
+### AWS Results (fused DISABLED, biobank-nofused-bench job, EPYC 7R13 c6a.4xlarge)
+
+This job ran the code with `use_fused_sketch = false` — no fused CountSketch, but
+includes all other recent improvements. SPOT terminated before CountSketch ran.
+
+| Mode | Time (mean ± σ) | Previous baseline | Change |
+|------|----------------|------------------|--------|
+| exact-f64 | 667.1s ± 6.3s | 688.8s | -3.2% |
+| exact-f32 | 360.9s ± 2.9s | 373.1s | -3.3% |
+| sketch-50 (Rademacher, auto-f32) | **115.4s ± 0.3s** | 129.5s | **-10.9%** |
+| sketch-100 (Rademacher) | 129.6s ± 0.6s | 138.6s | -6.5% |
+| sketch-200 (Rademacher) | 150.5s ± 0.1s | 159.3s | -5.5% |
+
+The across-the-board ~6-11% improvement is from incremental code changes since last benchmark
+(raw_bytes slicing, b_full allocation optimizations, etc.).
+
+### AWS Results (fused ENABLED, biobank-fused-cs-sweep job, EPYC 7R13 c6a.4xlarge)
+
+Job ID: 97c25095-f71b-4e2b-8725-b6676d6019bb, completed 2026-03-14.
+Full 15-mode sweep with fused CountSketch enabled. All modes ran 3× with 1 warmup via hyperfine.
+
+| Mode | Time (mean ± σ) | vs exact-f64 | vs Python (~1548s) |
+|------|----------------|-------------|-------------------|
+| exact-f64 | 665.9s ± 1.6s | 1.0× | 2.3× |
+| exact-f32 | 361.9s ± 4.4s | 1.84× | 4.3× |
+| sketch-50 (Rademacher) | 118.4s ± 0.6s | 5.6× | 13.1× |
+| sketch-100 (Rademacher) | 130.5s ± 0.1s | 5.1× | 11.9× |
+| sketch-200 (Rademacher) | 151.8s ± 0.4s | 4.4× | 10.2× |
+| **countsketch-50** | **33.1s ± 0.04s** | **20.1×** | **46.8×** |
+| **countsketch-100** | **33.4s ± 0.1s** | **19.9×** | **46.4×** |
+| **countsketch-200** | **33.8s ± 0.1s** | **19.7×** | **45.8×** |
+| countsketch-500 | 36.2s ± 0.01s | 18.4× | 42.7× |
+| countsketch-1000 | 39.7s ± 0.2s | 16.8× | 39.0× |
+| subsample-2k | 39.5s ± 0.1s | 16.9× | 39.2× |
+| subsample-5k | 78.1s ± 0.2s | 8.5× | 19.8× |
+| subsample-10k | 144.7s ± 0.2s | 4.6× | 10.7× |
+| subsample-5k+sketch50 | 24.9s ± 0.2s | 26.7× | 62.2× |
+| subsample-5k-f32 | 51.0s ± 0.2s | 13.1× | 30.4× |
+
+**Key findings:**
+- **Fused CountSketch is 3.6× faster than Rademacher sketch** at d=50 (33.1s vs 118.4s)
+- **CountSketch d=50–200 are essentially identical** (~33s), confirming the d≈√N "free accuracy" theory.
+  At N=50K (√N≈224), scatter-add O(N×c) dominates until d exceeds ~224. GEMM overhead visible at d=500 (+9%) and d=1000 (+20%).
+- **CountSketch-200 recommended** for biobank: r≈0.93, ~6% median error, same speed as CS-50 (33.8s vs 33.1s)
+- **subsample-5k+sketch50 fastest overall** at 24.9s (62.2× vs Python), but compounds two approximation errors
+- Previous best biobank mode was sketch-50-f32 at 129.5s — fused CS-50 is **3.9× faster**
+
+### Next steps
+- Consider fused path for non-contiguous chunks (--extract with gaps) to eliminate
+  b_full allocation entirely
+- Run accuracy comparison on AWS output files (CS-50 vs CS-200 vs CS-500 vs exact)
