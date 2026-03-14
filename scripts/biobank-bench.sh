@@ -52,13 +52,22 @@ run_bench "subsample-5k-sketch50"    "--subsample 5000 --sketch 50"
 # Subsample + exact f32
 run_bench "subsample-5k-f32"         "--fast-f32 --subsample 5000"
 
+# Subsample + CountSketch (Pareto frontier: accuracy vs speed)
+run_bench "subsample-2k-cs200"       "--subsample 2000 --sketch 200 --sketch-method countsketch"
+run_bench "subsample-3k-cs200"       "--subsample 3000 --sketch 200 --sketch-method countsketch"
+run_bench "subsample-5k-cs200"       "--subsample 5000 --sketch 200 --sketch-method countsketch"
+run_bench "subsample-2k-cs500"       "--subsample 2000 --sketch 500 --sketch-method countsketch"
+run_bench "subsample-5k-cs500"       "--subsample 5000 --sketch 500 --sketch-method countsketch"
+
 echo ""
 echo "=== RAW JSON ==="
 for label in exact-f64 exact-f32 \
              sketch-50 sketch-100 sketch-200 \
              countsketch-50 countsketch-100 countsketch-200 countsketch-500 countsketch-1000 \
              subsample-2k subsample-5k subsample-10k subsample-5k-sketch50 \
-             subsample-5k-f32; do
+             subsample-5k-f32 \
+             subsample-2k-cs200 subsample-3k-cs200 subsample-5k-cs200 \
+             subsample-2k-cs500 subsample-5k-cs500; do
     f="/tmp/${label}.json"
     echo "--- $label ---"
     cat "$f" 2>/dev/null || echo "(not available)"

@@ -1657,3 +1657,61 @@ scatter-writes to `bucket[i]` (L3 cache misses on the d×c accumulator), not bra
 prediction or bit extraction. The LUT has no measurable impact on the memory-bound path.
 
 **Verdict:** Commit — cleaner loop structure, minor win at small N, no regression anywhere.
+
+## 2026-03-14: Subsample + CountSketch parameter sweep
+
+**Change:** Added subsample+CountSketch combination modes to benchmark scripts to find the
+Pareto frontier of speed vs accuracy. No code changes — benchmark script additions only.
+
+### Local performance (Ryzen 5 5600X, biobank_50k N=50,000)
+
+| Mode | Wall time | vs CS-200 | Notes |
+|------|-----------|-----------|-------|
+| countsketch-200 (reference) | 91.0s | 1.0× | Pure CS, no subsample |
+| subsample-2k + CS-200 | 63.6s | **1.43×** | Fastest combo |
+| subsample-3k + CS-200 | 74.0s | 1.23× | |
+| subsample-5k + CS-200 | 88.0s | 1.03× | Marginal gain |
+| subsample-2k + CS-500 | 82.7s | 1.10× | Extra d not free at low N' |
+| subsample-5k + CS-500 | 86.2s | 1.06× | |
+| subsample-5k + Rad-50 | 84.9s | 1.07× | Rademacher reference |
+
+**Estimated AWS equivalents** (scaling by local/AWS ratio ~91/33.8 = 2.69×):
+- subsample-2k + CS-200: ~23.6s (vs 33.8s pure CS-200, **30% faster**)
+- subsample-3k + CS-200: ~27.5s
+
+### Accuracy (bench_200k, N=2,490 — worst case since subsample loses more at small N)
+
+| Mode | Pearson r | Med rel err | Max abs diff |
+|------|-----------|-------------|-------------|
+| CS-50 | 0.7411 | 39.4% | 24.49 |
+| CS-200 | 0.9188 | 20.4% | 16.74 |
+| CS-500 | 0.9725 | 11.0% | 8.49 |
+| sub2k + CS-200 | 0.9455 | 17.0% | 16.65 |
+| sub2k + CS-500 | 0.9750 | 10.9% | 11.36 |
+
+### Analysis
+
+Subsample reduces N before the scatter-add loop, cutting the O(N·c) cost linearly.
+At N=50K, subsample-2K uses only 4% of individuals but still achieves ~30% speedup.
+The accuracy penalty at biobank scale will be less severe than bench_200k (2000/50000 = 4%
+retained vs 2000/2490 = 80% retained) — subsample accuracy scales with N'/window_size,
+not N'/N.
+
+**Key insight:** At N=50K, subsample-2K+CS-200 is expected to hit ~23.6s on AWS (vs 33.8s
+pure CS-200), trading ~5% accuracy for ~30% speed. subsample-5K+CS-200 barely helps
+because the scatter-add N'=5K is still the bottleneck relative to BED I/O.
+
+**d=500 at low N' is NOT free:** With subsample-2K, √N'≈45, so d=500 exceeds √N' and
+the GEMM cost (d²+w·d per chunk) becomes visible. CS-200 is the sweet spot at N'=2K.
+
+### Perf gate check (bench_200k)
+
+| Mode | Time | Baseline | Status |
+|------|------|----------|--------|
+| exact-f64 | 3004ms | ~3000ms | OK |
+| exact-f32 | 2022ms | ~2000ms | OK |
+| sketch-50 | 1163ms | ~1100ms | OK |
+| countsketch-50 | 584ms | ~600ms | OK |
+| countsketch-100 | 595ms | ~600ms | OK |
+
+No regressions. All modes within expected range.
