@@ -1715,3 +1715,29 @@ the GEMM cost (d²+w·d per chunk) becomes visible. CS-200 is the sweet spot at 
 | countsketch-100 | 595ms | ~600ms | OK |
 
 No regressions. All modes within expected range.
+
+## 2026-03-14: Branchless subsample scatter path for fused CountSketch
+
+**Change:** Apply branchless norm_lut to the `!all_iids` (subsample) branch in
+`countsketch_fused_project_f32` and `countsketch_fused_project_f64`. Instead of
+per-individual bit extraction + NaN branch, use `norm_lut[byte][shift/2]` to get
+the pre-normalized value directly (0.0 for missing).
+
+**Parity:** Bit-exact match with old code on bench_200k subsample-2k+CS-200 (all 22 chromosomes).
+
+### Local results (Ryzen 5 5600X, biobank_50k N=50,000)
+
+| Mode | Before | After | Change |
+|------|--------|-------|--------|
+| subsample-2k + CS-200 | 63.6s | 58.5s | **-8.0%** |
+| subsample-5k + CS-200 | 88.0s | 86.1s | -2.2% |
+
+### Analysis
+
+The branchless LUT eliminates bit extraction (`>>`, `&`, `is_nan` branch) per individual
+in the subsample path. The improvement is modest (~8% at N'=2K) because the subsample path
+already has fewer individuals and the bottleneck is BED I/O overhead at large M (1.66M SNPs).
+
+### Perf gate (bench_200k, no regressions)
+
+All modes within expected range. No change to non-subsample paths.

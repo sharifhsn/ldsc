@@ -937,15 +937,13 @@ fn countsketch_fused_project_f32(
                     }
                 }
             } else {
+                // Branchless subsample: use norm_lut to get pre-normalized values.
+                // shift/2 maps byte shift (0,2,4,6) to LUT index (0,1,2,3).
                 for (i, pos) in iid_positions.iter().enumerate() {
-                    let byte = snp_bytes[pos.byte_idx];
-                    let bits = (byte >> pos.shift) & 0b11;
-                    let g = GENO_LUT_F32[bits as usize];
-                    if !g.is_nan() {
-                        let val = (g - mean) * inv_std;
-                        *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
-                            *sign.get_unchecked(i) * val;
-                    }
+                    let vals = &norm_lut[snp_bytes[pos.byte_idx] as usize];
+                    let val = vals[(pos.shift / 2) as usize];
+                    *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
+                        *sign.get_unchecked(i) * val;
                 }
             }
 
@@ -1058,14 +1056,10 @@ fn countsketch_fused_project_f64(
                 }
             } else {
                 for (i, pos) in iid_positions.iter().enumerate() {
-                    let byte = snp_bytes[pos.byte_idx];
-                    let bits = (byte >> pos.shift) & 0b11;
-                    let g = GENO_LUT_F64[bits as usize];
-                    if !g.is_nan() {
-                        let val = (g - mean) * inv_std;
-                        *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
-                            *sign.get_unchecked(i) * val;
-                    }
+                    let vals = &norm_lut[snp_bytes[pos.byte_idx] as usize];
+                    let val = vals[(pos.shift / 2) as usize];
+                    *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
+                        *sign.get_unchecked(i) * val;
                 }
             }
 
