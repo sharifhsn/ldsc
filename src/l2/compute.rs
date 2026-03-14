@@ -332,6 +332,51 @@ impl CountSketchProj {
 const GENO_LUT_F64: [f64; 4] = [2.0, f64::NAN, 1.0, 0.0];
 const GENO_LUT_F32: [f32; 4] = [2.0, f32::NAN, 1.0, 0.0];
 
+/// Build a branchless 256-entry byte LUT for fused CountSketch scatter-add.
+/// For a given (mean, inv_std), each byte (4 genotypes) maps to 4 normalized f32 values.
+/// Missing genotypes map to 0.0 (impute to mean → center → 0), enabling unconditional scatter-add.
+fn build_norm_byte_lut_f32(mean: f32, inv_std: f32) -> [[f32; 4]; 256] {
+    // Pre-compute the 4 possible normalized values for each 2-bit code:
+    //   0b00 = hom A1 (geno=2) → (2 - mean) * inv_std
+    //   0b01 = missing         → 0.0
+    //   0b10 = het (geno=1)    → (1 - mean) * inv_std
+    //   0b11 = hom A2 (geno=0) → -mean * inv_std
+    let code_vals: [f32; 4] = [
+        (2.0 - mean) * inv_std,
+        0.0,
+        (1.0 - mean) * inv_std,
+        -mean * inv_std,
+    ];
+    std::array::from_fn(|b| {
+        let byte = b as u8;
+        [
+            code_vals[(byte & 0b11) as usize],
+            code_vals[((byte >> 2) & 0b11) as usize],
+            code_vals[((byte >> 4) & 0b11) as usize],
+            code_vals[((byte >> 6) & 0b11) as usize],
+        ]
+    })
+}
+
+/// f64 variant of the branchless byte LUT.
+fn build_norm_byte_lut_f64(mean: f64, inv_std: f64) -> [[f64; 4]; 256] {
+    let code_vals: [f64; 4] = [
+        (2.0 - mean) * inv_std,
+        0.0,
+        (1.0 - mean) * inv_std,
+        -mean * inv_std,
+    ];
+    std::array::from_fn(|b| {
+        let byte = b as u8;
+        [
+            code_vals[(byte & 0b11) as usize],
+            code_vals[((byte >> 2) & 0b11) as usize],
+            code_vals[((byte >> 4) & 0b11) as usize],
+            code_vals[((byte >> 6) & 0b11) as usize],
+        ]
+    })
+}
+
 // Byte-level stats LUT: each of the 256 possible BED byte values encodes 4
 // genotypes; this LUT gives (sum, count, sum_sq) for the full byte.
 #[derive(Clone, Copy)]
@@ -865,14 +910,28 @@ fn countsketch_fused_project_f32(
                 *v = 0.0;
             }
 
-            // Fused decode + normalize + scatter-add
+            // Branchless byte-level LUT: each byte → 4 normalized values
+            // Missing genotypes map to 0.0, so scatter-add is unconditional.
+            let norm_lut = build_norm_byte_lut_f32(mean, inv_std);
+
             if all_iids {
-                for i in 0..n_indiv {
-                    let byte = snp_bytes[i / 4];
-                    let bits = (byte >> ((i % 4) * 2)) & 0b11;
-                    let g = GENO_LUT_F32[bits as usize];
-                    if !g.is_nan() {
-                        let val = (g - mean) * inv_std;
+                // Process 4 individuals per byte (branchless)
+                let n_full_bytes = n_indiv / 4;
+                for byte_idx in 0..n_full_bytes {
+                    let vals = &norm_lut[snp_bytes[byte_idx] as usize];
+                    let base_i = byte_idx * 4;
+                    for (k, &val) in vals.iter().enumerate() {
+                        let i = base_i + k;
+                        *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
+                            *sign.get_unchecked(i) * val;
+                    }
+                }
+                // Remainder individuals in last partial byte
+                let rem_start = n_full_bytes * 4;
+                if rem_start < n_indiv {
+                    let vals = &norm_lut[snp_bytes[n_full_bytes] as usize];
+                    for (k, &val) in vals.iter().enumerate().take(n_indiv - rem_start) {
+                        let i = rem_start + k;
                         *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
                             *sign.get_unchecked(i) * val;
                     }
@@ -975,13 +1034,24 @@ fn countsketch_fused_project_f64(
                 *v = 0.0;
             }
 
+            let norm_lut = build_norm_byte_lut_f64(mean, inv_std);
+
             if all_iids {
-                for i in 0..n_indiv {
-                    let byte = snp_bytes[i / 4];
-                    let bits = (byte >> ((i % 4) * 2)) & 0b11;
-                    let g = GENO_LUT_F64[bits as usize];
-                    if !g.is_nan() {
-                        let val = (g - mean) * inv_std;
+                let n_full_bytes = n_indiv / 4;
+                for byte_idx in 0..n_full_bytes {
+                    let vals = &norm_lut[snp_bytes[byte_idx] as usize];
+                    let base_i = byte_idx * 4;
+                    for (k, &val) in vals.iter().enumerate() {
+                        let i = base_i + k;
+                        *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
+                            *sign.get_unchecked(i) * val;
+                    }
+                }
+                let rem_start = n_full_bytes * 4;
+                if rem_start < n_indiv {
+                    let vals = &norm_lut[snp_bytes[n_full_bytes] as usize];
+                    for (k, &val) in vals.iter().enumerate().take(n_indiv - rem_start) {
+                        let i = rem_start + k;
                         *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
                             *sign.get_unchecked(i) * val;
                     }

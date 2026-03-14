@@ -1621,3 +1621,39 @@ Full 15-mode sweep with fused CountSketch enabled. All modes ran 3× with 1 warm
 - Consider fused path for non-contiguous chunks (--extract with gaps) to eliminate
   b_full allocation entirely
 - Run accuracy comparison on AWS output files (CS-50 vs CS-200 vs CS-500 vs exact)
+
+## 2026-03-14: Branchless byte-level LUT for fused CountSketch
+
+**Change:** Replace per-individual bit extraction + NaN branch with branchless per-byte LUT
+in `countsketch_fused_project_f32` and `countsketch_fused_project_f64`.
+
+A 256-entry LUT maps each packed BED byte to 4 pre-normalized values. Missing genotypes
+map to 0.0 (impute→mean→center→0), enabling unconditional scatter-add without NaN branching.
+Processes 4 individuals per byte instead of 1.
+
+**Parity:** Bit-exact on bench_5k and bench_200k (diff of sorted .l2.ldscore.gz = empty).
+
+### Local results (Ryzen 5 5600X)
+
+**bench_200k (N=2,490):**
+
+| Mode | Before | After | Change |
+|------|--------|-------|--------|
+| countsketch-50 | 633ms | 604ms | -4.6% |
+| countsketch-100 | 639ms | 615ms | -3.8% |
+| countsketch-200 | 685ms | 618ms | -9.8% |
+
+**biobank_50k (N=50,000):**
+
+| Mode | Before | After | Change |
+|------|--------|-------|--------|
+| countsketch-200 | 61.95s | 61.81s | **-0.2%** (negligible) |
+
+### Analysis
+
+At small N (2,490), the LUT eliminates per-individual bit extraction overhead and branch
+misprediction, yielding 5-10% improvement. At biobank N (50K), the bottleneck is random
+scatter-writes to `bucket[i]` (L3 cache misses on the d×c accumulator), not branch
+prediction or bit extraction. The LUT has no measurable impact on the memory-bound path.
+
+**Verdict:** Commit — cleaner loop structure, minor win at small N, no regression anywhere.
