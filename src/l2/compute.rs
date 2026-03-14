@@ -1143,13 +1143,16 @@ pub(super) fn compute_ldscore_global(
     // Compress individual dimension N→d via random projection P (d×N).
     // All subsequent GEMMs operate on d-dimensional data.
     // Bias correction: E[val̃²] = val²(1+1/d) + N²/d, absorbed into adjusted constants.
-    let sketch_dim: Option<usize> = sketch.and_then(|d| {
-        if d < 3 || d >= n_indiv {
-            eprintln!("WARNING: --sketch {d} ignored (must be 3 ≤ d < n_indiv={n_indiv})");
-            return None;
+    let sketch_dim: Option<usize> = match sketch {
+        Some(d) => {
+            anyhow::ensure!(
+                d >= 3 && d < n_indiv,
+                "--sketch {d} is out of bounds (must be 3 ≤ d < n_indiv={n_indiv})"
+            );
+            Some(d)
         }
-        Some(d)
-    });
+        None => None,
+    };
     let gemm_n: usize; // row dimension for all GEMM matrices (d when sketching, N otherwise)
     let active_n_inv_sq_r2u_a: f64;
     let active_r2u_b: f64;

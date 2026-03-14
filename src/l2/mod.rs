@@ -64,6 +64,18 @@ pub fn run(args: L2Args) -> Result<()> {
         WindowMode::Cm(args.ld_wind_cm.unwrap_or(1.0))
     };
 
+    // Validate --sketch-method
+    match args.sketch_method.as_str() {
+        "rademacher" | "countsketch" => {}
+        other => anyhow::bail!(
+            "--sketch-method must be 'rademacher' or 'countsketch', got '{}'",
+            other
+        ),
+    }
+    if args.sketch.is_none() && args.sketch_method != "rademacher" {
+        anyhow::bail!("--sketch-method requires --sketch to be set");
+    }
+
     let bim_path = format!("{}.bim", args.bfile);
     let fam_path = format!("{}.fam", args.bfile);
     let bed_path = format!("{}.bed", args.bfile);

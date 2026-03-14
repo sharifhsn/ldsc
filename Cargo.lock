@@ -2530,7 +2530,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "ldsc"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bzip2-rs",
@@ -2541,12 +2541,12 @@ dependencies = [
  "faer",
  "fastrand",
  "flate2",
+ "memmap2",
  "mimalloc",
  "polars",
  "rayon",
  "statrs",
  "tempfile",
- "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -5147,9 +5147,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
- "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

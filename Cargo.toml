@@ -1,6 +1,6 @@
 [package]
 name          = "ldsc"
-version       = "0.3.1"
+version       = "0.4.0"
 edition       = "2024"
 description   = "LD Score Regression — fast Rust reimplementation of Bulik-Sullivan et al. LDSC"
 license       = "GPL-3.0-only"
@@ -24,6 +24,14 @@ exclude       = [
   "cubecl/*",
   "docs/ldsc_paper.md",
   "docs/ldsc_supplementary_note.md",
+  "Dockerfile.bench*",
+  "Dockerfile.marker*",
+  "scripts/marker-pdf*",
+  "scripts/*.py",
+  "CLAUDE.md",
+  "docs/plan-*",
+  "AGENTS.md",
+  "testing.md",
 ]
 
 [dependencies]
@@ -62,8 +70,6 @@ tempfile = "3"
 crossbeam-channel = "0.5"
 cubecl = { version = "=0.10.0-pre.2", features = ["cuda"], optional = true }
 cubek-matmul = { version = "=0.2.0-pre.2", optional = true }
-tokio = { version = "1.50.0", features = ["full"] }
-
 # mimalloc — use for musl builds where the default allocator is slow under rayon parallelism.
 # Builds mimalloc from C source (self-contained, no system dependency).
 mimalloc = { version = "0.1", optional = true }

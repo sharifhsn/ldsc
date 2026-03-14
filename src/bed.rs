@@ -662,24 +662,11 @@ impl MmapBed {
     pub fn advise_willneed(&self, sid_start: usize, count: usize) {
         let offset = BED_HEADER_LEN as usize + sid_start * self.bytes_per_snp;
         let len = count * self.bytes_per_snp;
-        // advise_range is best-effort; ignore errors
-        let _ = self
+        if let Err(e) = self
             .mmap
-            .advise_range(memmap2::Advice::WillNeed, offset, len);
-    }
-
-    #[allow(dead_code)]
-    pub fn bytes_per_snp(&self) -> usize {
-        self.bytes_per_snp
-    }
-
-    #[allow(dead_code)]
-    pub fn iid_count(&self) -> usize {
-        self.iid_count
-    }
-
-    #[allow(dead_code)]
-    pub fn sid_count(&self) -> usize {
-        self.sid_count
+            .advise_range(memmap2::Advice::WillNeed, offset, len)
+        {
+            tracing::warn!("madvise WILLNEED failed (offset={offset}, len={len}): {e}");
+        }
     }
 }

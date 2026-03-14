@@ -409,6 +409,28 @@ Benefit scales with GPFS cache miss rate (highest on the first job run after dat
 not available; `--prefetch-bed` uses standard POSIX `pread` on a background `std::thread`.
 Output is always bit-identical to the default path.
 
+### Memory-mapped BED I/O (`--mmap`)
+
+For HPC deployments with GPFS, Lustre, or other networked filesystems, `--mmap` uses
+memory-mapped I/O instead of buffered reads. This provides:
+
+- **Zero-copy access** for the fused CountSketch path (eliminates ~20GB of memcpy at biobank scale)
+- **OS-managed readahead** via `MADV_SEQUENTIAL` — GPFS can prefetch across storage nodes in parallel
+- **Async prefetch** via `MADV_WILLNEED` on the next chunk — replaces `--prefetch-bed` without thread contention
+- **No seek invalidation** — unlike `BufReader`, mmap'd pages stay resident once faulted
+
+```bash
+# Recommended for GPFS/Lustre HPC
+ldsc l2 --bfile … --out … --mmap
+
+# Can combine with any mode
+ldsc l2 --bfile … --out … --mmap --sketch 200 --sketch-method countsketch
+```
+
+**Note:** On local SSD with warm cache, `--mmap` regresses ~15% due to page fault overhead.
+Use the default (no flag) for local storage. `--mmap` is designed for networked filesystems
+where it replaces both `--prefetch-bed` and buffered reads.
+
 ### Optional GPU acceleration (experimental)
 
 Build with `--features gpu` to enable CUDA-accelerated matrix multiplication via
@@ -416,13 +438,20 @@ Build with `--features gpu` to enable CUDA-accelerated matrix multiplication via
 
 ```bash
 cargo build --release --features gpu
-ldsc l2 --bfile … --out … --gpu
+ldsc l2 --bfile … --out … --gpu              # f32 compute (default)
+ldsc l2 --bfile … --out … --gpu --gpu-f64    # native f64 compute
+ldsc l2 --bfile … --out … --gpu --gpu-flex32 # half-precision compute, f32 accumulation
 ```
+
+Precision options:
+- `--gpu`: Default f32 compute
+- `--gpu-f64`: Native f64 on GPU (slower but numerically exact)
+- `--gpu-flex32`: Half-precision compute with f32 accumulation (fastest, slight accuracy loss)
+- `--gpu-tile-cols N`: Split large window matrices into VRAM-fitting tiles
 
 At 1000G scale (n=2,490), GPU is transfer-bound and slower than CPU. GPU acceleration
 targets biobank-scale cohorts (n >= 50k) where each chunk's GEMM is large enough for
-compute to dominate PCIe transfer. Use `--gpu-tile-cols N` to split large window
-matrices into VRAM-fitting tiles.
+compute to dominate PCIe transfer.
 
 Default build (CPU only):
 
@@ -513,6 +542,7 @@ The following flags are available for performance tuning:
 - `--rayon-threads N`: Rayon thread count for jackknife in `h2`/`rg`.
 - `--polars-threads N`: Polars thread count for CSV streaming in `munge-sumstats`.
 - `--prefetch-bed`: Background BED reader thread for `l2`. Beneficial on networked filesystems (GPFS/NFS); hurts on local SSD with warm cache. See [BED prefetch](#bed-prefetch-for-networked-storage---prefetch-bed) for full guidance.
+- `--mmap`: Memory-mapped BED I/O for `l2`. Recommended for GPFS/Lustre HPC; replaces `--prefetch-bed`. See [mmap](#memory-mapped-bed-io---mmap) for details.
 
 ---
 
