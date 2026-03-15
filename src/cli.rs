@@ -339,14 +339,6 @@ pub struct L2Args {
     #[arg(long, value_name = "N_PRIME", conflicts_with = "keep")]
     pub subsample: Option<usize>,
 
-    /// Use Gram matrix fast path for CountSketch. Replaces O(d×W×M) cross-window
-    /// GEMM with O(d²×M) quadratic forms. Dramatic speedup when windows span entire
-    /// chromosomes (e.g. --ld-wind-cm 1 on data with CM=0). Stores all sketch vectors
-    /// in memory (d×M×4 bytes, ~332 MB at d=50 M=1.66M).
-    /// Only applies when --sketch-method countsketch is also set.
-    #[arg(long)]
-    pub gram: bool,
-
     /// Print per-section timing breakdown to stderr.
     #[arg(long)]
     pub verbose_timing: bool,

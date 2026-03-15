@@ -401,7 +401,6 @@ pub fn run(args: L2Args) -> Result<()> {
         args.sketch,
         args.sketch_method.as_str(),
         args.mmap,
-        args.gram,
     )
     .context("computing LD scores")?;
 

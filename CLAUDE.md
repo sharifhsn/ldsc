@@ -50,7 +50,7 @@ All source lives in `src/`. The binary is a clap-derive CLI dispatcher (`main.rs
 - **`munge.rs`** — Polars LazyFrame pipeline for GWAS summary statistics preprocessing. Streams input without loading entire file into RAM.
 - **`l2/`** — LD score computation, split into submodules:
   - **`mod.rs`** (~570 lines) — `run()` orchestrator: arg validation, BIM/FAM loading, `--extract`/`--annot`/`--keep` wiring, output writing.
-  - **`compute.rs`** (~2200 lines) — `compute_ldscore_global`: ring-buffer GEMM loop (sequential global pass, scalar + partitioned + sketch + stochastic paths). Also `countsketch_gram_path` (Gram matrix fast path, `--gram`), `GemmBufs`, Rademacher helpers, GPU compat helpers.
+  - **`compute.rs`** (~1830 lines) — `compute_ldscore_global`: ring-buffer GEMM loop (sequential global pass, scalar + partitioned + sketch + stochastic paths). Also `GemmBufs`, Rademacher helpers, GPU compat helpers.
   - **`window.rs`** — `WindowMode` enum + `get_block_lefts_*`: per-chromosome window boundary computation.
   - **`normalize.rs`** — `normalize_col_f{32,64}_with_stats`: impute NaN→mean, centre, unit-variance. AVX2+FMA `sum_sumsq_f32`.
   - **`snp_stats.rs`** — `compute_snp_stats`: fast BED scan for MAF + het/missing prefilter.
@@ -156,8 +156,6 @@ Three opt-in modes trade precision for speed in the `l2` subcommand:
   - Accuracy depends on d: d=50 r≈0.81, d=100 r≈0.85, d=200 r≈0.93, d=500 r≈0.97
   - **Automatically enables f32** — sketch entries (±1/√d or ±1) are exactly representable in f32, producing bit-identical output. `--fast-f32` is redundant with `--sketch`.
   - Deterministic (seed=42). Same `--sketch d` on same data always produces identical output.
-
-- **`--gram`** — Gram matrix fast path for CountSketch. Replaces O(d×W×M) cross-window GEMM with O(d²×M) quadratic forms via the identity Σ_k (s_j·s_k)² = s_j^T G s_j. Two-pass algorithm (forward: BED+Gram accumulation, backward: stored sketch vectors). **11.7× speedup** on full-chromosome windows (d=50, 1.66M SNPs: 136s→11.7s). Only applies with `--sketch-method countsketch`. Stores all sketch vectors in memory (d×M×4 bytes). Best when d² << average window size; regresses at d≥100 with narrow windows.
 
 - **`--stochastic <T>`** — Hutchinson's trace estimation with T random probes. ~7% median error at T=50. Best at 1000G scale (36.2s vs 41.1s exact). Incompatible with partitioned (`--annot`). T>50 causes cache thrashing regression.
 
