@@ -1111,6 +1111,7 @@ pub(super) fn compute_ldscore_global(
     sketch: Option<usize>,
     sketch_method: &str,
     use_mmap: bool,
+    snp_level_masking: bool,
 ) -> Result<(MatF, Vec<f64>)> {
     let m = all_snps.len();
     if m == 0 {
@@ -2485,6 +2486,23 @@ pub(super) fn compute_ldscore_global(
                         );
                     }
                 }
+                // SNP-level B×B masking: zero r2u_bb entries for pairs outside
+                // each other's window. Only triggers at chromosome boundaries
+                // where block_left jumps within a chunk.
+                if snp_level_masking {
+                    for j in 1..c {
+                        let bl_j = block_left[chunk_start + j];
+                        if bl_j <= chunk_start {
+                            continue;
+                        }
+                        let cutoff = bl_j - chunk_start;
+                        for k in 0..cutoff.min(j) {
+                            r2u_bb[(j, k)] = 0.0;
+                            r2u_bb[(k, j)] = 0.0;
+                        }
+                    }
+                }
+
                 let r2u_bb_view = mat_slice(r2u_bb.as_ref(), 0..c, 0..c);
                 // Small matmul (c×c @ c×n_annot) — Par::Seq avoids thread-pool overhead
                 if let Some(ref eff) = annot_chunk_eff {
@@ -2783,6 +2801,25 @@ pub(super) fn compute_ldscore_global(
                                     *r2u_val =
                                         *ab_val * *ab_val * active_n_inv_sq_r2u_a + active_r2u_b;
                                 }
+                            }
+                        }
+                    }
+
+                    // SNP-level A×B masking: zero r2u_ab entries where the window
+                    // SNP is outside the chunk SNP's per-SNP window boundary.
+                    // Window is sorted by snp_idx; block_left is non-decreasing
+                    // across the chunk, so the cutoff row can only advance.
+                    if snp_level_masking {
+                        let mut cutoff_row = 0usize;
+                        for j in 0..c {
+                            let bl_j = block_left[chunk_start + j];
+                            while cutoff_row < w
+                                && window.get(cutoff_row).is_some_and(|(idx, _)| *idx < bl_j)
+                            {
+                                cutoff_row += 1;
+                            }
+                            for wi in 0..cutoff_row {
+                                r2u_ab[(wi, j)] = 0.0;
                             }
                         }
                     }

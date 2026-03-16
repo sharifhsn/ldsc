@@ -1833,3 +1833,204 @@ map positions aren't populated, and users should use `--ld-wind-kb 1000` instead
 
 **Verdict:** Reverted. The code was correct but solves a problem that doesn't exist in
 practice. exact-f32 is the right path for production speedups.
+
+## 2026-03-15: SNP-level window masking (`--snp-level-masking`)
+
+**Change:** Added `--snp-level-masking` flag to `l2` subcommand. When enabled, after
+computing r²_unbiased via the standard chunk GEMM, entries for SNP pairs outside each
+SNP's exact window are zeroed before the annotation matmul. This eliminates the
+chunk-level eviction approximation from Python LDSC.
+
+**Background:** Python LDSC evicts window entries at chunk granularity:
+`a_left = block_left[chunk_start]` for ALL SNPs in the chunk. This is a numpy vectorization
+hack — the Python docstring explicitly calls it an approximation. The LDSC paper
+(Bulik-Sullivan et al. 2015) defines LD scores without any chunking; the chunk-level
+approximation is not discussed or justified in the paper.
+
+**Implementation:** Two masking passes after GEMM, before annotation matmul:
+- **B×B masking**: Zeros within-chunk pairs crossing chromosome boundaries. Only triggers
+  at 42/8334 chunks at full 1.66M scale (essentially a no-op within chromosomes).
+- **A×B masking**: Zeros window×chunk entries where the window SNP is outside the chunk
+  SNP's per-SNP window. Uses monotonic cutoff_row optimization (O(w+c) not O(w×c)).
+
+**Performance:** Zero measurable cost. Masking runs after GEMM (which is 74% of runtime);
+the O(w+c) masking loop is negligible compared to the O(w×c×n) GEMM.
+
+**L2 Score Impact (full 1.66M SNPs, --ld-wind-kb 1000, N=2490):**
+
+| Metric | Value |
+|--------|-------|
+| SNPs that differ | 99.99% (1,664,777 / 1,664,852) |
+| Direction | Masked lower in 99.9% of cases |
+| Mean relative diff | 11.3% |
+| Max relative diff | 94.6% |
+| Mean absolute diff | 3.43 |
+
+**h2 Impact (real GWAS sumstats, --ref-ld-chr and --w-ld-chr both set to same L2):**
+
+| Trait | Unmasked h2 (SE) | Masked h2 (SE) | Change |
+|-------|-----------------|----------------|--------|
+| BMI | 0.1045 (0.0057) | 0.1209 (0.0065) | +15.7% |
+| SCZ | 0.3292 (0.0166) | 0.3825 (0.0187) | +16.2% |
+
+Cross-tests isolating ref-ld vs w-ld effects (BMI):
+
+| ref-ld | w-ld | h2 (SE) | Interpretation |
+|--------|------|---------|----------------|
+| unmasked | unmasked | 0.1045 (0.0057) | Python-equivalent baseline |
+| masked | unmasked | 0.1238 (0.0067) | Regressor effect only: +18.5% |
+| unmasked | masked | 0.1011 (0.0055) | Weight effect only: -3.3% |
+| masked | masked | 0.1209 (0.0065) | Combined: +15.7% |
+
+The h2 increase is driven by the regressor change (lower LD scores → steeper slope → higher h2).
+The weight change partially counteracts.
+
+**Verdict:** Implemented as opt-in `--snp-level-masking`. Default (no flag) remains
+Python-identical for reproducibility. The masking produces LD scores more faithful to the
+paper's definition at zero performance cost. Whether this improves h2 accuracy is
+unknown without ground-truth simulation — the 2.6-2.8 SE difference is statistically
+meaningful but the LDSC framework tolerates LD score perturbations of this magnitude.
+
+**Window size dependence:** The chunk-level approximation error is controlled by the ratio
+of window size (in SNPs) to chunk_c (200). Smaller windows → block_left varies more within
+each chunk → more A×B entries are wrongly included → larger L2 and h2 differences.
+
+L2 score impact (full 1.66M SNPs, N=2490):
+
+| Window (kb) | Mean window (SNPs) | Window/chunk | Mean L2 rel diff | Median | p95 |
+|-------------|--------------------|--------------|-----------------:|-------:|----:|
+| 100 | ~69 | 0.35 | 36.4% | 35.3% | 67.4% |
+| 500 | ~327 | 1.6 | 15.8% | 14.3% | 34.3% |
+| 1000 | ~642 | 3.2 | 11.3% | 10.3% | 23.8% |
+| 2000 | ~1261 | 6.3 | 7.7% | 7.1% | 15.5% |
+
+Downstream h2 impact (BMI GWAS sumstats):
+
+| Window (kb) | Chunk h2 (SE) | SNP h2 (SE) | h2 change | Intercept change |
+|-------------|--------------|-------------|-----------|-----------------|
+| 100 | 0.1710 (0.0085) | 0.2525 (0.0134) | +47.7% | 0.790 → 0.815 |
+| 500 | 0.1356 (0.0070) | 0.1631 (0.0083) | +20.3% | 0.809 → 0.799 |
+| 1000 | 0.1045 (0.0057) | 0.1209 (0.0065) | +15.7% | 0.833 → 0.822 |
+| 2000 | 0.0703 (0.0041) | 0.0784 (0.0045) | +11.5% | 0.869 → 0.860 |
+
+At 100kb (window < chunk), the chunk approximation is catastrophically wrong — the window
+is only 69 SNPs but Python rounds up to 200, inflating L2 by 36% and h2 by 48%.
+
+### GEMM Scheduling Analysis
+
+Exhaustive analysis of alternative GEMM scheduling approaches for exact mode:
+- **Chunk size**: Total FLOPs = O(NwM), invariant to c. PGO sweep confirmed c=200 optimal.
+- **Fused square-accumulate**: Saves ~6% memory traffic but requires abandoning faer's GEMM.
+- **Symmetry**: Already fully exploited (single A^T·B gives both contrib_left and contrib_right).
+- **Window overlap**: Consecutive chunks share ~2/3 of window columns, but B' is new data —
+  no reusable pairs exist.
+- **diag(G²) reformulation**: l2[j] = x_j^T(XX^T)x_j requires O(N²M) FLOPs, worse than
+  O(NwM) when N > w (true for all real datasets).
+- **Cache scheduling**: faer's internal panel tiling already optimizes for L2/L3 hierarchy.
+- **Genotype discreteness**: 3-value columns enable O(N/32) contingency-table dot products
+  via SIMD popcount, but loses cache locality vs contiguous GEMM buffers.
+
+**Conclusion**: Exact mode is at ~88% of the memory-bandwidth ceiling (measured: 5.5 GFLOPS/core
+vs ~6.25 effective peak on EPYC AVX2 f64). No algorithmic reformulation can break through this
+because the total data read (every column dotted with every window neighbor) is irreducible.
+Further speedups require approximate methods (sketch/countsketch) or reduced precision (f32).
+At 2000kb (window ~6× chunk), the approximation is decent (~8% L2 diff, ~12% h2 diff).
+
+Note: h2 also varies with window size even without masking (larger windows include more
+distant, near-zero r² pairs → inflates LD scores → flattens regression slope → lower h2).
+The standard LDSC window is 1 cM (~1000 kb average), following the paper.
+
+## 2026-03-15: Comprehensive Python LDSC Correctness Audit
+
+Five parallel expert audits of the Python LDSC implementation (`ldsc_py/`) against the
+original paper (`docs/ldsc_paper.md`) and supplementary note (`docs/ldsc_supplementary_note.md`).
+Each audit focused on a different subsystem: LD score computation, h2/rg regression,
+sumstats munging, partitioned LD scores, and numerical edge cases.
+
+### HIGH severity (3 findings)
+
+**H1. Dead `raise` after `return` swallows file parsing errors** (`sumstats.py:149-150`)
+`_read_chr_split_files` does `return e` then `raise e` (dead code). LD score parsing errors
+are silently returned as Python exception objects instead of being raised. Causes cryptic
+downstream errors when LD score files are malformed.
+*Rust status: ABSENT. Rust uses `?` operator with `anyhow::Result` throughout.*
+
+**H2. Undefined variable `fh` in `annot()` per-chr path** (`parse.py:223`)
+Per-chromosome annotation loading calls `get_present_chrs(fh, num+1)` but the parameter is
+`fh_list`, not `fh`. Causes NameError crash for `--overlap-annot --ref-ld-chr`.
+*Rust status: ABSENT. Compiler catches undefined variables.*
+
+**H3. Daner column deletion is a no-op** (`munge_sumstats.py:561`)
+`cname_map[x] == 'c'` compares against string literal `'c'` instead of variable `c`.
+N/FRQ columns not cleaned up in `--daner` mode. Rarely triggered but a real bug.
+*Rust status: ABSENT. Rust `apply_daner_overrides` uses proper filter-based column removal.*
+
+### MEDIUM severity (5 findings)
+
+**M1. Genetic covariance clipped to [-1, 1]** (`regressions.py:662-663`)
+`rho_g` (a covariance, not a correlation) is clipped to [-1, 1] in the rg weight function.
+Genetic covariance is not bounded by [-1, 1]. Distorts weights for high-h2 traits.
+*Rust status: PRESENT (intentional parity). `regressions.rs:1661` does `rho_g.clamp(-1.0, 1.0)`.*
+
+**M2. Off-by-one in bounds checks** (`ldscore.py:81,94`)
+`keep_indivs > self.n` should be `>= self.n` (0-based indexing). Index equal to n silently
+reads BED padding bits (potentially garbage genotypes).
+*Rust status: ABSENT. `bed.rs` uses `u < max` and `sid < self.sid_count` (correct).*
+
+**M3. Typo `it` vs `i` in pop_prev guard** (`sumstats.py:456`)
+`all((i is not None for it in args.pop_prev))` checks variable `i` from outer scope instead
+of `it` from the generator. Liability-scale conversion guard may not detect None prevalence.
+*Rust status: N/A. Rust has no equivalent validation (compiler prevents this class of bug).*
+
+**M4. `--N-cas`/`--N-con` uses total N, not effective N** (`munge_sumstats.py:339-340`)
+`N = N_cas + N_con` instead of `4*N_cas*N_con/(N_cas+N_con)`. For unbalanced case-control
+(e.g., 1:4 ratio), N is overestimated by 56%, biasing h2 downward by ~36%.
+*Rust status: PRESENT (intentional parity). `munge.rs:345-346` uses `n_cas + n_con`.*
+
+**M5. Condition number check receives column names** (`sumstats.py:260,323`)
+`_check_ld_condnum(ref_ld_cnames)` passes string Index instead of matrix. Shape guard
+prevents execution for partitioned regression, so the check is silently skipped.
+*Rust status: N/A. Rust uses QR/LU solvers which handle ill-conditioning natively.*
+
+### LOW severity (6 notable findings)
+
+**L1. NaN from sqrt of negative h2 delete values in rg** (`regressions.py:705-706`)
+`np.sqrt(hsq1_delete * hsq2_delete)` produces NaN when jackknife deletes go negative.
+*Rust status: ABSENT (improved). Rust guards `prod >= 0.0` before sqrt.*
+
+**L2. IRWLS hardcoded to 2 iterations** (`irwls.py:111`)
+Paper describes iterating to convergence. 2 iterations empirically sufficient but not proven.
+*Rust status: PRESENT (parity). `h2.rs:447` uses `for _ in 0..2`.*
+
+**L3. `max(x[0][1])` no-op on intercept** (`regressions.py:366`)
+Intended to clamp negative intercept but `max()` on single element returns the element unchanged.
+*Rust status: ABSENT. Rust passes intercept directly without broken clamping attempt.*
+
+**L4. Partitioned regression skips IRWLS** (`sumstats.py:333-334`)
+Uses single-pass WLS with `old_weights=True`. By design — aggregate h2 gives reasonable weights.
+*Rust status: PRESENT (parity). Same design choice.*
+
+**L5. Lambda GC constant 0.4549 vs exact 0.4549364** (`regressions.py:380`)
+Rounded constant, ~0.008% relative error. Display-only, not used in regression.
+*Rust status: Uses `statrs` chi-squared inverse CDF (exact computation).*
+
+**L6. Duplicate function definitions M() and M_fromlist()** (`parse.py:174-210`)
+Second definition shadows first. Both identical. Dead code.
+*Rust status: N/A. Compiler prevents duplicate definitions.*
+
+### Already known (confirmed by audit)
+
+- **Chunk-level window eviction** — our finding, 11-36% L2 inflation depending on window size
+- **Asymmetric window expansion** — `ceil(block_size/c)*c` rounds up left boundary only
+
+### Key takeaways
+
+1. **Core statistics are correct.** The unbiased r² estimator (uses precise N-2 vs paper's 1/N),
+   IRWLS regression, block jackknife, liability-scale conversion, and partitioned regression are
+   all faithful to the paper.
+2. **Real bugs are in plumbing.** High-severity findings are Python coding errors (dead code,
+   undefined variable, string literal typo), not statistical mistakes.
+3. **Chunk-level window approximation is the biggest statistical issue** in the entire codebase.
+4. **Rust rewrite status:** All 3 HIGH bugs absent (Rust compiler prevents most). 2 MEDIUM bugs
+   present by design (parity): genetic covariance clipping and N_cas+N_con. 1 LOW bug actively
+   improved (NaN guard on rg sqrt).

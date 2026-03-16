@@ -242,6 +242,18 @@ pub struct L2Args {
     #[arg(long)]
     pub mmap: bool,
 
+    /// Process all chromosomes in a single sequential pass (legacy behavior).
+    /// Default is per-chromosome parallel processing for better GEMM scaling.
+    #[arg(long)]
+    pub global_pass: bool,
+
+    /// Use exact per-SNP window boundaries instead of chunk-level approximation.
+    /// Zeroes r² contributions outside each SNP's true window after the GEMM.
+    /// Produces theoretically correct LD scores at no measurable performance cost.
+    /// Without this flag, the chunk-level approximation matches Python LDSC exactly.
+    #[arg(long)]
+    pub snp_level_masking: bool,
+
     /// File containing SNP IDs (one per line) to print LD scores for.
     /// Unlike --extract, all SNPs are still used in LD windows; only output is filtered.
     #[arg(long)]

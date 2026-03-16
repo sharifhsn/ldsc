@@ -5,7 +5,7 @@ use crate::la::{
     matmul_tn_to,
 };
 use anyhow::{Result, bail};
-use faer::linalg::solvers::{PartialPivLu, Solve, SolveLstsq, Svd};
+use faer::linalg::solvers::{PartialPivLu, Qr, Solve, SolveLstsq};
 use faer::{Accum, Par};
 
 #[derive(Debug, Clone)]
@@ -83,9 +83,10 @@ pub(crate) fn weight_xy(x: &MatF, y: &ColF, w: &ColF) -> Result<(MatF, ColF)> {
 
 fn wls(x: &MatF, y: &ColF, w: &ColF) -> Result<ColF> {
     let (xw, yw) = weight_xy(x, y, w)?;
-    let svd = Svd::new(xw.as_ref()).map_err(|err| anyhow::anyhow!("svd for wls: {:?}", err))?;
+    // QR decomposition: O(n·p²) memory (n×p thin Q), not O(n²) like full SVD.
+    let qr = Qr::new(xw.as_ref());
     let mut rhs = yw.clone();
-    svd.solve_lstsq_in_place(rhs.as_mut());
+    qr.solve_lstsq_in_place(rhs.as_mut());
     Ok(rhs)
 }
 

@@ -225,16 +225,19 @@ ldsc cts-annot \
 
 Native builds require Rust ≥ 1.85. The Rust implementation uses `faer` for dense linear algebra.
 
-### Fast f32 mode (experimental)
+### Fast f32 mode
 
 Pass `--fast-f32` to `ldsc l2` to run core matmuls in f32 while accumulating
 in f64. This halves the memory bandwidth for GEMM and can be significantly faster on CPUs
-with 256-bit SIMD. It is **not parity-safe** compared to the default f64 path.
+with 256-bit SIMD.
 
 Observed speedup varies with panel size (hyperfine-validated, AWS EPYC 7R13):
 - **N=2,490 (1000G):** ~1.3× faster vs f64 exact
 - **N=50,000 (biobank):** ~1.85× faster vs f64 exact (bandwidth-limited, f32 halves per-chunk BED footprint)
-- Output deltas vs f64: `max_abs_diff ≈ 0.008` (well within h2/rg regression noise)
+- Per-SNP LD score deltas vs f64: `max_abs_diff ≈ 0.008`
+- **Downstream h2/rg regression: identical to f64** — h2 estimate, SE, intercept, and ratio
+  all match to displayed precision. The per-SNP noise is far below the regression's sensitivity
+  threshold. **This is the recommended mode for biobank-scale data when exact h2/rg is needed.**
 
 **Note:** `--sketch` automatically enables f32 (see below), so `--fast-f32` is only needed
 for exact or `--stochastic` modes.
@@ -306,13 +309,22 @@ r²_unbiased constants, but a single run can show systematic shifts. Requires d 
 | 200     | ~61× (25.4s)                  | ~0.93             | ~6%                 | recommended default |
 | 500     | ~49× (31.5s)                  | ~0.97             | ~3%                 | high accuracy   |
 
-Accuracy measured at N=2,490 (1000G). At biobank scale (N=50K), sketch speedup is bounded by
-BED read bandwidth: `--sketch 50` achieves **5.3×** over exact-f64, and is the recommended
-biobank mode.
+Accuracy measured at N=2,490 (1000G). At biobank scale (N=50K), CountSketch is recommended
+over Rademacher — see [Projection methods](#projection-methods---sketch-method) below.
+
+**Important: downstream h2/rg regression accuracy.** Sketch LD scores introduce measurement
+error that causes attenuation bias in h2 regression — the h2 estimate is systematically low
+and the intercept is inflated. This effect is much larger than the per-SNP LD score error
+suggests. See [Downstream regression impact](#downstream-regression-impact) for detailed
+benchmarks. If exact h2/rg is needed, use `--fast-f32` (exact, 1.84× faster) or CountSketch
+at d ≥ 5000.
 
 ```bash
-# Sketch (faster, approximate — d=200 is a good default)
+# Sketch (faster, approximate — d=200 is a good default for LD scores)
 ldsc l2 --bfile … --out … --sketch 200
+
+# High-accuracy sketch for downstream h2/rg (d=5000, ~2% h2 bias)
+ldsc l2 --bfile … --out … --sketch 5000 --sketch-method countsketch
 
 # Exact (default, numerically identical to Python)
 ldsc l2 --bfile … --out …
@@ -348,16 +360,33 @@ ldsc l2 --bfile … --out … --sketch 100 --sketch-method countsketch
 - **Rademacher:** avoid d > 500 — cache thrashing from the d×N projection matrix causes
   severe regression at d=1000.
 - **CountSketch:** d up to √N is free (scatter-add is O(N×c), independent of d). Above √N,
-  the downstream d×d matmul begins to matter. d=500–1000 recommended.
+  the downstream d×d matmul begins to matter. Even at d=10000 (20% of N=50K), CountSketch
+  is still ~2× faster than exact-f32 and ~4× faster than exact-f64.
+- **Downstream h2/rg bias:** sketch LD scores cause errors-in-variables attenuation in
+  regression. See [Downstream regression impact](#downstream-regression-impact) for
+  benchmarks. Use d ≥ 5000 for h2/rg, or `--fast-f32` for exact regression.
 - Incompatible with `--gpu` and `--stochastic`.
 - Results are deterministic (fixed PRNG seed 42).
 - Works with partitioned annotations (unlike `--stochastic`).
+
+### Downstream regression impact
+
+Sketch LD scores cause **errors-in-variables attenuation bias** in h2 regression: the h2
+estimate is systematically low and the intercept is inflated. exact-f32 has zero downstream
+error. For full benchmarks, see [docs/performance-deep-dive.md](docs/performance-deep-dive.md#downstream-regression-impact).
+
+| Use case | Recommended mode | Speedup vs exact-f64 |
+|----------|-----------------|---------------------|
+| Exact h2/rg needed | `--fast-f32` | 1.84× |
+| h2 within ~2% | `--sketch 5000 --sketch-method countsketch` | ~5× |
+| h2 within ~4% | `--sketch 1000 --sketch-method countsketch` | ~9× |
+| LD scores only (QC, visualization) | `--sketch 200 --sketch-method countsketch` | ~20× |
 
 ### Individual subsampling (`--subsample`, experimental)
 
 Pass `--subsample N'` to `ldsc l2` to randomly select N' individuals from the reference
 panel before LD computation. This reduces both BED I/O and GEMM cost proportionally —
-runtime scales as O(N'²) instead of O(N²).
+runtime scales with N' instead of N.
 
 **This is an approximation.** LD scores from a subsample are noisier than from the full
 panel. For biobank-scale data (N > 10K), N' = 2,000–5,000 gives accurate LD scores for
@@ -573,7 +602,7 @@ all 1,664,852 SNPs.
 #### Biobank scale (N = 50,000)
 
 At biobank-scale N, GEMM dominates and larger panels expose more parallelism. Python runtime is
-extrapolated from the 1000G linear O(N²) scaling; Rust runtimes are hyperfine-measured (AWS EPYC 7R13,
+extrapolated assuming linear O(N) scaling; Rust runtimes are hyperfine-measured (AWS EPYC 7R13,
 same hardware as above).
 
 | Mode | Wall time | vs exact-f64 | Notes |
@@ -583,9 +612,16 @@ same hardware as above).
 | `--sketch 50` (Rademacher) | 118.4 s | 5.6× | r ≈ 0.81 |
 | `--sketch 200` (Rademacher) | 151.8 s | 4.4× | r ≈ 0.93 |
 | **`--sketch 50 --sketch-method countsketch`** | **33.1 s** | **20.1×** | r ≈ 0.81 |
-| **`--sketch 200 --sketch-method countsketch`** | **33.8 s** | **19.7×** | r ≈ 0.93, recommended |
+| **`--sketch 200 --sketch-method countsketch`** | **33.8 s** | **19.7×** | r ≈ 0.93 |
 | `--sketch 500 --sketch-method countsketch` | 36.2 s | 18.4× | r ≈ 0.97 |
+| `--sketch 1000 --sketch-method countsketch` | 39.7 s | 16.8× | r ≈ 0.99 |
+| `--sketch 5000 --sketch-method countsketch` | ~55 s\* | ~12×\* | r ≈ 0.998, h2 ~2% low |
+| `--sketch 10000 --sketch-method countsketch` | ~75 s\* | ~9×\* | r ≈ 0.999, h2 exact |
 | `--subsample 5000 --sketch 50` | 24.9 s | 26.7× | fastest (compounds two approx.) |
+
+\*d=5000 and d=10000 timings estimated from local scaling (1.7× and 2.3× vs d=200); AWS
+times will differ but the relative ordering is stable. Even at d=10000 (20% of N), CountSketch
+is still **~5× faster than exact-f32** and **~9× faster than exact-f64**.
 
 Fused CountSketch reads packed BED bytes and scatter-adds directly into the d×c sketch buffer,
 eliminating the N×c intermediate entirely. Cost is O(N×c) independent of d, so d=200 has the
@@ -622,8 +658,10 @@ keeps memory bounded by the LD window size, not the total SNP count.
 | 2,490 (1000G) | `--sketch 50` | 15.3 s *(measured)* | ~101× |
 | 50,000 (biobank) | exact-f64 | 665.9 s *(measured)* | — |
 | 50,000 (biobank) | countsketch-200 | 33.8 s *(measured)* | — |
+| 50,000 (biobank) | countsketch-5000 | ~55 s *(estimated)* | — |
+| 50,000 (biobank) | countsketch-10000 | ~75 s *(estimated)* | — |
 
-At biobank N, GEMM cost is O(N²) per window; CountSketch reduces this to O(N×c) scatter-add,
+At biobank N, GEMM cost is O(N × w × c) per chunk; CountSketch reduces this to O(N×c) scatter-add,
 independent of d. Rademacher sketch reduces inner dimension from N to d but is still GEMM-bound.
 BED I/O is sequential and throughput-bound; `--fast-f32` halves BED read bytes per chunk.
 
@@ -700,397 +738,13 @@ The following Python flags are accepted for CLI parity but do not change behavio
 
 ---
 
-## Performance Deep-Dive
-
-### Algorithmic complexity
-
-This section documents the per-chunk and total complexity of each `l2` mode. The variables are:
-
-| Symbol | Meaning | Typical value |
-|--------|---------|---------------|
-| M | Total SNPs | 1.66M (full genome) |
-| N | Individuals in reference panel | 2,490 (1000G) to 500K+ (UKB) |
-| c | Chunk size (`--chunk-size`) | 200 |
-| w | Max window size in SNPs | ~1,000–4,000 (depends on `--ld-wind-*`) |
-| d | Sketch dimension (`--sketch d`) | 50–1,000 |
-
-The main loop iterates over M/c chunks. Each chunk reads c SNP columns, computes the within-chunk
-product BB = B^T B (c × c) and the cross-window product AB = A^T B (w × c), then accumulates
-unbiased r² values into the L2 array.
-
-#### Exact mode (default)
-
-```
-Per chunk:
-  BED decode + normalize .... O(N × c)       decode 2-bit genotypes, center, scale
-  BB = Bᵀ·B (within-chunk) .. O(N × c²)      c×c matmul, N inner dimension
-  AB = Aᵀ·B (cross-window) .. O(N × w × c)   w×c matmul, N inner dimension
-  Ring store ................. O(N × c)       copy c columns into ring buffer
-
-Total: O(M × N × (c + w))
-
-Memory: O(N × (w + c))   ring buffer + scratch
-BED I/O: O(M × N / 4) bytes   sequential scan of packed 2-bit genotypes
-```
-
-At 1000G scale (N=2,490), the BB and AB matmuls are small and fast. At biobank scale
-(N=50K), GEMM dominates: BB alone is 50K × 200² = 2B FLOPs per chunk, ×8,324 chunks.
-
-#### `--fast-f32`
-
-Same algorithm as exact, but genotype storage and GEMM use f32 instead of f64. This halves
-memory bandwidth (the bottleneck at large N) for a ~1.85× speedup at N=50K. Complexity is
-identical; the constant factor changes.
-
-#### `--sketch d` with Rademacher projection (default sketch method)
-
-Rademacher sketch pre-multiplies each decoded chunk by a fixed random matrix P (d × N) with
-entries ±1/√d, reducing the individual dimension from N to d before all downstream GEMM ops.
-
-```
-Per chunk:
-  BED decode + normalize .... O(N × c)        same as exact
-  Projection P·B ............ O(d × N × c)    dense GEMM (the dominant cost)
-  Ratio estimator renorm .... O(d × c)        rescale columns so ||col||² = N
-  BB = B̃ᵀ·B̃ (within-chunk) .. O(d × c²)      c×c matmul, d inner dimension
-  AB = Ãᵀ·B̃ (cross-window) .. O(d × w × c)   w×c matmul, d inner dimension
-  Ring store ................. O(d × c)       copy c columns (d rows, not N)
-
-Total: O(M × (d × N + d × (c + w)))
-     = O(M × d × N)  when N >> c + w  (projection dominates)
-
-Memory: O(d × N) for projection matrix P, O(d × (w + c)) for ring buffer + scratch,
-        O(N × c) for decoded genotype buffer (b_full)
-BED I/O: O(M × N / 4) bytes   same full scan
-```
-
-The projection GEMM (d × N × c per chunk) is the bottleneck. At d=50, N=50K, c=200: 500M
-FLOPs/chunk. faer's SIMD matmul with Par::rayon(0) parallelizes this across all cores.
-
-Rademacher speedup over exact: the downstream GEMM (BB, AB) shrinks from O(N) to O(d) inner
-dimension, giving a theoretical N/d speedup on those phases. But the projection itself is
-O(d × N × c) — same order as the exact BB — so total speedup is bounded by ~2× from GEMM
-reduction alone. The real win is at large N where the O(N × c²) exact BB is the bottleneck.
-
-**Performance scales with d**: higher d = more projection FLOPs = slower. At d=200, projection
-is 4× more expensive than d=50. This is why Rademacher sketch shows increasing runtimes with d:
-
-| d | Projection FLOPs/chunk (N=50K) | Observed biobank time |
-|---|-------------------------------|----------------------|
-| 50 | 500M | 129.5s |
-| 100 | 1B | 138.6s |
-| 200 | 2B | 159.3s |
-
-#### `--sketch d --sketch-method countsketch` (fused CountSketch)
-
-CountSketch replaces the dense projection GEMM with a hash-based scatter-add. Each individual
-i is assigned a random bucket h(i) ∈ {0,...,d−1} and sign σ(i) ∈ {±1}. The projected
-value for bucket k is the sum of σ(i) × x(i) over all individuals i with h(i) = k.
-
-The fused kernel reads raw packed BED bytes and performs decode + normalize + scatter-add in a
-single pass, eliminating the N × c intermediate buffer entirely.
-
-```
-Per chunk:
-  Pass 1 — SNP statistics ... O(N × c / 4)   byte-level LUT over packed BED
-  Pass 2 — fused scatter-add  O(N × c)        decode genotype, normalize, scatter to bucket
-  Ratio estimator renorm .... O(d × c)        rescale columns so ||col||² = N
-  BB = B̃ᵀ·B̃ (within-chunk) .. O(d × c²)      c×c matmul, d inner dimension
-  AB = Ãᵀ·B̃ (cross-window) .. O(d × w × c)   w×c matmul, d inner dimension
-  Ring store ................. O(d × c)
-
-Total: O(M × (N + d × (c + w)))
-     = O(M × N)  when N >> d × (c + w)  (scatter-add dominates)
-
-Memory: O(N) for bucket/sign arrays, O(d × (w + c)) for ring buffer + scratch
-        NO N×c buffer — the key memory advantage
-BED I/O: O(M × N / 4) bytes   same full scan, but reads packed bytes (not decoded f32)
-```
-
-**Performance is constant in d**: the scatter-add is O(N × c) regardless of d. The output
-buffer (d × c) fits in L1 cache for any d ≤ ~2000. Only the downstream BB (O(d × c²)) and AB
-(O(d × w × c)) scale with d, and these are negligible until d² approaches N:
-
-| d | Scatter-add FLOPs/chunk | BB + AB FLOPs/chunk (w=2000) | Observed local time (N=2490) |
-|---|------------------------|-----------------------------|-----------------------------|
-| 50 | 500K | 2M + 20M = 22M | 619ms |
-| 200 | 500K | 8M + 80M = 88M | 644ms |
-| 500 | 500K | 50M + 200M = 250M | 760ms |
-| 1000 | 500K | 200M + 400M = 600M | 1506ms |
-| 2000 | 500K | 800M + 800M = 1.6B | 2258ms |
-
-The crossover where BB+AB cost matches scatter-add cost is approximately **d ≈ √N**:
-
-```
-BB + AB = O(d × c × (c + w))
-scatter = O(N × c)
-crossover: d × (c + w) ≈ N  →  d ≈ N / (c + w) ≈ N / 2200
-
-For practical purposes (c + w ≈ 2200):
-  N = 2,490   → d_crossover ≈ 1
-  N = 50,000  → d_crossover ≈ 23
-  N = 500,000 → d_crossover ≈ 227
-```
-
-At biobank scale (N=50K), d up to ~1000 is essentially free — the scatter-add over 50K
-individuals dwarfs the d²-scaling GEMM. At UKB scale (N=500K), d up to ~5000 would be free.
-
-**Recommended d values** (accuracy vs. speed, measured on bench_200k N=2,490):
-
-| d | Pearson r vs exact | Median relative error | Speed vs d=50 |
-|---|-------------------|----------------------|---------------|
-| 50 | 0.74 | 39% | 1.0× |
-| 100 | 0.87 | 27% | ~1.0× |
-| 200 | 0.92 | 20% | ~1.0× |
-| **500** | **0.97** | **11%** | **~1.0×** |
-| 1000 | 0.99 | 7% | ~1.5× slower |
-| 2000 | 0.99 | 5% | ~3× slower |
-
-**d=500 is the recommended default** — it achieves r=0.97 at no performance cost relative to
-d=50 (scatter-add dominates at any realistic N). d=1000 is the "high accuracy" option for
-users needing r > 0.98, with a modest ~50% slowdown from BB+AB at small N.
-
-Accuracy depends only on d, not on N: the variance of CountSketch inner products is
-Var[⟨x̃,ỹ⟩] ≈ (N² + ⟨x,y⟩²) / d for unit-normalized columns. This ratio is independent of N
-after normalization, so d=500 gives the same r ≈ 0.97 whether N = 2,490 or N = 500,000.
-
-#### `--subsample N'`
-
-Subsampling selects N' individuals before any computation. This reduces the effective N in all
-formulas above:
-
-```
-Exact + subsample:      O(M × N' × (c + w))     compute
-Sketch + subsample:     O(M × (d × N' + ...))    compute
-BED I/O:                O(M × N / 4) bytes        still reads full packed bytes
-Decode:                 O(M × N')                 only decodes N' positions
-```
-
-BED I/O remains O(M × N / 4) because the PLINK format is SNP-major — the full byte range for
-each SNP must be read even if only N' individuals are extracted. But decode and all GEMM ops
-scale with N', giving near-linear speedup:
-
-| N' | Theoretical speedup (GEMM) | Observed (biobank N=50K, AWS) |
-|----|---------------------------|------------------------------|
-| 50,000 (full) | 1× | 665s (exact-f64) |
-| 10,000 | 25× | 90s |
-| 5,000 | 100× | 51s |
-| 2,000 | 625× | I/O-bound |
-
-At N'=5K, LD score variance for common variants (MAF > 5%) increases by only ~10× relative to
-N=50K, which is negligible for downstream h2/rg regression (LD scores are inputs to a second
-regression that averages over ~1M SNPs).
-
-#### `--stochastic T`
-
-Hutchinson's trace estimator uses T random probe vectors instead of forming the full correlation
-matrix. Each probe requires an O(N × M_window) matrix-vector product.
-
-```
-Per chunk:
-  BED decode + normalize .... O(N × c)
-  T probe MVPs .............. O(T × N × c)    T matrix-vector products
-  L2 accumulation ........... O(T × c)
-
-Total: O(M × T × N × c)
-
-Memory: O(N × T) for probe buffer + O(N × c) for genotype chunk
-```
-
-Compared to exact (O(M × N × c × (c + w))), stochastic is faster when T < c + w. At
-T=50, c=200, w~2000: T << c + w, so stochastic should be ~44× faster in theory. In practice,
-the sequential MVP loop causes cache pressure at T > 50, and the method is only compatible with
-scalar (non-partitioned) LD scores.
-
-#### Summary table
-
-| Mode | Compute per chunk | Memory | Performance scales with d? |
-|------|-------------------|--------|---------------------------|
-| Exact f64 | O(N × c × (c + w)) | O(N × (w + c)) | n/a |
-| Exact f32 | Same, 2× bandwidth | Same, half bytes | n/a |
-| Rademacher sketch | O(d × N × c) | O(d × N + d × (w + c)) | Yes — linear in d |
-| **Fused CountSketch** | **O(N × c + d × c × (c + w))** | **O(N + d × (w + c))** | **No** (until d ≈ √N) |
-| Subsample N' (exact) | O(N' × c × (c + w)) | O(N' × (w + c)) | n/a |
-| Stochastic T | O(T × N × c) | O(N × (T + c)) | n/a (scales with T) |
-
-### Why Python is slow
-
-The original Python implementation is bottlenecked by three independent factors:
-
-1. **GIL-blocked jackknife.** `jackknife.py` runs 200 leave-one-block-out IRWLS refits sequentially.
-   Each refit is a `scipy.linalg.lstsq` call that releases the GIL, but Python loop overhead and
-   NumPy's per-call allocation dominate at this problem size.
-
-2. **Per-SNP NumPy allocation in the LD score loop.** `ldscore.py` calls `np.dot` in a Python-level
-   loop with fresh array views on each of the ~33,000 chunks for a 1M-SNP genome. Python's boxing
-   overhead and NumPy's internal allocation path are not amortised.
-
-3. **Sequential LD computation.** The GIL prevents genuine thread-level parallelism in the
-   correlation loop.
-
-### What the Rust implementation does differently
-
-#### 1. Ring-buffer genotype store (`l2/compute.rs`)
-
-Python allocates a new `rfuncA` matrix every chunk. Rust pre-allocates a single F-order
-`MatF` of shape `(n_indiv, ring_size)` where `ring_size = max_window + chunk_c`. SNP columns
-are written into successive ring slots modulo `ring_size`; evicted slots are reused. This eliminates
-~33,000 heap allocations for a 1M-SNP genome and improves cache locality because each active column
-occupies a contiguous 8-byte stride in memory.
-
-#### 2. Single matmul per chunk
-
-For each chunk of B SNPs the computation is:
-
-```
-BB = Bᵀ · B          (chunk × chunk, unbiased r²)
-AB = Aᵀ · B          (window × chunk, unbiased r²)
-```
-
-Both are single `faer` matmul calls. The window matrix `A` is assembled from ring slots into a
-pre-allocated column-major `a_buf` so columns are contiguous in memory and the matmul kernel can
-stride through them without gather operations.
-
-#### 3. Threading control
-
-Small matrix multiplications benefit from fewer threads; the `--rayon-threads` flag controls the
-global Rayon thread count used by jackknife and matrix ops.
-
-#### 4. Global sequential pass — no cross-chromosome boundary artefact
-
-Python processes all chromosomes as a single ordered dataset. With `--ld-wind-snps`, the last 100
-SNPs of chromosome k and the first 100 of chromosome k+1 are within each other's windows. The 1000G
-reference panel contains five continental populations, creating population-stratification-driven
-Pearson r up to 0.38 across chromosome boundaries. Earlier versions of the Rust code ran per-chromosome
-in parallel, which zeroed out these cross-boundary contributions and produced L2 values 1–2 units too
-low for boundary SNPs. The current implementation mirrors Python: a single global pass over all SNPs
-in BIM order, with per-chromosome files written from the global L2 array after the fact.
-
-#### 5. Parallel block jackknife (`jackknife.rs`)
-
-The 200 leave-one-block-out IRWLS refits are independent. Rayon's `into_par_iter` distributes them
-across all available cores. Each refit allocates two `faer` matrices and one SVD call; the total
-wall time for h2 and rg is dominated by the file I/O and merge join, not the jackknife.
-
-#### 6. Polars LazyFrame for munge (`munge.rs`)
-
-`munge_sumstats.py` uses pandas, which loads the entire file into RAM before filtering. The Rust
-implementation uses Polars `LazyCsvReader`, which pushes column selection, renaming, and filter
-predicates into a query plan that streams the file in chunks. For large GWAS files (> 1 M SNPs) the
-peak RAM is proportional to the output size, not the input size.
-
----
-
-## Source Map (for LLMs)
-
-```
-src/
-├── main.rs          Clap dispatch — parses CLI, calls into subcommand modules.
-│
-├── cli.rs           All argument structs (MungeArgs, L2Args, H2Args, RgArgs,
-│                    MakeAnnotArgs, CtsAnnotArgs). No logic — pure clap derive macros.
-│
-├── gpu.rs           [cfg(feature = "gpu")] CUDA matmul via CubeCL/cubek-matmul.
-│                    · GpuContext — holds ComputeClient + Strategy
-│                    · matmul_tn — A^T × B single-shot GPU GEMM
-│                    · matmul_tn_tiled — tiled variant for VRAM-limited windows
-│
-├── parse.rs         File I/O helpers:
-│                    · scan_sumstats / scan_ldscore  → Polars LazyFrame
-│                    · concat_chrs(prefix, suffix)   → concat per-chr files
-│                    · read_m_total / read_m_vec      → .l2.M files
-│                    · read_annot(prefix, thin)       → MatF + col names
-│
-├── munge.rs         munge-sumstats pipeline (Polars LazyFrame, no data loaded until
-│                    collect). Internal functions:
-│                    · apply_ignore, apply_col_overrides, normalize_columns
-│                    · apply_info_list, apply_n_override
-│                    · derive_z (BETA/SE → Z; P + sign → Z; --a1-inc)
-│                    · filter_snps, apply_nstudy_filter
-│                    · write_sumstats_gz (gzip TSV output)
-│
-├── l2/              LD score computation (split into submodules):
-│   ├── mod.rs       · run — orchestrates BIM read, --extract / --annot / --keep,
-│   │                  calls compute_ldscore_global, writes per-chr .l2.ldscore.gz
-│   │                  and .l2.M / .l2.M_5_50 files
-│   ├── compute.rs   · GemmBufs — enum holding f32 or f64 scratch buffers (--fast-f32)
-│   │                · compute_ldscore_global — ring-buffer GEMM loop (sequential,
-│   │                  scalar and partitioned + sketch + stochastic paths)
-│   │                · r2_unbiased — r² − (1−r²)/(n−2)
-│   ├── window.rs    · WindowMode — Cm / Kb / Snp enum
-│   │                · get_block_lefts_f64, get_block_lefts_by_chr — window boundaries
-│   ├── normalize.rs · normalize_col_f{32,64}_with_stats — impute NaN → mean,
-│   │                  centre, unit-variance; AVX2+FMA sum_sumsq_f32
-│   ├── snp_stats.rs · compute_snp_stats — fast BED scan for MAF + het/missing
-│   └── io.rs        · parse_bim, count_fam, parse_fam — PLINK file parsers
-│                    · load_individual_indices — --keep FID/IID → isize indices
-│                    · write_ldscore_refs — gzip TSV output
-│                    · load_snp_set — HashSet<String> from --extract / --print-snps
-│
-├── irwls.rs         Iteratively Re-Weighted Least Squares.
-│                    · IrwlsResult — est + optional jackknife fields
-│                    · irwls(x, y, weights, n_iter) — pre-alloc xw/yw, SVD solve,
-│                      reweight on fitted values; zero-alloc inner loop
-│
-├── jackknife.rs     Block jackknife variance estimation.
-│                    · jackknife(x, y, weights, n_blocks, n_iter) →
-│                      full-data IRWLS + n_blocks parallel leave-one-out refits
-│                      (rayon par_iter) → pseudo-values → SE + covariance matrix
-│
-└── regressions.rs   h2 and rg regression drivers.
-                     · run_h2 — loads sumstats + LD scores, inner-joins on SNP,
-                       detects K annotation columns, dispatches to scalar (K=1)
-                       or partitioned (K>1) path; supports --two-step, --no-intercept,
-                       --intercept-h2, --print-coefficients, liability-scale output
-                     · run_h2_partitioned — K-column design matrix, per-annotation
-                       enrichment, resolves M vector from per-annotation M files
-                     · run_h2_scalar — shared by standalone h2 and rg univariate sub-fits
-                     · run_rg — iterates trait pairs; gencov regression + univariate h2
-                       per trait; --two-step, --intercept-gencov, --no-intercept,
-                       liability-scale rg; prints summary table
-                     · load_ld_ref / load_ld — LazyFrame readers for ref and weight LD
-                     · resolve_m / resolve_m_vec — reads .l2.M_5_50 or falls back to n_obs
-                     · liability_scale_h2 — observed → liability scale conversion
-                     · print_jackknife_diagnostics — --print-cov / --print-delete-vals
-
-make_annot.rs        BED → 0/1 annotation generator.
-                     · annotate_from_bed — loads BED intervals per chromosome,
-                       sorts and merges, binary-search annotation per SNP
-                     · annotate_from_gene_set — gene symbols → coordinate lookup →
-                       same interval merge/annotate pipeline
-                     · write_annot_file — CHR BP SNP CM ANNOT TSV (optional .gz)
-```
-
-### Key data-flow invariants
-
-- `l2 --annot prefix` reads `{prefix}{chr}.annot[.gz]` for every chromosome found in
-  the BIM (not a single `prefix.annot.gz` file).
-- `--extract` filters the BIM *before* window computation; `--print-snps` filters only the output.
-- `bed_idx` (original BIM row index) differs from `pos` (index in the filtered `all_snps` slice)
-  when `--extract` is active; `bed_idx_to_pos` in `run()` maps between them.
-- `--keep` passes `iid_indices: Option<&[isize]>` to the internal BED reader; `n_indiv_actual` (not
-  the FAM total) is used for normalization and the r²-unbiased correction.
-- The ring buffer `ring_size = max_window + chunk_c` guarantees no live window slot is overwritten
-  before it has been consumed in the A×B product.
-- `rg --no-intercept` propagates `fixed_intercept = Some(1.0)` to both the gencov regression and
-  each univariate `run_h2_scalar` call, matching Python's behaviour.
-
-### Dependency rationale
-
-| Crate | Version | Role |
-|-------|---------|------|
-| internal `bed` module | - | minimal PLINK .bed reader tailored to LDSC |
-| `polars` | 0.53 | lazy CSV streaming (munge + LD score file loading) |
-| `faer` | 0.24 | dense matrix algebra; SVD for IRWLS |
-| `rayon` | 1 | data-parallel jackknife blocks |
-| `statrs` | 0.18 | Normal CDF/quantile for P→Z conversion |
-| `clap` | 4 | derive-macro CLI argument parsing |
-| `anyhow` | 1 | error propagation |
-| `flate2` | 1 | gzip output for .sumstats.gz and .ldscore.gz |
-| `cubecl` | 0.10 | (optional, `gpu` feature) multi-backend GPU compute |
-| `cubek-matmul` | 0.2 | (optional, `gpu` feature) autotuned GPU matmul |
-| `fastrand` | 2 | Rademacher random generation for `--stochastic` and `--sketch` modes |
-| `mimalloc` | 0.1 | (optional, `mimalloc` feature) fast allocator for musl builds |
+## Further Reading
+
+- **[Performance deep-dive](docs/performance-deep-dive.md)** — algorithmic complexity for each
+  mode, scaling analysis for dense SNP panels (O(M² × N) with distance-based windows),
+  downstream h2/rg regression accuracy by sketch dimension, and why Python is slow.
+- **[Architecture & source map](docs/architecture.md)** — module-level code map, key data-flow
+  invariants, and dependency rationale.
 
 ---
 

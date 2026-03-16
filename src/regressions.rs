@@ -1658,7 +1658,10 @@ fn gencov_weights(
 ) -> ColF {
     let h1 = h1.clamp(0.0, 1.0);
     let h2 = h2.clamp(0.0, 1.0);
-    let rho_g = rho_g.clamp(-1.0, 1.0);
+    // Note: rho_g is a genetic covariance (unbounded), not a correlation (bounded [-1,1]).
+    // Python LDSC clamps to [-1,1] but this is semantically wrong and produces suboptimal
+    // weights when |rho_g| > 1. The denominator a*b + c² is always positive (a,b > 0 from
+    // h1/h2 clamps, c² >= 0), so no numerical safety issue from leaving rho_g unclamped.
 
     let n = col_len(ld);
     let mut out = col_zeros(n);

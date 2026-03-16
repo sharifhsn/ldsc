@@ -346,12 +346,46 @@ fn apply_n_override(lf: LazyFrame, args: &MungeArgs) -> Result<LazyFrame> {
         return Ok(lf.with_column(lit(n_cas + n_con).alias("N")));
     }
     // Priority 3: N_CAS + N_CON per-row columns (from --n-cas-col / --n-con-col).
+    // Python formula: N = N_total * P / P_max, where P = N_CAS/N_total and
+    // P_max = mean(P) at rows where N_total == max(N_total). This normalizes for
+    // varying case/control ratios across SNPs in meta-analyses.
     let cols = column_names(&lf)?;
     if has_col(&cols, "N_CAS") && has_col(&cols, "N_CON") {
-        return Ok(lf.with_column(
-            (col("N_CAS").cast(DataType::Float64) + col("N_CON").cast(DataType::Float64))
-                .alias("N"),
-        ));
+        // Materialize to compute P_max, then add N column and drop N_CAS/N_CON.
+        let mut df = lf
+            .with_columns([
+                (col("N_CAS").cast(DataType::Float64) + col("N_CON").cast(DataType::Float64))
+                    .alias("_N_TOTAL"),
+                col("N_CAS").cast(DataType::Float64).alias("_N_CAS_F64"),
+            ])
+            .collect()
+            .context("collecting N_CAS/N_CON frame")?;
+        let n_total = df.column("_N_TOTAL")?.f64()?;
+        let n_cas_f64 = df.column("_N_CAS_F64")?.f64()?;
+        let max_n = n_total
+            .into_no_null_iter()
+            .fold(f64::NEG_INFINITY, f64::max);
+        // P_max = mean case proportion at rows where N_total == max(N_total).
+        let (sum_p, count_p) = n_total
+            .into_no_null_iter()
+            .zip(n_cas_f64.into_no_null_iter())
+            .filter(|(n, _)| *n == max_n)
+            .map(|(n, nc)| nc / n)
+            .fold((0.0, 0u64), |(s, c), p| (s + p, c + 1));
+        let p_max = if count_p > 0 {
+            sum_p / count_p as f64
+        } else {
+            1.0
+        };
+        // N = N_CAS / P_max (equivalent to N_total * P / P_max).
+        let n_col: Vec<f64> = n_cas_f64.into_no_null_iter().map(|nc| nc / p_max).collect();
+        let _ = df.drop_in_place("_N_TOTAL")?;
+        let _ = df.drop_in_place("_N_CAS_F64")?;
+        let _ = df.drop_in_place("N_CAS").ok();
+        let _ = df.drop_in_place("N_CON").ok();
+        let n_series = Series::new("N".into(), &n_col);
+        df.with_column(n_series.into())?;
+        return Ok(df.lazy());
     }
     Ok(lf)
 }
