@@ -66,8 +66,6 @@ bzip2-rs = "0.1"
 # Temp files for on-the-fly .bz2 decompression
 tempfile = "3"
 
-# Bounded channel for double-buffered BED reading (reader thread → compute thread)
-crossbeam-channel = "0.5"
 cubecl = { version = "=0.10.0-pre.2", features = ["cuda"], optional = true }
 cubek-matmul = { version = "=0.2.0-pre.2", optional = true }
 # mimalloc — use for musl builds where the default allocator is slow under rayon parallelism.

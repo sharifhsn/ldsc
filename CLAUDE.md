@@ -176,7 +176,6 @@ Three opt-in modes trade precision for speed in the `l2` subcommand:
 | **--sketch 200** | **33.8s** | **19.7×** |
 | --sketch 500 | 36.2s | 18.4× |
 | --sketch 1000 | 39.7s | 16.8× |
-| subsample-5k+sketch50 | 24.9s | 26.7× |
 
 Key insight: Fused CountSketch eliminates the N×c intermediate buffer entirely — it reads packed BED bytes and scatter-adds directly into the d×c sketch buffer. Cost is O(N×c) independent of d, so d=200 is "free" accuracy vs d=50.
 

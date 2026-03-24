@@ -228,17 +228,10 @@ pub struct L2Args {
     #[arg(long, default_value_t = true)]
     pub maf_pre: bool,
 
-    /// Read BED chunks on a background thread while compute runs on the main thread.
-    /// Useful on slow networked storage (GPFS/NFS) where I/O blocks waiting for the
-    /// network. On local SSD with warm page cache this hurts (extra thread competes
-    /// with rayon for CPU cores); leave it off for local benchmarks.
-    #[arg(long)]
-    pub prefetch_bed: bool,
-
     /// Memory-map the BED file instead of buffered reads. Provides zero-copy access
     /// via the OS page cache. Benefits: no seek invalidation, OS-managed prefetching,
     /// zero-copy for fused CountSketch. Recommended for HPC with networked filesystems
-    /// (GPFS/Lustre over InfiniBand). Redundant with --prefetch-bed (mmap replaces it).
+    /// (GPFS/Lustre over InfiniBand).
     #[arg(long)]
     pub mmap: bool,
 
@@ -328,13 +321,6 @@ pub struct L2Args {
     /// Automatically enables f32.
     #[arg(long, value_name = "DIM", conflicts_with = "gpu")]
     pub sketch: Option<usize>,
-
-    /// Randomly subsample N' individuals from the reference panel for LD computation.
-    /// Reduces both I/O and GEMM cost proportionally (~10× faster at N'=5K vs N=50K).
-    /// For biobank-scale data (N>10K), N'=5000-10000 gives accurate LD scores for
-    /// common variants (MAF>5%). Cannot be combined with --keep.
-    #[arg(long, value_name = "N_PRIME", conflicts_with = "keep")]
-    pub subsample: Option<usize>,
 
     /// Print per-section timing breakdown to stderr.
     #[arg(long)]

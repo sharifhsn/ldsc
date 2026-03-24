@@ -9,7 +9,7 @@ A compiled, statically-typed rewrite of [Bulik-Sullivan et al.'s LDSC](https://g
 Implements six subcommands — `munge-sumstats`, `l2`, `h2`, `rg`, `make-annot`, `cts-annot` — with
 numerically identical output and a **~38× speedup** on LD score computation
 (exact mode, 1000G N=2,490; up to **101×** with `--sketch`). Approximate modes
-(`--sketch`, `--subsample`) trade per-SNP precision for additional throughput.
+(`--sketch`) trades per-SNP precision for additional throughput.
 
 ---
 
@@ -320,25 +320,6 @@ error. For full benchmarks, see [docs/performance-deep-dive.md](docs/performance
 | h2 within ~4% | `--sketch 1000` | ~9× |
 | LD scores only (QC, visualization) | `--sketch 200` | ~20× |
 
-### Individual subsampling (`--subsample`, experimental)
-
-Pass `--subsample N'` to `ldsc l2` to randomly select N' individuals from the reference
-panel before LD computation. This reduces both BED I/O and GEMM cost proportionally —
-runtime scales with N' instead of N.
-
-**This is an approximation.** LD scores from a subsample are noisier than from the full
-panel. For biobank-scale data (N > 10K), N' = 2,000–5,000 gives accurate LD scores for
-common variants (MAF > 5%). The subsample is deterministic (seed 42) and sorted to preserve
-sequential BED read order. Cannot be combined with `--keep`.
-
-```bash
-# Subsample 5000 individuals from a 50K panel
-ldsc l2 --bfile biobank_50k --out out --subsample 5000
-
-# Full panel (default)
-ldsc l2 --bfile biobank_50k --out out
-```
-
 ### Exact per-SNP window boundaries (`--snp-level-masking`)
 
 By default, this tool reproduces Python LDSC's output exactly — including a known approximation
@@ -394,43 +375,6 @@ ldsc l2 --bfile data/1000G_phase3_common_norel --out ld_scores/python_compat \
 published LD score files or replicating results from the Python tool. Use `--snp-level-masking`
 when computing new reference panels where theoretical correctness is preferred.
 
-### BED prefetch for networked storage (`--prefetch-bed`)
-
-On HPC clusters with networked filesystems (GPFS, NFS, Lustre), BED file reads travel over
-the network and can block for tens of milliseconds per chunk. `--prefetch-bed` reads the next
-BED chunk on a background thread while the compute thread runs GEMM, overlapping I/O latency
-with computation.
-
-```bash
-# Recommended for GPFS/NFS (HPC) — first run or cold filesystem cache
-ldsc l2 --bfile … --out … --prefetch-bed
-
-# Default (no flag) — always correct, optimal for local SSD
-ldsc l2 --bfile … --out …
-```
-
-**When to use it:**
-
-| Storage | Cache state | Use `--prefetch-bed`? |
-|---------|-------------|----------------------|
-| Local SSD | Warm (repeated runs) | **No** — regresses ~10% |
-| Local SSD | Cold (first run) | Neutral to slight benefit |
-| GPFS / NFS / Lustre | Cold (typical HPC job) | **Yes** — hides network latency |
-| GPFS / NFS / Lustre | Warm (same job, 2nd pass) | Probably neutral |
-
-**Why it regresses on local SSD:** With a warm OS page cache the BED file is already in RAM,
-so `read()` is just a `memcpy` from kernel pages — no blocking I/O. The reader thread still
-uses CPU for 2-bit genotype decoding and competes with the rayon GEMM thread pool. On a
-6-core / 12-thread machine, adding a 13th thread preempts GEMM workers and slows the whole run.
-
-**Why it helps on GPFS:** Each `read()` call blocks waiting for data over InfiniBand. While the
-reader thread waits, the CPU is free for GEMM — genuine parallelism with no resource contention.
-Benefit scales with GPFS cache miss rate (highest on the first job run after data is staged).
-
-**Note for PMACS users:** The cluster runs CentOS 7 (kernel 3.10). `io_uring` (kernel 5.1+) is
-not available; `--prefetch-bed` uses standard POSIX `pread` on a background `std::thread`.
-Output is always bit-identical to the default path.
-
 ### Memory-mapped BED I/O (`--mmap`)
 
 For HPC deployments with GPFS, Lustre, or other networked filesystems, `--mmap` uses
@@ -438,7 +382,7 @@ memory-mapped I/O instead of buffered reads. This provides:
 
 - **Zero-copy access** for the fused CountSketch path (eliminates ~20GB of memcpy at biobank scale)
 - **OS-managed readahead** via `MADV_SEQUENTIAL` — GPFS can prefetch across storage nodes in parallel
-- **Async prefetch** via `MADV_WILLNEED` on the next chunk — replaces `--prefetch-bed` without thread contention
+- **Async prefetch** via `MADV_WILLNEED` on the next chunk — no reader thread contention
 - **No seek invalidation** — unlike `BufReader`, mmap'd pages stay resident once faulted
 
 ```bash
@@ -450,8 +394,7 @@ ldsc l2 --bfile … --out … --mmap --sketch 200
 ```
 
 **Note:** On local SSD with warm cache, `--mmap` regresses ~15% due to page fault overhead.
-Use the default (no flag) for local storage. `--mmap` is designed for networked filesystems
-where it replaces both `--prefetch-bed` and buffered reads.
+Use the default (no flag) for local storage. `--mmap` is designed for networked filesystems.
 
 ### Optional GPU acceleration (experimental)
 
@@ -563,8 +506,7 @@ The following flags are available for performance tuning:
 
 - `--rayon-threads N`: Rayon thread count for jackknife in `h2`/`rg`.
 - `--polars-threads N`: Polars thread count for CSV streaming in `munge-sumstats`.
-- `--prefetch-bed`: Background BED reader thread for `l2`. Beneficial on networked filesystems (GPFS/NFS); hurts on local SSD with warm cache. See [BED prefetch](#bed-prefetch-for-networked-storage---prefetch-bed) for full guidance.
-- `--mmap`: Memory-mapped BED I/O for `l2`. Recommended for GPFS/Lustre HPC; replaces `--prefetch-bed`. See [mmap](#memory-mapped-bed-io---mmap) for details.
+- `--mmap`: Memory-mapped BED I/O for `l2`. Recommended for GPFS/Lustre HPC. See [mmap](#memory-mapped-bed-io---mmap) for details.
 
 ---
 
@@ -606,7 +548,6 @@ same hardware as above).
 | `--sketch 1000` | 39.7 s | 16.8× | r ≈ 0.99 |
 | `--sketch 5000` | ~55 s\* | ~12×\* | r ≈ 0.998, h2 ~2% low |
 | `--sketch 10000` | ~75 s\* | ~9×\* | r ≈ 0.999, h2 exact |
-| `--subsample 5000 --sketch 50` | 24.9 s | 26.7× | fastest (compounds two approx.) |
 
 \*d=5000 and d=10000 timings estimated from local scaling (1.7× and 2.3× vs d=200); AWS
 times will differ but the relative ordering is stable. Even at d=10000 (20% of N), CountSketch

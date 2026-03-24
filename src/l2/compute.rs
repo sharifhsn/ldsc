@@ -749,7 +749,6 @@ pub(super) fn compute_ldscore_global(
     #[cfg(feature = "gpu")] gpu_ctx: Option<&GpuContext>,
     #[cfg(feature = "gpu")] gpu_config: GpuConfig,
     use_f32: bool,
-    prefetch_bed: bool,
     verbose_timing: bool,
     sketch: Option<usize>,
     use_mmap: bool,
@@ -918,78 +917,6 @@ pub(super) fn compute_ldscore_global(
     let (_gpu_tile_cols, _gpu_flex32, _gpu_f64) =
         (gpu_config.tile_cols, gpu_config.flex32, gpu_config.f64);
 
-    // --prefetch-bed: spawn a background reader thread that reads BED chunks one ahead
-    // of the compute loop, overlapping I/O with GEMM.
-    // Only beneficial when BED reads involve real blocking I/O (cold GPFS/NFS).
-    // On local SSD with warm page cache this adds thread contention with rayon and
-    // regresses ~10%; leave off for local benchmarks.
-    type ChunkMsg = anyhow::Result<(usize, usize, MatF32)>;
-    let prefetch_rx: Option<crossbeam_channel::Receiver<ChunkMsg>>;
-    let reader_handle: Option<std::thread::JoinHandle<()>>;
-
-    if prefetch_bed {
-        struct ChunkSpec {
-            chunk_start: usize,
-            chunk_end: usize,
-            bed_indices: Vec<isize>,
-        }
-        let chunk_specs: Vec<ChunkSpec> = (0..m)
-            .step_by(chunk_c)
-            .map(|start| {
-                let end = (start + chunk_c).min(m);
-                let bed_indices = all_snps[start..end]
-                    .iter()
-                    .map(|s| s.bed_idx as isize)
-                    .collect();
-                ChunkSpec {
-                    chunk_start: start,
-                    chunk_end: end,
-                    bed_indices,
-                }
-            })
-            .collect();
-
-        let (filled_tx, filled_rx) = crossbeam_channel::bounded::<ChunkMsg>(1);
-        let bed_path_owned = bed_path.to_string();
-        let iid_indices_owned: Option<Vec<isize>> = iid_indices.map(|s| s.to_vec());
-
-        let handle = std::thread::spawn(move || {
-            let mut bed = match Bed::builder(bed_path_owned.as_str()).build() {
-                Ok(b) => b,
-                Err(e) => {
-                    let _ = filled_tx.send(Err(e));
-                    return;
-                }
-            };
-            for spec in chunk_specs {
-                let result: anyhow::Result<MatF32> = {
-                    let mut ro = ReadOptions::builder();
-                    let mut builder = ro.sid_index(&spec.bed_indices).f32();
-                    let raw = if let Some(ref iids) = iid_indices_owned {
-                        builder.iid_index(iids).read(&mut bed)
-                    } else {
-                        builder.read(&mut bed)
-                    };
-                    raw.with_context(|| {
-                        format!(
-                            "reading BED chunk [{},{})",
-                            spec.chunk_start, spec.chunk_end
-                        )
-                    })
-                };
-                let msg = result.map(|raw| (spec.chunk_start, spec.chunk_end, raw));
-                if filled_tx.send(msg).is_err() {
-                    break;
-                }
-            }
-        });
-        prefetch_rx = Some(filled_rx);
-        reader_handle = Some(handle);
-    } else {
-        prefetch_rx = None;
-        reader_handle = None;
-    }
-
     // Memory-mapped BED: zero-copy access, replaces BufReader for fused path.
     let mmap_bed = if use_mmap {
         Some(MmapBed::open(bed_path).context("memory-mapping BED file")?)
@@ -997,22 +924,16 @@ pub(super) fn compute_ldscore_global(
         None
     };
 
-    // Sequential path: open BED once with pre-computed ChunkReader; used only when prefetch_bed=false.
+    // Sequential path: open BED once with pre-computed ChunkReader.
     // When mmap is enabled, we still need ChunkReader for metadata (iid_positions, etc.)
     // but I/O goes through MmapBed instead.
-    let mut seq_bed = if !prefetch_bed {
-        Some(Bed::builder(bed_path).build().context("opening BED file")?)
-    } else {
-        None
-    };
-    let mut chunk_reader: Option<ChunkReader<f32>> = if !prefetch_bed {
+    let mut seq_bed = Some(Bed::builder(bed_path).build().context("opening BED file")?);
+    let mut chunk_reader: Option<ChunkReader<f32>> = {
         let bed = seq_bed.as_ref().unwrap();
         Some(
             ChunkReader::new(bed, iid_indices, chunk_c, true, f32::NAN)
                 .context("creating chunk reader")?,
         )
-    } else {
-        None
     };
     // Check if ALL SNPs are contiguous in the BED file (common: no --extract).
     // If so, use sequential reads (1 seek + streaming reads) instead of seeking per chunk.
@@ -1022,7 +943,7 @@ pub(super) fn compute_ldscore_global(
         && all_snps
             .windows(2)
             .all(|w| w[1].bed_idx == w[0].bed_idx + 1);
-    if all_bed_sequential && !prefetch_bed && !use_mmap {
+    if all_bed_sequential && !use_mmap {
         let bed = seq_bed.as_mut().unwrap();
         let cr = chunk_reader.as_mut().unwrap();
         cr.start_sequential(bed, all_snps[0].bed_idx)
@@ -1057,15 +978,13 @@ pub(super) fn compute_ldscore_global(
             // mmap can access any contiguous range without seek penalty
             let start_bed_idx = all_snps[chunk_start].bed_idx;
             all_snps[chunk_end - 1].bed_idx == start_bed_idx + c - 1
-        } else if !prefetch_bed && !all_bed_sequential {
+        } else if !all_bed_sequential {
             let start_bed_idx = all_snps[chunk_start].bed_idx;
             all_snps[chunk_end - 1].bed_idx == start_bed_idx + c - 1
         } else {
             all_bed_sequential
         };
-        // Fused path also requires chunk_reader (allocated only when !prefetch_bed).
-        // With prefetch_bed, fall back to non-fused CountSketch (still O(N×c), marginally slower).
-        let do_fused = use_fused_sketch && chunk_is_contiguous && !prefetch_bed;
+        let do_fused = use_fused_sketch && chunk_is_contiguous;
 
         if do_fused {
             // ── Fused path: read raw bytes, fuse decode+normalize+project ──────────
@@ -1155,16 +1074,8 @@ pub(super) fn compute_ldscore_global(
             t_sketch += t0.elapsed();
         } else {
             // ── Standard path: read decoded Mat<f32>, normalize, then project ────────
-            // Use a reference to avoid moving the owned Mat from prefetch path
             let prefetch_raw: MatF32;
-            let raw_ref: &MatF32 = if let Some(ref rx) = prefetch_rx {
-                // Prefetch path: receive pre-read chunk from reader thread.
-                let (cs, ce, r) = rx.recv().context("prefetch reader closed early")??;
-                debug_assert_eq!(cs, chunk_start);
-                debug_assert_eq!(ce, chunk_end);
-                prefetch_raw = r;
-                &prefetch_raw
-            } else if all_bed_sequential {
+            let raw_ref: &MatF32 = if all_bed_sequential {
                 // Fast path: sequential BED — no seek, BufReader stays warm.
                 let bed = seq_bed.as_mut().unwrap();
                 let cr = chunk_reader.as_mut().unwrap();
@@ -1956,10 +1867,6 @@ pub(super) fn compute_ldscore_global(
         ring_next += c;
         t_ring_store += t0.elapsed();
     } // end for chunk_start
-
-    if let Some(handle) = reader_handle {
-        handle.join().expect("prefetch reader thread panicked");
-    }
 
     if verbose_timing {
         if sketch_dim.is_some() {

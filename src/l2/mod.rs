@@ -220,7 +220,7 @@ pub fn run(args: L2Args) -> Result<()> {
     } else {
         None
     };
-    // --keep / --subsample: subset individuals for LD computation.
+    // --keep: subset individuals for LD computation.
     let iid_indices: Option<Vec<isize>> = if let Some(ref keep_path) = args.keep {
         let fam_ids =
             parse_fam(&fam_path).with_context(|| format!("parsing FAM '{}'", fam_path))?;
@@ -228,31 +228,6 @@ pub fn run(args: L2Args) -> Result<()> {
             load_individual_indices(keep_path, &fam_ids)
                 .with_context(|| format!("loading keep file '{}'", keep_path))?,
         )
-    } else if let Some(n_prime) = args.subsample {
-        anyhow::ensure!(n_prime > 0, "--subsample must be > 0");
-        if n_prime >= n_indiv {
-            eprintln!(
-                "WARNING: --subsample {} >= n_indiv {}; using all individuals",
-                n_prime, n_indiv
-            );
-            None
-        } else {
-            // Fisher-Yates partial shuffle to select n_prime indices (deterministic seed 42).
-            // Sort after selection so BED reads remain sequential-friendly.
-            let mut rng = fastrand::Rng::with_seed(42);
-            let mut indices: Vec<usize> = (0..n_indiv).collect();
-            for i in 0..n_prime {
-                let j = rng.usize(i..n_indiv);
-                indices.swap(i, j);
-            }
-            indices.truncate(n_prime);
-            indices.sort_unstable();
-            println!(
-                "  --subsample: retaining {}/{} individuals",
-                n_prime, n_indiv
-            );
-            Some(indices.iter().map(|&i| i as isize).collect())
-        }
     } else {
         None
     };
@@ -427,7 +402,6 @@ pub fn run(args: L2Args) -> Result<()> {
             #[cfg(feature = "gpu")]
             gpu_config,
             use_f32,
-            args.prefetch_bed,
             args.verbose_timing,
             args.sketch,
             args.mmap,
@@ -487,7 +461,6 @@ pub fn run(args: L2Args) -> Result<()> {
                     #[cfg(feature = "gpu")]
                     gpu_config,
                     use_f32,
-                    false, // prefetch_bed disabled for parallel
                     false, // verbose_timing disabled per-chr (noisy)
                     args.sketch,
                     args.mmap,
