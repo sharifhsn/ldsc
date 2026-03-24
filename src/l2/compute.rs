@@ -165,8 +165,7 @@ impl<T> SendPtr<T> {
 
 // ── CountSketch projection ──────────────────────────────────────────────────
 // Hash each individual to a random bucket with a random sign.
-// Replaces the dense d×N Rademacher matrix with O(N) hash + sign arrays.
-// Application: O(N×c) scatter-add vs O(d×N×c) for dense GEMM.
+// O(N) hash + sign arrays; O(N×c) scatter-add, flat cost in d.
 
 /// CountSketch projection: hash each individual to a bucket with a random sign.
 struct CountSketchProj {
@@ -308,9 +307,6 @@ impl CountSketchProj {
 // Pass 2: tiled decode+normalize+project, accumulating into out[d×c].
 
 // BED decode LUT: bits → genotype value (or NaN for missing).
-// BED bits 0b00=2, 0b01=missing, 0b10=1, 0b11=0 (count_a1=true convention).
-const GENO_LUT_F64: [f64; 4] = [2.0, f64::NAN, 1.0, 0.0];
-const GENO_LUT_F32: [f32; 4] = [2.0, f32::NAN, 1.0, 0.0];
 
 /// Build a branchless 256-entry byte LUT for fused CountSketch scatter-add.
 /// For a given (mean, inv_std), each byte (4 genotypes) maps to 4 normalized f32 values.
@@ -461,344 +457,14 @@ fn snp_stats_from_bytes(
     }
 }
 
-/// Fused BED-decode-normalize-project (f64).
-/// Reads raw packed BED bytes, computes per-SNP statistics, then tiles over
-/// individuals to decode+normalize+project without materializing the full N×c
-/// intermediate matrix.
-///
-/// Pass 2 parallelizes over tiles via rayon: each thread decodes a tile of
-/// individuals, computes P_tile × B_tile (a d×c partial result), and the
-/// partial results are summed via `reduce`.
-///
-/// On return, `out[0..d, 0..c]` contains the projected+renormalized columns,
-/// and `maf_out[0..c]` contains the per-SNP MAF.
-#[allow(clippy::too_many_arguments)]
-fn sketch_fused_project_f64(
-    raw_bytes: &[u8],
-    bytes_per_snp: usize,
-    n_indiv: usize,
-    c: usize,
-    d: usize,
-    proj: &MatF,
-    n: f64,
-    iid_positions: &[IidPos],
-    all_iids: bool,
-    maf_out: &mut [f64],
-    out: &mut MatF,
-) {
-    use rayon::prelude::*;
-
-    let byte_lut = build_bed_byte_lut();
-
-    // --- Pass 1: per-SNP statistics from packed bytes ---
-    struct SnpStats {
-        mean: f64,
-        inv_std: f64,
-        maf: f64,
-    }
-    let stats: Vec<SnpStats> = (0..c)
-        .map(|j| {
-            let snp_bytes = &raw_bytes[j * bytes_per_snp..(j + 1) * bytes_per_snp];
-            let (sum, count, sum_sq) =
-                snp_stats_from_bytes(snp_bytes, n_indiv, iid_positions, all_iids, &byte_lut);
-            let mean = if count > 0 {
-                sum as f64 / count as f64
-            } else {
-                0.0
-            };
-            let freq = (mean / 2.0).clamp(0.0, 1.0);
-            let maf = freq.min(1.0 - freq);
-            let centered_ss = sum_sq as f64 - count as f64 * mean * mean;
-            let var = centered_ss / n_indiv as f64;
-            let std = var.sqrt();
-            let inv_std = if std > 0.0 { 1.0 / std } else { 0.0 };
-            SnpStats { mean, inv_std, maf }
-        })
-        .collect();
-
-    for (j, s) in stats.iter().enumerate() {
-        maf_out[j] = s.maf;
-    }
-
-    // --- Pass 2: parallel tiled decode + normalize + project ---
-    const TILE: usize = 512;
-    let tile_starts: Vec<usize> = (0..n_indiv).step_by(TILE).collect();
-
-    // Each tile produces a d×c partial result; reduce by summing.
-    let summed = tile_starts
-        .par_iter()
-        .map(|&tile_start| {
-            let tile_end = (tile_start + TILE).min(n_indiv);
-            let tile_n = tile_end - tile_start;
-
-            let mut b_tile = MatF::zeros(tile_n, c);
-            let mut partial = MatF::zeros(d, c);
-
-            // Decode + normalize tile into b_tile[tile_n × c]
-            for j in 0..c {
-                let snp_bytes = &raw_bytes[j * bytes_per_snp..(j + 1) * bytes_per_snp];
-                let mean = stats[j].mean;
-                let inv_std = stats[j].inv_std;
-                let col = b_tile
-                    .col_mut(j)
-                    .try_as_col_major_mut()
-                    .unwrap()
-                    .as_slice_mut();
-                if all_iids {
-                    for (i, v) in col[..tile_n].iter_mut().enumerate() {
-                        let iid = tile_start + i;
-                        let byte = snp_bytes[iid / 4];
-                        let bits = (byte >> ((iid % 4) * 2)) & 0b11;
-                        let g = GENO_LUT_F64[bits as usize];
-                        *v = if g.is_nan() {
-                            0.0
-                        } else {
-                            (g - mean) * inv_std
-                        };
-                    }
-                } else {
-                    for (v, pos) in col[..tile_n]
-                        .iter_mut()
-                        .zip(iid_positions[tile_start..tile_end].iter())
-                    {
-                        let byte = snp_bytes[pos.byte_idx];
-                        let bits = (byte >> pos.shift) & 0b11;
-                        let g = GENO_LUT_F64[bits as usize];
-                        *v = if g.is_nan() {
-                            0.0
-                        } else {
-                            (g - mean) * inv_std
-                        };
-                    }
-                }
-            }
-
-            // Project: partial[d × c] = P[:, tile_start..tile_end] × b_tile[tile_n × c]
-            matmul_to(
-                mat_slice_mut(partial.as_mut(), 0..d, 0..c),
-                mat_slice(proj.as_ref(), 0..d, tile_start..tile_end),
-                mat_slice(b_tile.as_ref(), 0..tile_n, 0..c),
-                1.0,
-                Accum::Replace,
-                Par::Seq,
-            );
-
-            partial
-        })
-        .reduce(
-            || MatF::zeros(d, c),
-            |mut acc, part| {
-                mat_add_in_place(acc.as_mut(), part.as_ref());
-                acc
-            },
-        );
-
-    // Copy summed result into out
-    mat_copy_from(
-        mat_slice_mut(out.as_mut(), 0..d, 0..c),
-        mat_slice(summed.as_ref(), 0..d, 0..c),
-    );
-
-    // Ratio estimator renorm: rescale each column so ||out[:,j]||² = n
-    for j in 0..c {
-        let col = out.col(j).try_as_col_major().unwrap().as_slice();
-        let mut nrm_sq = 0.0f64;
-        for &v in &col[..d] {
-            nrm_sq += v * v;
-        }
-        if nrm_sq > 0.0 {
-            let scale = (n / nrm_sq).sqrt();
-            let col_mut = out
-                .col_mut(j)
-                .try_as_col_major_mut()
-                .unwrap()
-                .as_slice_mut();
-            for v in &mut col_mut[..d] {
-                *v *= scale;
-            }
-        }
-    }
-}
-
-/// Fused BED-decode-normalize-project (f32 variant).
-/// Same parallel tile strategy as the f64 variant — see `sketch_fused_project_f64`.
-#[allow(clippy::too_many_arguments)]
-fn sketch_fused_project_f32(
-    raw_bytes: &[u8],
-    bytes_per_snp: usize,
-    n_indiv: usize,
-    c: usize,
-    d: usize,
-    proj: &MatF32,
-    n: f64,
-    iid_positions: &[IidPos],
-    all_iids: bool,
-    maf_out: &mut [f64],
-    out: &mut MatF32,
-) {
-    use rayon::prelude::*;
-
-    let byte_lut = build_bed_byte_lut();
-
-    // --- Pass 1: per-SNP statistics from packed bytes ---
-    struct SnpStats {
-        mean: f32,
-        inv_std: f32,
-        maf: f64,
-    }
-    let stats: Vec<SnpStats> = (0..c)
-        .map(|j| {
-            let snp_bytes = &raw_bytes[j * bytes_per_snp..(j + 1) * bytes_per_snp];
-            let (sum, count, sum_sq) =
-                snp_stats_from_bytes(snp_bytes, n_indiv, iid_positions, all_iids, &byte_lut);
-            let mean_f64 = if count > 0 {
-                sum as f64 / count as f64
-            } else {
-                0.0
-            };
-            let freq = (mean_f64 / 2.0).clamp(0.0, 1.0);
-            let maf = freq.min(1.0 - freq);
-            let centered_ss = sum_sq as f64 - count as f64 * mean_f64 * mean_f64;
-            let var = centered_ss / n_indiv as f64;
-            let std = var.sqrt();
-            let inv_std = if std > 0.0 {
-                (1.0 / std) as f32
-            } else {
-                0.0f32
-            };
-            SnpStats {
-                mean: mean_f64 as f32,
-                inv_std,
-                maf,
-            }
-        })
-        .collect();
-
-    for (j, s) in stats.iter().enumerate() {
-        maf_out[j] = s.maf;
-    }
-
-    // --- Pass 2: parallel tiled decode + normalize + project ---
-    const TILE: usize = 512;
-    let tile_starts: Vec<usize> = (0..n_indiv).step_by(TILE).collect();
-
-    let summed = tile_starts
-        .par_iter()
-        .map(|&tile_start| {
-            let tile_end = (tile_start + TILE).min(n_indiv);
-            let tile_n = tile_end - tile_start;
-
-            let mut b_tile = MatF32::zeros(tile_n, c);
-            let mut partial = MatF32::zeros(d, c);
-
-            for j in 0..c {
-                let snp_bytes = &raw_bytes[j * bytes_per_snp..(j + 1) * bytes_per_snp];
-                let mean = stats[j].mean;
-                let inv_std = stats[j].inv_std;
-                let col = b_tile
-                    .col_mut(j)
-                    .try_as_col_major_mut()
-                    .unwrap()
-                    .as_slice_mut();
-                if all_iids {
-                    for (i, v) in col[..tile_n].iter_mut().enumerate() {
-                        let iid = tile_start + i;
-                        let byte = snp_bytes[iid / 4];
-                        let bits = (byte >> ((iid % 4) * 2)) & 0b11;
-                        let g = GENO_LUT_F32[bits as usize];
-                        *v = if g.is_nan() {
-                            0.0
-                        } else {
-                            (g - mean) * inv_std
-                        };
-                    }
-                } else {
-                    for (v, pos) in col[..tile_n]
-                        .iter_mut()
-                        .zip(iid_positions[tile_start..tile_end].iter())
-                    {
-                        let byte = snp_bytes[pos.byte_idx];
-                        let bits = (byte >> pos.shift) & 0b11;
-                        let g = GENO_LUT_F32[bits as usize];
-                        *v = if g.is_nan() {
-                            0.0
-                        } else {
-                            (g - mean) * inv_std
-                        };
-                    }
-                }
-            }
-
-            faer::linalg::matmul::matmul(
-                mat_slice_mut_f32(partial.as_mut(), 0..d, 0..c),
-                Accum::Replace,
-                mat_slice_f32(proj.as_ref(), 0..d, tile_start..tile_end),
-                mat_slice_f32(b_tile.as_ref(), 0..tile_n, 0..c),
-                1.0f32,
-                Par::Seq,
-            );
-
-            partial
-        })
-        .reduce(
-            || MatF32::zeros(d, c),
-            |mut acc, part| {
-                for j in 0..c {
-                    let acc_col = acc
-                        .col_mut(j)
-                        .try_as_col_major_mut()
-                        .unwrap()
-                        .as_slice_mut();
-                    let part_col = part.col(j).try_as_col_major().unwrap().as_slice();
-                    for (a, &p) in acc_col[..d].iter_mut().zip(part_col[..d].iter()) {
-                        *a += p;
-                    }
-                }
-                acc
-            },
-        );
-
-    // Copy summed result into out
-    for j in 0..c {
-        let out_col = out
-            .col_mut(j)
-            .try_as_col_major_mut()
-            .unwrap()
-            .as_slice_mut();
-        let sum_col = summed.col(j).try_as_col_major().unwrap().as_slice();
-        out_col[..d].copy_from_slice(&sum_col[..d]);
-    }
-
-    // Ratio estimator renorm
-    for j in 0..c {
-        let col = out.col(j).try_as_col_major().unwrap().as_slice();
-        let mut nrm_sq = 0.0f64;
-        for &v in &col[..d] {
-            nrm_sq += (v as f64) * (v as f64);
-        }
-        if nrm_sq > 0.0 {
-            let scale = (n / nrm_sq).sqrt() as f32;
-            let col_mut = out
-                .col_mut(j)
-                .try_as_col_major_mut()
-                .unwrap()
-                .as_slice_mut();
-            for v in &mut col_mut[..d] {
-                *v *= scale;
-            }
-        }
-    }
-}
-
 // ── Fused CountSketch: BED-decode-normalize-scatter-add ─────────────────────
 // Avoids materializing the full N×c intermediate matrix AND avoids any GEMM.
 // Pass 1: compute per-SNP stats (mean, inv_std, maf) from packed BED bytes.
 // Pass 2: parallel over columns — decode each genotype, normalize, scatter-add
 //         to the appropriate bucket. O(N×c) total, column-parallel via rayon.
 //
-// Unlike fused Rademacher (which fragments one large GEMM into many tiny tile
-// GEMMs), fused CountSketch has NO GEMM at all — just scatter-adds. The column-
-// parallel pattern gives c-way (c=200) parallelism with no SIMD efficiency loss.
+// Fused CountSketch has NO GEMM at all — just scatter-adds. The column-parallel
+// pattern gives c-way (c=200) parallelism with no SIMD efficiency loss.
 
 /// Fused BED-decode-normalize-CountSketch (f32 variant, primary path since sketch auto-enables f32).
 /// Reads raw packed BED bytes, computes per-SNP statistics, then scatter-adds
@@ -1086,7 +752,6 @@ pub(super) fn compute_ldscore_global(
     prefetch_bed: bool,
     verbose_timing: bool,
     sketch: Option<usize>,
-    sketch_method: &str,
     use_mmap: bool,
     snp_level_masking: bool,
 ) -> Result<(MatF, Vec<f64>)> {
@@ -1134,10 +799,6 @@ pub(super) fn compute_ldscore_global(
     let gemm_n: usize; // row dimension for all GEMM matrices (d when sketching, N otherwise)
     let active_n_inv_sq_r2u_a: f64;
     let active_r2u_b: f64;
-    // Projection matrices (one per precision path, allocated only when sketching)
-    let proj_f64: Option<MatF>;
-    let proj_f32: Option<MatF32>;
-
     if let Some(d) = sketch_dim {
         gemm_n = d;
         // Bias correction with column re-normalization (ratio estimator).
@@ -1150,91 +811,20 @@ pub(super) fn compute_ldscore_global(
         let dm2 = d_f - 2.0;
         active_n_inv_sq_r2u_a = n_inv_sq_r2u_a * d_f / dm2;
         active_r2u_b = r2u_b - r2u_a / dm2;
-
-        // Only allocate the dense Rademacher P matrix when actually needed.
-        // CountSketch uses hash arrays instead; fused path uses P at projection time.
-        if sketch_method == "countsketch" {
-            proj_f64 = None;
-            proj_f32 = None;
-        } else {
-            let inv_sqrt_d = 1.0 / d_f.sqrt();
-            let mut rng_proj = fastrand::Rng::with_seed(42);
-            if use_f32 {
-                let mut p = MatF32::zeros(d, n_indiv);
-                for col in 0..n_indiv {
-                    let sl = p
-                        .col_mut(col)
-                        .try_as_col_major_mut()
-                        .unwrap()
-                        .as_slice_mut();
-                    for chunk in sl[..d].chunks_mut(64) {
-                        let bits = rng_proj.u64(..);
-                        for (j, v) in chunk.iter_mut().enumerate() {
-                            *v = if (bits >> j) & 1 == 0 {
-                                inv_sqrt_d as f32
-                            } else {
-                                -(inv_sqrt_d as f32)
-                            };
-                        }
-                    }
-                }
-                proj_f32 = Some(p);
-                proj_f64 = None;
-            } else {
-                let mut p = MatF::zeros(d, n_indiv);
-                for col in 0..n_indiv {
-                    let sl = p
-                        .col_mut(col)
-                        .try_as_col_major_mut()
-                        .unwrap()
-                        .as_slice_mut();
-                    for chunk in sl[..d].chunks_mut(64) {
-                        let bits = rng_proj.u64(..);
-                        for (j, v) in chunk.iter_mut().enumerate() {
-                            *v = if (bits >> j) & 1 == 0 {
-                                inv_sqrt_d
-                            } else {
-                                -inv_sqrt_d
-                            };
-                        }
-                    }
-                }
-                proj_f64 = Some(p);
-                proj_f32 = None;
-            }
-        }
-        println!(
-            "Sketch mode: projecting N={} → d={} (bias-corrected, method={})",
-            n_indiv, d, sketch_method
-        );
+        println!("Sketch mode: projecting N={n_indiv} → d={d} (CountSketch, bias-corrected)");
     } else {
         gemm_n = n_indiv;
         active_n_inv_sq_r2u_a = n_inv_sq_r2u_a;
         active_r2u_b = r2u_b;
-        proj_f64 = None;
-        proj_f32 = None;
     }
 
-    // CountSketch projection (allocated only when sketch_method == "countsketch").
-    // Uses seed 42, same as Rademacher (only one is active at a time).
-    let count_sketch: Option<CountSketchProj> = sketch_dim.and_then(|d| {
-        if sketch_method == "countsketch" {
-            Some(CountSketchProj::new(n_indiv, d, 42))
-        } else {
-            None
-        }
-    });
+    // CountSketch projection: O(N×c) scatter-add, cost flat in d.
+    let count_sketch: Option<CountSketchProj> =
+        sketch_dim.map(|d| CountSketchProj::new(n_indiv, d, 42));
 
-    // Fused BED-decode-normalize-project for Rademacher: DISABLED.
-    // The tiled approach (512-individual tiles with Par::Seq GEMMs + rayon across tiles)
-    // saves ~40MB (N×c buffer) but is 2.2× slower than the non-fused path at biobank scale
-    // (285s vs 130s). The non-fused path uses a single large P×B GEMM with Par::rayon(0),
-    // which is far more efficient due to faer's SIMD panel scheduling.
-    //
-    // Fused CountSketch: ENABLED. CountSketch is a scatter-add (not a GEMM), so the
-    // tile-fragmentation problem doesn't apply. Column-parallel (c-way) scatter-add
-    // gives good parallelism without any GEMM overhead.
-    let use_fused_sketch = sketch_dim.is_some() && sketch_method == "countsketch";
+    // Fused BED-decode-normalize-CountSketch: single pass over raw BED bytes,
+    // scatter-adds directly into the d×c sketch buffer. No intermediate N×c matrix.
+    let use_fused_sketch = sketch_dim.is_some();
 
     let mut maf_per_snp = vec![0.0f64; m];
 
@@ -1554,41 +1144,6 @@ pub(super) fn compute_ldscore_global(
                         );
                     }
                 }
-            } else {
-                // Fused Rademacher (currently disabled via use_fused_sketch)
-                let d = sketch_dim.unwrap();
-                match bufs {
-                    GemmBufs::F32 { ref mut b_mat, .. } => {
-                        sketch_fused_project_f32(
-                            &raw,
-                            bps,
-                            n_i,
-                            c,
-                            d,
-                            proj_f32.as_ref().unwrap(),
-                            n,
-                            &ipos,
-                            ai,
-                            &mut maf_per_snp[chunk_start..chunk_start + c],
-                            b_mat,
-                        );
-                    }
-                    GemmBufs::F64 { ref mut b_mat, .. } => {
-                        sketch_fused_project_f64(
-                            &raw,
-                            bps,
-                            n_i,
-                            c,
-                            d,
-                            proj_f64.as_ref().unwrap(),
-                            n,
-                            &ipos,
-                            ai,
-                            &mut maf_per_snp[chunk_start..chunk_start + c],
-                            b_mat,
-                        );
-                    }
-                }
             }
             // pq_exp: derive from the MAF we just computed
             if let (Some(exp), Some(ref mut pq_vec)) = (pq_exp, pq_per_snp.as_mut()) {
@@ -1750,84 +1305,17 @@ pub(super) fn compute_ldscore_global(
 
             t_norm += t0.elapsed();
 
-            // Sketch projection: b_mat (d × c) = proj(b_full)
-            // Dispatches to CountSketch (O(N) scatter-add) or Rademacher dense GEMM.
+            // Sketch projection: b_mat (d × c) = CountSketch(b_full)
+            // O(N×c) scatter-add, flat cost in d.
             if sketching {
                 let t0 = Instant::now();
-                let d = sketch_dim.unwrap();
-                if let Some(ref cs) = count_sketch {
-                    // CountSketch: O(N×c) scatter-add, includes ratio renorm.
-                    match bufs {
-                        GemmBufs::F32 { ref mut b_mat, .. } => {
-                            cs.project_f32(&b_full_f32, n_indiv, c, n, b_mat);
-                        }
-                        GemmBufs::F64 { ref mut b_mat, .. } => {
-                            cs.project_f64(&b_full_f64, n_indiv, c, n, b_mat);
-                        }
+                let cs = count_sketch.as_ref().unwrap();
+                match bufs {
+                    GemmBufs::F32 { ref mut b_mat, .. } => {
+                        cs.project_f32(&b_full_f32, n_indiv, c, n, b_mat);
                     }
-                } else {
-                    // Rademacher: dense GEMM + ratio renorm.
-                    match bufs {
-                        GemmBufs::F32 { ref mut b_mat, .. } => {
-                            let p = proj_f32.as_ref().unwrap();
-                            faer::linalg::matmul::matmul(
-                                mat_slice_mut_f32(b_mat.as_mut(), 0..d, 0..c),
-                                Accum::Replace,
-                                mat_slice_f32(p.as_ref(), 0..d, 0..n_indiv),
-                                mat_slice_f32(b_full_f32.as_ref(), 0..n_indiv, 0..c),
-                                1.0f32,
-                                Par::rayon(0),
-                            );
-                            // Re-normalize: ||x̃'_j||² = N (ratio estimator).
-                            for j in 0..c {
-                                let col = b_mat.col(j).try_as_col_major().unwrap().as_slice();
-                                let mut nrm_sq = 0.0f64;
-                                for &v in &col[..d] {
-                                    nrm_sq += (v as f64) * (v as f64);
-                                }
-                                if nrm_sq > 0.0 {
-                                    let scale = ((n / nrm_sq).sqrt()) as f32;
-                                    let col_mut = b_mat
-                                        .col_mut(j)
-                                        .try_as_col_major_mut()
-                                        .unwrap()
-                                        .as_slice_mut();
-                                    for v in &mut col_mut[..d] {
-                                        *v *= scale;
-                                    }
-                                }
-                            }
-                        }
-                        GemmBufs::F64 { ref mut b_mat, .. } => {
-                            let p = proj_f64.as_ref().unwrap();
-                            matmul_to(
-                                mat_slice_mut(b_mat.as_mut(), 0..d, 0..c),
-                                mat_slice(p.as_ref(), 0..d, 0..n_indiv),
-                                mat_slice(b_full_f64.as_ref(), 0..n_indiv, 0..c),
-                                1.0,
-                                Accum::Replace,
-                                Par::rayon(0),
-                            );
-                            // Re-normalize: ||x̃'_j||² = N (ratio estimator)
-                            for j in 0..c {
-                                let col = b_mat.col(j).try_as_col_major().unwrap().as_slice();
-                                let mut nrm_sq = 0.0f64;
-                                for &v in &col[..d] {
-                                    nrm_sq += v * v;
-                                }
-                                if nrm_sq > 0.0 {
-                                    let scale = (n / nrm_sq).sqrt();
-                                    let col_mut = b_mat
-                                        .col_mut(j)
-                                        .try_as_col_major_mut()
-                                        .unwrap()
-                                        .as_slice_mut();
-                                    for v in &mut col_mut[..d] {
-                                        *v *= scale;
-                                    }
-                                }
-                            }
-                        }
+                    GemmBufs::F64 { ref mut b_mat, .. } => {
+                        cs.project_f64(&b_full_f64, n_indiv, c, n, b_mat);
                     }
                 }
                 t_sketch += t0.elapsed();

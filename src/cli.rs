@@ -324,18 +324,10 @@ pub struct L2Args {
     /// vs exact; d=50 gives ~2.7× speedup but r≈0.72. For biobank scale
     /// (N>50k) much smaller d suffices. Works with partitioned annotations.
     /// Avoid d>500 (cache thrashing). Bias is exactly corrected in expectation.
-    /// Automatically enables f32 (sketch f64 and f32 produce bit-identical
-    /// output since ±1/√d entries are exactly representable in f32).
+    /// Uses CountSketch (hash-based, O(N×c) scatter-add, cost flat in d).
+    /// Automatically enables f32.
     #[arg(long, value_name = "DIM", conflicts_with = "gpu")]
     pub sketch: Option<usize>,
-
-    /// Sketch projection method: "rademacher" (default, dense ±1/√d matrix) or
-    /// "countsketch" (hash-based, O(N) scatter-add instead of O(d×N) GEMM).
-    /// CountSketch is faster at large N but slightly noisier at same d;
-    /// use d=100-200 for equivalent quality to Rademacher d=50.
-    /// Ignored unless --sketch is also set.
-    #[arg(long, value_name = "METHOD", default_value = "rademacher")]
-    pub sketch_method: String,
 
     /// Randomly subsample N' individuals from the reference panel for LD computation.
     /// Reduces both I/O and GEMM cost proportionally (~10× faster at N'=5K vs N=50K).

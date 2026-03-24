@@ -67,18 +67,6 @@ pub fn run(args: L2Args) -> Result<()> {
         WindowMode::Cm(args.ld_wind_cm.unwrap_or(1.0))
     };
 
-    // Validate --sketch-method
-    match args.sketch_method.as_str() {
-        "rademacher" | "countsketch" => {}
-        other => anyhow::bail!(
-            "--sketch-method must be 'rademacher' or 'countsketch', got '{}'",
-            other
-        ),
-    }
-    if args.sketch.is_none() && args.sketch_method != "rademacher" {
-        anyhow::bail!("--sketch-method requires --sketch to be set");
-    }
-
     let bim_path = format!("{}.bim", args.bfile);
     let fam_path = format!("{}.fam", args.bfile);
     let bed_path = format!("{}.bed", args.bfile);
@@ -374,9 +362,8 @@ pub fn run(args: L2Args) -> Result<()> {
         eprintln!("[perf] maf_prefilter={:.3}s", t_maf_pre.as_secs_f64());
     }
 
-    // --sketch automatically enables f32: sketch projections produce bit-identical
-    // results in f32 vs f64 (Rademacher ±1/√d and CountSketch ±1 are exactly
-    // representable), so f64 is strictly dominated (same accuracy, ~1.3× slower).
+    // --sketch automatically enables f32: CountSketch ±1 entries are exactly
+    // representable in f32, so f64 is strictly dominated (same accuracy, ~1.3× slower).
     let use_f32 = args.fast_f32 || args.sketch.is_some();
     if args.sketch.is_some() && !args.fast_f32 {
         println!("  --sketch auto-enables f32 (bit-identical to f64, ~1.3× faster)");
@@ -443,7 +430,6 @@ pub fn run(args: L2Args) -> Result<()> {
             args.prefetch_bed,
             args.verbose_timing,
             args.sketch,
-            args.sketch_method.as_str(),
             args.mmap,
             args.snp_level_masking,
         )
@@ -473,8 +459,6 @@ pub fn run(args: L2Args) -> Result<()> {
 
         let bed_path_str = bed_path.as_str();
         let iid_slice = iid_indices.as_deref();
-        let sketch_method_str = args.sketch_method.as_str();
-
         let results: Vec<(MatF, Vec<f64>)> = chr_groups
             .par_iter()
             .map(|&(_chr, start, end)| {
@@ -506,7 +490,6 @@ pub fn run(args: L2Args) -> Result<()> {
                     false, // prefetch_bed disabled for parallel
                     false, // verbose_timing disabled per-chr (noisy)
                     args.sketch,
-                    sketch_method_str,
                     args.mmap,
                     args.snp_level_masking,
                 )

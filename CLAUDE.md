@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Rust rewrite of [Bulik-Sullivan et al.'s LDSC](https://github.com/bulik/ldsc) (LD Score Regression), a tool for estimating heritability and genetic correlation from GWAS summary statistics. Six subcommands: `munge-sumstats`, `l2`, `h2`, `rg`, `make-annot`, `cts-annot`. Numerically exact parity with Python (`max_abs_diff=0` in f64 mode). Current performance vs Python on AWS EPYC 7R13:
 
 - **1000G (N=2,490)**: 37.7× exact, 101× with `--sketch 50`
-- **Biobank (N=50K)**: 20× with `--sketch 50 --sketch-method countsketch` (best), 1.84× exact-f32
+- **Biobank (N=50K)**: 20× with `--sketch 50` (best), 1.84× exact-f32
 
 ## Build & Test Commands
 
@@ -150,11 +150,9 @@ Three opt-in modes trade precision for speed in the `l2` subcommand:
 
 - **`--fast-f32`** — Use f32 for genotype storage and GEMM. ~1.85× speedup (bandwidth-bound). Numerically close to f64; safe for downstream h2/rg. Combinable with all other modes.
 
-- **`--sketch <d>`** — Randomized dimensionality reduction (N→d dimensions) before GEMM. Two methods:
-  - **Rademacher** (default): Dense ±1/√d projection matrix, O(d×N×c) GEMM. Bias-corrected via ratio estimator.
-  - **CountSketch** (`--sketch-method countsketch`): Fused BED-decode-normalize-scatter-add kernel, O(N×c) regardless of d. **3.6× faster than Rademacher** at biobank scale. Cost is flat in d until d≈√N, so d=200 has same speed as d=50 but much better accuracy.
+- **`--sketch <d>`** — Randomized dimensionality reduction via CountSketch before GEMM. Fused BED-decode-normalize-scatter-add kernel, O(N×c) regardless of d. Cost is flat in d until d≈√N, so d=200 has same speed as d=50 but much better accuracy.
   - Accuracy depends on d: d=50 r≈0.81, d=100 r≈0.85, d=200 r≈0.93, d=500 r≈0.97
-  - **Automatically enables f32** — sketch entries (±1/√d or ±1) are exactly representable in f32, producing bit-identical output. `--fast-f32` is redundant with `--sketch`.
+  - **Automatically enables f32** — CountSketch ±1 entries are exactly representable in f32. `--fast-f32` is redundant with `--sketch`.
   - Deterministic (seed=42). Same `--sketch d` on same data always produces identical output.
 
 
@@ -174,15 +172,13 @@ Three opt-in modes trade precision for speed in the `l2` subcommand:
 |------|------|-------------|
 | exact-f64 | 665.9s | 1.0× |
 | exact-f32 | 361.9s | 1.84× |
-| sketch-50 (Rademacher) | 118.4s | 5.6× |
-| sketch-200 (Rademacher) | 151.8s | 4.4× |
-| **countsketch-50** | **33.1s** | **20.1×** |
-| **countsketch-200** | **33.8s** | **19.7×** |
-| countsketch-500 | 36.2s | 18.4× |
-| countsketch-1000 | 39.7s | 16.8× |
+| **--sketch 50** | **33.1s** | **20.1×** |
+| **--sketch 200** | **33.8s** | **19.7×** |
+| --sketch 500 | 36.2s | 18.4× |
+| --sketch 1000 | 39.7s | 16.8× |
 | subsample-5k+sketch50 | 24.9s | 26.7× |
 
-Key insight: Fused CountSketch eliminates the N×c intermediate buffer entirely — it reads packed BED bytes and scatter-adds directly into the d×c sketch buffer. Cost is O(N×c) independent of d, so d=200 is "free" accuracy vs d=50. Rademacher sketch is bounded by N×c→d×c GEMM.
+Key insight: Fused CountSketch eliminates the N×c intermediate buffer entirely — it reads packed BED bytes and scatter-adds directly into the d×c sketch buffer. Cost is O(N×c) independent of d, so d=200 is "free" accuracy vs d=50.
 
 ## GPU
 
@@ -238,9 +234,9 @@ Reference timings (Ryzen 5 5600X, 2026-03-14):
 
 ### Perf Regression Lessons Learned
 
-- **Never bypass the non-fused GEMM path for Rademacher sketch.** faer's single large `Par::rayon(0)` GEMM on P(d×N)×B(N×c) is dramatically faster than distributing many small `Par::Seq` tile GEMMs across rayon. The fused BED-decode-normalize-project kernel (512-individual tiles) caused a 2.2× regression at biobank scale (285s vs 130s). **Exception: fused CountSketch is validated** — its scatter-add kernel is O(N×c) not O(d×N×c), so it bypasses GEMM entirely and is 3.6× faster than Rademacher at biobank scale.
+- **Fused CountSketch is O(N×c), not O(d×N×c).** Its scatter-add kernel bypasses GEMM entirely; d=200 has the same cost as d=50. A Rademacher-style fused tile kernel (512-individual tiles, many small `Par::Seq` GEMMs) caused a 2.2× regression (285s vs 130s) — avoid fragmenting the GEMM.
 - **Parallelism is N-dependent.** A change that's neutral at N=2,490 can be catastrophic at N=50,000. Always think about how parallelism scales with N before submitting HPC jobs.
-- **Diff the hot path against the last validated binary before any AWS run.** The sketch projection path in `compute.rs` (search for "Sketch projection: b_mat") must use `Par::rayon(0)` for the dense Rademacher GEMM.
+- **Diff the hot path against the last validated binary before any AWS run.** The sketch projection path in `compute.rs` (search for "Sketch projection") must go through the CountSketch scatter-add path, not any GEMM.
 
 
 ## Release Process

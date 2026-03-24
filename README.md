@@ -258,10 +258,9 @@ a random projection before all GEMM operations. This reduces the inner dimension
 every matrix multiply, trading precision for speed. After projection, each column is
 re-normalized (ratio estimator) to reduce per-pair variance by ~2×.
 
-**`--sketch` automatically enables f32.** Sketch projections in f64 and f32 produce
-bit-identical output because the projection entries (±1/√d for Rademacher, ±1 for
-CountSketch) are exactly representable in f32. There is zero accuracy cost and ~1.3×
-speed gain, so f64 sketch is strictly dominated. You do not need to pass `--fast-f32`.
+**`--sketch` automatically enables f32.** CountSketch ±1 entries are exactly representable
+in f32, so f64 sketch is strictly dominated (same accuracy, ~1.3× faster). You do not need
+to pass `--fast-f32`.
 
 **This is an approximation.** All SNPs share the same random projection matrix, so
 errors are correlated across SNPs. The bias is corrected in expectation via adjusted
@@ -275,8 +274,8 @@ r²_unbiased constants, but a single run can show systematic shifts. Requires d 
 | 200     | ~61× (25.4s)                  | ~0.93             | ~6%                 | recommended default |
 | 500     | ~49× (31.5s)                  | ~0.97             | ~3%                 | high accuracy   |
 
-Accuracy measured at N=2,490 (1000G). At biobank scale (N=50K), CountSketch is recommended
-over Rademacher — see [Projection methods](#projection-methods---sketch-method) below.
+Accuracy measured at N=2,490 (1000G). At biobank scale (N=50K), CountSketch is dramatically
+faster — see the [biobank benchmarks](#biobank-scale-n--50000) below.
 
 **Important: downstream h2/rg regression accuracy.** Sketch LD scores introduce measurement
 error that causes attenuation bias in h2 regression — the h2 estimate is systematically low
@@ -290,41 +289,14 @@ at d ≥ 5000.
 ldsc l2 --bfile … --out … --sketch 200
 
 # High-accuracy sketch for downstream h2/rg (d=5000, ~2% h2 bias)
-ldsc l2 --bfile … --out … --sketch 5000 --sketch-method countsketch
+ldsc l2 --bfile … --out … --sketch 5000
 
 # Exact (default, numerically identical to Python)
 ldsc l2 --bfile … --out …
 ```
 
-#### Projection methods (`--sketch-method`)
-
-Two projection methods are available via `--sketch-method`:
-
-- **`rademacher`** (default) — Dense ±1/√d random matrix. Projection cost is O(d×N×c) via
-  GEMM. Leverages faer's SIMD-optimized matmul for high throughput. Slightly more accurate
-  than CountSketch at the same d.
-
-- **`countsketch`** — Hash-based projection where each individual is assigned a random bucket
-  b ∈ {0,...,d−1} and sign σ ∈ {±1}. Projection cost is O(N×c) — a scatter-add instead of a
-  full GEMM. Faster than Rademacher at large N (fewer FLOPs), but slightly noisier because each
-  individual contributes to exactly one bucket instead of all d dimensions.
-
-| Method | d=50 median error | d=200 median error | Projection cost | Best for |
-|--------|------------------|--------------------|-----------------|----------|
-| Rademacher | 20.6% | 6.1% | O(d×N×c) | small-to-medium N, best accuracy |
-| CountSketch | 21.8% | 7.5% | O(N×c) | large N (biobank), fastest projection |
-
-To match Rademacher d=50 accuracy with CountSketch, use d=100–200.
-
-```bash
-# CountSketch projection (faster at large N)
-ldsc l2 --bfile … --out … --sketch 100 --sketch-method countsketch
-```
-
 #### Sketch limitations
 
-- **Rademacher:** avoid d > 500 — cache thrashing from the d×N projection matrix causes
-  severe regression at d=1000.
 - **CountSketch:** d up to √N is free (scatter-add is O(N×c), independent of d). Above √N,
   the downstream d×d matmul begins to matter. Even at d=10000 (20% of N=50K), CountSketch
   is still ~2× faster than exact-f32 and ~4× faster than exact-f64.
@@ -344,9 +316,9 @@ error. For full benchmarks, see [docs/performance-deep-dive.md](docs/performance
 | Use case | Recommended mode | Speedup vs exact-f64 |
 |----------|-----------------|---------------------|
 | Exact h2/rg needed | `--fast-f32` | 1.84× |
-| h2 within ~2% | `--sketch 5000 --sketch-method countsketch` | ~5× |
-| h2 within ~4% | `--sketch 1000 --sketch-method countsketch` | ~9× |
-| LD scores only (QC, visualization) | `--sketch 200 --sketch-method countsketch` | ~20× |
+| h2 within ~2% | `--sketch 5000` | ~5× |
+| h2 within ~4% | `--sketch 1000` | ~9× |
+| LD scores only (QC, visualization) | `--sketch 200` | ~20× |
 
 ### Individual subsampling (`--subsample`, experimental)
 
@@ -474,7 +446,7 @@ memory-mapped I/O instead of buffered reads. This provides:
 ldsc l2 --bfile … --out … --mmap
 
 # Can combine with any mode
-ldsc l2 --bfile … --out … --mmap --sketch 200 --sketch-method countsketch
+ldsc l2 --bfile … --out … --mmap --sketch 200
 ```
 
 **Note:** On local SSD with warm cache, `--mmap` regresses ~15% due to page fault overhead.
@@ -628,14 +600,12 @@ same hardware as above).
 |------|-----------|--------------|-------|
 | exact-f64 | 665.9 s | 1.0× | numerically exact |
 | exact-f32 (`--fast-f32`) | 361.9 s | **1.84×** | halved BED bandwidth |
-| `--sketch 50` (Rademacher) | 118.4 s | 5.6× | r ≈ 0.81 |
-| `--sketch 200` (Rademacher) | 151.8 s | 4.4× | r ≈ 0.93 |
-| **`--sketch 50 --sketch-method countsketch`** | **33.1 s** | **20.1×** | r ≈ 0.81 |
-| **`--sketch 200 --sketch-method countsketch`** | **33.8 s** | **19.7×** | r ≈ 0.93 |
-| `--sketch 500 --sketch-method countsketch` | 36.2 s | 18.4× | r ≈ 0.97 |
-| `--sketch 1000 --sketch-method countsketch` | 39.7 s | 16.8× | r ≈ 0.99 |
-| `--sketch 5000 --sketch-method countsketch` | ~55 s\* | ~12×\* | r ≈ 0.998, h2 ~2% low |
-| `--sketch 10000 --sketch-method countsketch` | ~75 s\* | ~9×\* | r ≈ 0.999, h2 exact |
+| **`--sketch 50`** | **33.1 s** | **20.1×** | r ≈ 0.81 |
+| **`--sketch 200`** | **33.8 s** | **19.7×** | r ≈ 0.93 |
+| `--sketch 500` | 36.2 s | 18.4× | r ≈ 0.97 |
+| `--sketch 1000` | 39.7 s | 16.8× | r ≈ 0.99 |
+| `--sketch 5000` | ~55 s\* | ~12×\* | r ≈ 0.998, h2 ~2% low |
+| `--sketch 10000` | ~75 s\* | ~9×\* | r ≈ 0.999, h2 exact |
 | `--subsample 5000 --sketch 50` | 24.9 s | 26.7× | fastest (compounds two approx.) |
 
 \*d=5000 and d=10000 timings estimated from local scaling (1.7× and 2.3× vs d=200); AWS
@@ -676,13 +646,12 @@ keeps memory bounded by the LD window size, not the total SNP count.
 | 2,490 (1000G) | exact-f64 | 41.1 s *(measured)* | ~38× |
 | 2,490 (1000G) | `--sketch 50` | 15.3 s *(measured)* | ~101× |
 | 50,000 (biobank) | exact-f64 | 665.9 s *(measured)* | — |
-| 50,000 (biobank) | countsketch-200 | 33.8 s *(measured)* | — |
-| 50,000 (biobank) | countsketch-5000 | ~55 s *(estimated)* | — |
-| 50,000 (biobank) | countsketch-10000 | ~75 s *(estimated)* | — |
+| 50,000 (biobank) | `--sketch 200` | 33.8 s *(measured)* | — |
+| 50,000 (biobank) | `--sketch 5000` | ~55 s *(estimated)* | — |
+| 50,000 (biobank) | `--sketch 10000` | ~75 s *(estimated)* | — |
 
 At biobank N, GEMM cost is O(N × w × c) per chunk; CountSketch reduces this to O(N×c) scatter-add,
-independent of d. Rademacher sketch reduces inner dimension from N to d but is still GEMM-bound.
-BED I/O is sequential and throughput-bound; `--fast-f32` halves BED read bytes per chunk.
+independent of d. BED I/O is sequential and throughput-bound; `--fast-f32` halves BED read bytes per chunk.
 
 Additional UKBB I/O benchmarks on this machine (Apple M4, 10 CPU cores, 24 GB RAM, macOS 26.3
 build 25D125). These highlight I/O-heavy workflows and the impact of the Rust pipeline’s faster

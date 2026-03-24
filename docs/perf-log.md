@@ -2034,3 +2034,22 @@ Second definition shadows first. Both identical. Dead code.
 4. **Rust rewrite status:** All 3 HIGH bugs absent (Rust compiler prevents most). 2 MEDIUM bugs
    present by design (parity): genetic covariance clipping and N_cas+N_con. 1 LOW bug actively
    improved (NaN guard on rg sqrt).
+
+## 2026-03-24: Rademacher sketch removed — CountSketch only
+
+**Decision:** Removed the Rademacher sketch method entirely. `--sketch` now always uses CountSketch.
+`--sketch-method` flag and `fill_rademacher_f{32,64}` helpers deleted. ~250 lines removed.
+
+**Rationale:** Rademacher sketch is only competitive at small N (≤2,490), where the dense
+d×N GEMM still fits in cache. At biobank N=50K, Rademacher (118.4s) is 3.6× slower than
+CountSketch (33.1s) at the same d=50. There is no realistic workload where Rademacher wins:
+- Small N → exact-f32 (1.84×) or exact-f64 are fast enough
+- Large N → CountSketch dominates at every d
+
+**CountSketch advantages that make Rademacher obsolete:**
+- O(N×c) scatter-add vs O(d×N×c) GEMM — cost flat in d until d≈√N
+- d=200 is "free" accuracy vs d=50 (same wall time, r≈0.93 vs r≈0.81)
+- Fused BED-decode-normalize-scatter-add eliminates N×c intermediate buffer
+- No GEMM fragmentation risk (prior lesson: fused tile GEMMs caused 2.2× regression)
+
+**Impact:** No performance change. Codebase simplified: `compute.rs` ~1500→~1250 lines.
