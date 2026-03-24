@@ -191,6 +191,28 @@ Key insight: Fused CountSketch eliminates the N×c intermediate buffer entirely 
 There's an experimental GPU option, code is available in `src/gpu.rs`, based on the CubeCL library for now using CUDA backend.
 Documentation at `docs/gpu-feasibility.md`.
 
+### CUDA Version Compatibility
+
+`cudarc` (CubeCL's CUDA backend) eagerly loads driver symbols at runtime matching the **compile-time** CUDA version. If the binary is built for CUDA 13.1 but runs on a system with an older driver, it panics on missing symbols.
+
+**Control the target CUDA version at build time:**
+```bash
+CUDARC_CUDA_VERSION=12040 cargo build --release --features gpu   # CUDA 12.4 (AWS default)
+CUDARC_CUDA_VERSION=11080 cargo build --release --features gpu   # CUDA 11.8 (older HPC)
+```
+
+Without `CUDARC_CUDA_VERSION`, cudarc auto-detects via `nvcc --version` (good for local dev). In Docker builds without `nvcc`, it falls back to CUDA 13.1 (latest) which will crash on older drivers.
+
+**Target versions by environment:**
+| Target | `CUDARC_CUDA_VERSION` | Driver | Notes |
+|--------|----------------------|--------|-------|
+| Local dev (RTX 2070) | auto (omit) | 590 | nvcc auto-detects |
+| AWS g5/g6 (AL2023 AMI) | `12040` | 580 | Safe default |
+| AWS g5/g6 (AL2 AMI) | `12040` | 550 | Safe default |
+| PMACS P100 | `11080` | 418-470 | No tensor cores |
+
+Check target CUDA version: `nvidia-smi` (top-right shows "CUDA Version").
+
 ## Optimization Workflow
 - **Verification**: Start with verifying that the optimization makes sense logically.
 - **Implementation**: Then implement it in code.

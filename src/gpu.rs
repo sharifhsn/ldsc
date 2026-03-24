@@ -12,6 +12,14 @@ use cubek_matmul::launch::{MatmulInputHandleRef, Strategy};
 
 type R = CudaRuntime;
 
+/// GPU dispatch configuration (which precision/tiling mode to use).
+#[derive(Clone, Copy)]
+pub struct GpuConfig {
+    pub tile_cols: Option<usize>,
+    pub flex32: bool,
+    pub f64: bool,
+}
+
 /// Runtime GPU capabilities detected from device properties.
 pub struct GpuCapabilities {
     pub has_cmma: bool,
@@ -83,7 +91,26 @@ impl GpuContext {
     /// Create a new GPU context on CUDA device 0.
     pub fn new(gpu_flex32: bool) -> Result<Self> {
         let device = CudaDevice::new(0);
-        let client = R::client(&device);
+        // cudarc eagerly loads ALL CUDA driver symbols for the compile-time CUDA version.
+        // If the runtime driver is older, symbols are missing and cudarc panics.
+        // Catch that panic and convert to a helpful error.
+        let client = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| R::client(&device)))
+            .map_err(|e| {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| e.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                anyhow!(
+                    "GPU initialization failed (CUDA driver version mismatch): {msg}\n\
+                 Binary was compiled for CUDA version '{}'. The runtime driver is older \
+                 and missing required symbols.\n\
+                 Fix: rebuild with CUDARC_CUDA_VERSION=XXXXX matching your target \
+                 (e.g., 12040 for CUDA 12.4, 11080 for CUDA 11.8).\n\
+                 Check your driver's CUDA version with: nvidia-smi",
+                    env!("LDSC_CUDA_VERSION")
+                )
+            })?;
         let capabilities = Self::detect_capabilities(&client);
         eprintln!(
             "GPU: initialized CUDA device [{}]",

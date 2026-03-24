@@ -42,13 +42,22 @@ echo "Memory: $(free -h 2>/dev/null | awk '/Mem:/{print $2}' || echo 'unknown')"
 echo "Date: $(date -u)"
 echo ""
 
+# ── GPU info (if available) ────────────────────────────────────────────────────
+if nvidia-smi >/dev/null 2>&1; then
+    echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'detected')"
+    echo ""
+fi
+
 # ── Run benchmark ─────────────────────────────────────────────────────────────
 if [ $# -gt 0 ]; then
     # Custom command passed as arguments
     echo "=== Running custom command ==="
     exec "$@"
+elif [ "${GPU_BENCH:-0}" = "1" ] && [ "$DATASET" = "biobank_50k" ]; then
+    # GPU biobank benchmark sweep
+    exec gpu-biobank-bench
 elif [ "$DATASET" = "biobank_50k" ]; then
-    # Biobank multi-mode sweep
+    # CPU biobank multi-mode sweep
     exec biobank-bench
 else
     # Default: full 1000G benchmark with verbose timing
