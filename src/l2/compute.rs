@@ -2,7 +2,7 @@ use super::normalize::{normalize_col_f32_with_stats, normalize_col_f64_with_stat
 use super::window::{WindowMode, get_block_lefts_by_chr};
 use crate::bed::{Bed, ChunkReader, IidPos, MmapBed, ReadOptions};
 #[cfg(feature = "gpu")]
-use crate::gpu::GpuContext;
+use crate::gpu::{GpuConfig, GpuContext};
 use crate::la::{
     MatF, MatF32, mat_add_in_place, mat_copy_from, mat_slice, mat_slice_f32, mat_slice_mut,
     mat_slice_mut_f32, matmul_tn_to, matmul_tn_to_f32, matmul_to,
@@ -1100,10 +1100,8 @@ pub(super) fn compute_ldscore_global(
     iid_indices: Option<&[isize]>,
     pq_exp: Option<f64>,
     yes_really: bool,
-    _use_gpu: bool,
-    _gpu_tile_cols: Option<usize>,
-    _gpu_flex32: bool,
-    _gpu_f64: bool,
+    #[cfg(feature = "gpu")] gpu_ctx: Option<&GpuContext>,
+    #[cfg(feature = "gpu")] gpu_config: GpuConfig,
     use_f32: bool,
     prefetch_bed: bool,
     verbose_timing: bool,
@@ -1420,26 +1418,10 @@ pub(super) fn compute_ldscore_global(
     let mut t_ab_dot = std::time::Duration::ZERO;
     let mut t_ring_store = std::time::Duration::ZERO;
 
+    // GPU context and config are passed in from the caller (created once in run()).
     #[cfg(feature = "gpu")]
-    let gpu_ctx = if _use_gpu {
-        match GpuContext::new(_gpu_flex32) {
-            Ok(ctx) => {
-                if _gpu_f64 && !ctx.capabilities.has_f64 {
-                    eprintln!(
-                        "GPU: warning: --gpu-f64 requested but f64 arithmetic not supported; \
-                         falling back to f32 conversion"
-                    );
-                }
-                Some(ctx)
-            }
-            Err(e) => {
-                eprintln!("GPU: initialization failed ({}), falling back to CPU", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let (_gpu_tile_cols, _gpu_flex32, _gpu_f64) =
+        (gpu_config.tile_cols, gpu_config.flex32, gpu_config.f64);
 
     // --prefetch-bed: spawn a background reader thread that reads BED chunks one ahead
     // of the compute loop, overlapping I/O with GEMM.
@@ -2367,7 +2349,7 @@ pub(super) fn compute_ldscore_global(
                         let mut _did_gpu = false;
                         #[cfg(feature = "gpu")]
                         {
-                            if let Some(ref ctx) = gpu_ctx {
+                            if let Some(ctx) = gpu_ctx {
                                 let b_f32 = mat_to_col_major_f32_from_f32(b_slice, gemm_n, c);
                                 let gpu_result = if let Some(tc) = _gpu_tile_cols {
                                     if _gpu_flex32 {
@@ -2416,7 +2398,7 @@ pub(super) fn compute_ldscore_global(
                         let mut _did_gpu = false;
                         #[cfg(feature = "gpu")]
                         {
-                            if let Some(ref ctx) = gpu_ctx {
+                            if let Some(ctx) = gpu_ctx {
                                 if _gpu_f64 && ctx.capabilities.has_f64 {
                                     // Native f64 path — no precision loss
                                     let b_f64 = mat_to_col_major_f64(b_slice, gemm_n, c);
@@ -2612,7 +2594,7 @@ pub(super) fn compute_ldscore_global(
                             let mut _did_gpu = false;
                             #[cfg(feature = "gpu")]
                             {
-                                if let Some(ref ctx) = gpu_ctx {
+                                if let Some(ctx) = gpu_ctx {
                                     let a_f32 = mat_to_col_major_f32_from_f32(a_view, gemm_n, w);
                                     let b_f32 = mat_to_col_major_f32_from_f32(b_sl, gemm_n, c);
                                     let gpu_result = if let Some(tc) = _gpu_tile_cols {
@@ -2701,7 +2683,7 @@ pub(super) fn compute_ldscore_global(
                             let mut _did_gpu = false;
                             #[cfg(feature = "gpu")]
                             {
-                                if let Some(ref ctx) = gpu_ctx {
+                                if let Some(ctx) = gpu_ctx {
                                     if _gpu_f64 && ctx.capabilities.has_f64 {
                                         // Native f64 path
                                         let a_f64_data = mat_to_col_major_f64(a_view, gemm_n, w);

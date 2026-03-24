@@ -11,6 +11,8 @@ pub use window::WindowMode;
 use crate::bed::Bed;
 use crate::cli::L2Args;
 use crate::cts_annot;
+#[cfg(feature = "gpu")]
+use crate::gpu::{GpuConfig, GpuContext};
 use crate::la::MatF;
 use crate::parse;
 use anyhow::{Context, Result};
@@ -380,8 +382,48 @@ pub fn run(args: L2Args) -> Result<()> {
         println!("  --sketch auto-enables f32 (bit-identical to f64, ~1.3× faster)");
     }
 
+    // GPU + per-chr parallel: each rayon thread allocates full ring/b_mat/a_buf buffers
+    // plus competes for the single GPU. At large N this OOMs and serializes GPU work.
+    // Auto-enable --global-pass when --gpu is active.
+    #[cfg(feature = "gpu")]
+    if args.gpu && !args.global_pass {
+        eprintln!("GPU: auto-enabling --global-pass (per-chr parallel wastes GPU with contention)");
+    }
+    #[cfg(feature = "gpu")]
+    let force_global_pass = args.gpu && !args.global_pass;
+    #[cfg(not(feature = "gpu"))]
+    let force_global_pass = false;
+
+    // Create GPU context once (shared across all chromosomes).
+    #[cfg(feature = "gpu")]
+    let gpu_ctx = if args.gpu {
+        match GpuContext::new(args.gpu_flex32) {
+            Ok(ctx) => {
+                if args.gpu_f64 && !ctx.capabilities.has_f64 {
+                    eprintln!(
+                        "GPU: warning: --gpu-f64 requested but f64 arithmetic not supported; \
+                         falling back to f32 conversion"
+                    );
+                }
+                Some(ctx)
+            }
+            Err(e) => {
+                eprintln!("GPU: initialization failed ({}), falling back to CPU", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(feature = "gpu")]
+    let gpu_config = GpuConfig {
+        tile_cols: args.gpu_tile_cols,
+        flex32: args.gpu_flex32,
+        f64: args.gpu_f64,
+    };
+
     let t_compute_start = std::time::Instant::now();
-    let (l2, maf_per_snp) = if args.global_pass {
+    let (l2, maf_per_snp) = if args.global_pass || force_global_pass {
         // Legacy single-pass across all chromosomes.
         compute_ldscore_global(
             &all_snps,
@@ -393,10 +435,10 @@ pub fn run(args: L2Args) -> Result<()> {
             iid_indices.as_deref(),
             pq_exp_for_compute,
             args.yes_really,
-            args.gpu,
-            args.gpu_tile_cols,
-            args.gpu_flex32,
-            args.gpu_f64,
+            #[cfg(feature = "gpu")]
+            gpu_ctx.as_ref(),
+            #[cfg(feature = "gpu")]
+            gpu_config,
             use_f32,
             args.prefetch_bed,
             args.verbose_timing,
@@ -457,10 +499,10 @@ pub fn run(args: L2Args) -> Result<()> {
                     iid_slice,
                     pq_exp_for_compute,
                     args.yes_really,
-                    args.gpu,
-                    args.gpu_tile_cols,
-                    args.gpu_flex32,
-                    args.gpu_f64,
+                    #[cfg(feature = "gpu")]
+                    gpu_ctx.as_ref(),
+                    #[cfg(feature = "gpu")]
+                    gpu_config,
                     use_f32,
                     false, // prefetch_bed disabled for parallel
                     false, // verbose_timing disabled per-chr (noisy)

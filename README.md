@@ -401,6 +401,61 @@ ldsc l2 --bfile biobank_50k --out out --subsample 5000
 ldsc l2 --bfile biobank_50k --out out
 ```
 
+### Exact per-SNP window boundaries (`--snp-level-masking`)
+
+By default, this tool reproduces Python LDSC's output exactly — including a known approximation
+in how window boundaries are applied during LD score computation.
+
+**The approximation:** Python LDSC processes SNPs in chunks and evicts window entries once per
+chunk using the left boundary of the first SNP in each chunk (`block_left[chunk_start]`). This
+means later SNPs in the same chunk can include r² contributions from SNPs that fall outside
+their true window. The Python codebase comments on this explicitly, calling it a vectorization
+approximation. The [Bulik-Sullivan et al. 2015 paper](https://www.nature.com/articles/ng.3211)
+defines LD scores with exact per-SNP window boundaries — chunking is not mentioned.
+
+**The fix:** `--snp-level-masking` applies the paper's definition exactly. After each GEMM,
+r² entries for SNP pairs outside each SNP's true window are zeroed before accumulation into
+LD scores. The implementation uses a monotonic scan (O(window + chunk)), so the overhead is
+negligible — the GEMM itself is 74% of runtime and is unchanged.
+
+**Impact (full 1000G, 1.66M SNPs, `--ld-wind-kb 1000`):**
+
+| Metric | Value |
+|--------|-------|
+| SNPs with different L2 scores | 99.99% |
+| Mean relative L2 difference | 11.3% (masked scores are lower) |
+| h2 change — BMI | +15.7% (0.1045 → 0.1209) |
+| h2 change — SCZ | +16.2% (0.3292 → 0.3825) |
+
+The effect is larger at narrower windows:
+
+| Window | Mean L2 rel diff | h2 change (BMI) |
+|--------|-----------------|-----------------|
+| 100 kb | 36.4% | +47.7% |
+| 500 kb | 15.8% | +20.3% |
+| 1000 kb | 11.3% | +15.7% |
+| 2000 kb | 7.7% | +11.5% |
+
+The h2 increase is driven by the regressor: lower LD scores produce a steeper regression
+slope, which translates to higher heritability estimates. Whether the paper-correct LD scores
+produce more accurate h2 estimates in practice is an open empirical question — the LDSC
+framework is tolerant of LD score perturbations, and the Python approximation has been used
+in thousands of published analyses.
+
+```bash
+# Paper-correct LD scores (exact per-SNP window boundaries)
+ldsc l2 --bfile data/1000G_phase3_common_norel --out ld_scores/snp_exact \
+    --ld-wind-kb 1000 --snp-level-masking
+
+# Default (Python-identical, for reproducibility with published results)
+ldsc l2 --bfile data/1000G_phase3_common_norel --out ld_scores/python_compat \
+    --ld-wind-kb 1000
+```
+
+**Note:** The default (no flag) is Python-identical and should be used when comparing against
+published LD score files or replicating results from the Python tool. Use `--snp-level-masking`
+when computing new reference panels where theoretical correctness is preferred.
+
 ### BED prefetch for networked storage (`--prefetch-bed`)
 
 On HPC clusters with networked filesystems (GPFS, NFS, Lustre), BED file reads travel over
