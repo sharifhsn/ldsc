@@ -50,7 +50,7 @@ All source lives in `src/`. The binary is a clap-derive CLI dispatcher (`main.rs
 - **`munge.rs`** — Polars LazyFrame pipeline for GWAS summary statistics preprocessing. Streams input without loading entire file into RAM.
 - **`l2/`** — LD score computation, split into submodules:
   - **`mod.rs`** (~570 lines) — `run()` orchestrator: arg validation, BIM/FAM loading, `--extract`/`--annot`/`--keep` wiring, output writing.
-  - **`compute.rs`** (~1830 lines) — `compute_ldscore_global`: ring-buffer GEMM loop (sequential global pass, scalar + partitioned + sketch + stochastic paths). Also `GemmBufs`, Rademacher helpers, GPU compat helpers.
+  - **`compute.rs`** (~1500 lines) — `compute_ldscore_global`: ring-buffer GEMM loop (sequential global pass, scalar + partitioned + sketch paths). Also `GemmBufs`, GPU compat helpers.
   - **`window.rs`** — `WindowMode` enum + `get_block_lefts_*`: per-chromosome window boundary computation.
   - **`normalize.rs`** — `normalize_col_f{32,64}_with_stats`: impute NaN→mean, centre, unit-variance. AVX2+FMA `sum_sumsq_f32`.
   - **`snp_stats.rs`** — `compute_snp_stats`: fast BED scan for MAF + het/missing prefilter.
@@ -157,7 +157,6 @@ Three opt-in modes trade precision for speed in the `l2` subcommand:
   - **Automatically enables f32** — sketch entries (±1/√d or ±1) are exactly representable in f32, producing bit-identical output. `--fast-f32` is redundant with `--sketch`.
   - Deterministic (seed=42). Same `--sketch d` on same data always produces identical output.
 
-- **`--stochastic <T>`** — Hutchinson's trace estimation with T random probes. ~7% median error at T=50. Best at 1000G scale (36.2s vs 41.1s exact). Incompatible with partitioned (`--annot`). T>50 causes cache thrashing regression.
 
 ### Performance Summary (AWS EPYC 7R13 c6a.4xlarge, 16 vCPU, 1.66M SNPs)
 
@@ -166,7 +165,6 @@ Three opt-in modes trade precision for speed in the `l2` subcommand:
 | Mode | Time | vs Python |
 |------|------|-----------|
 | exact | 41.1s | 37.7× |
-| --stochastic 50 | 36.2s | 42.8× |
 | --sketch 50 | 15.3s | 101× |
 | --sketch 200 | 25.4s | 61× |
 
@@ -235,7 +233,6 @@ Reference timings (Ryzen 5 5600X, 2026-03-14):
 | sketch-200 | 3.3s | 4.2× |
 | countsketch-50 | 1.7s | 8.0× |
 | countsketch-100 | 3.6s | 3.8× |
-| stochastic-50 | 68s | slow at small N (known) |
 
 **Red flags**: any mode >30% slower than these baselines, or sketch slower than exact.
 

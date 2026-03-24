@@ -62,9 +62,6 @@ echo "--- Sketch CountSketch (auto-f32) ---"
 run_mode "countsketch-50"       "--sketch 50  --sketch-method countsketch"
 run_mode "countsketch-100"      "--sketch 100 --sketch-method countsketch"
 
-echo "--- Stochastic ---"
-run_mode "stochastic-50"        "--stochastic 50"
-
 echo "--- Subsample (if biobank) ---"
 if [ "$LABEL" = "biobank_50k" ]; then
     run_mode "subsample-5k"         "--subsample 5000"

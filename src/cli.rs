@@ -318,13 +318,6 @@ pub struct L2Args {
     #[arg(long)]
     pub fast_f32: bool,
 
-    /// Use Hutchinson's stochastic trace estimator with T random probes instead
-    /// of exact GEMM for LD score computation. Trades precision for speed:
-    /// ~sqrt(2/T) relative error per SNP. Only effective for scalar (non-partitioned)
-    /// LD scores; partitioned mode falls back to exact computation.
-    #[arg(long, value_name = "PROBES", conflicts_with = "gpu")]
-    pub stochastic: Option<usize>,
-
     /// Random projection sketch: compress individual dimension N→d before GEMM.
     /// Trades precision for speed — larger d is more accurate but slower.
     /// At 1000G scale (N=2490): d=200 gives ~2× speedup with Pearson r≈0.90
@@ -333,7 +326,7 @@ pub struct L2Args {
     /// Avoid d>500 (cache thrashing). Bias is exactly corrected in expectation.
     /// Automatically enables f32 (sketch f64 and f32 produce bit-identical
     /// output since ±1/√d entries are exactly representable in f32).
-    #[arg(long, value_name = "DIM", conflicts_with_all = ["gpu", "stochastic"])]
+    #[arg(long, value_name = "DIM", conflicts_with = "gpu")]
     pub sketch: Option<usize>,
 
     /// Sketch projection method: "rademacher" (default, dense ±1/√d matrix) or
