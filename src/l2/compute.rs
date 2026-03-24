@@ -1568,7 +1568,9 @@ pub(super) fn compute_ldscore_global(
         } else {
             all_bed_sequential
         };
-        let do_fused = use_fused_sketch && chunk_is_contiguous;
+        // Fused path also requires chunk_reader (allocated only when !prefetch_bed).
+        // With prefetch_bed, fall back to non-fused CountSketch (still O(N×c), marginally slower).
+        let do_fused = use_fused_sketch && chunk_is_contiguous && !prefetch_bed;
 
         if do_fused {
             // ── Fused path: read raw bytes, fuse decode+normalize+project ──────────

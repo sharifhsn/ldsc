@@ -78,6 +78,13 @@ pub fn run(args: L2Args) -> Result<()> {
     if args.sketch.is_none() && args.sketch_method != "rademacher" {
         anyhow::bail!("--sketch-method requires --sketch to be set");
     }
+    if args.snp_level_masking && args.stochastic.is_some() {
+        eprintln!(
+            "Warning: --snp-level-masking has no effect with --stochastic. \
+             The stochastic Hutchinson estimator does not compute per-SNP r² values \
+             and cannot apply exact window masking."
+        );
+    }
 
     let bim_path = format!("{}.bim", args.bfile);
     let fam_path = format!("{}.fam", args.bfile);
