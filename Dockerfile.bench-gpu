@@ -1,0 +1,60 @@
+# GPU benchmark image for ldsc (glibc + CUDA + mimalloc).
+# CubeCL compiles PTX at runtime via nvrtc — no CUDA SDK needed at build time.
+#
+# Build:  docker build -f Dockerfile.bench-gpu -t ldsc-bench-gpu .
+# Test:   docker run --gpus all ldsc-bench-gpu ldsc l2 --help
+
+# CUDA version for cudarc symbol loading. Must be <= target driver's CUDA version.
+# 12040 = CUDA 12.4 (safe default for AWS AL2/AL2023 GPU AMIs)
+# 11080 = CUDA 11.8 (for older HPC like PMACS P100)
+ARG CUDA_TARGET_VERSION=12040
+
+# ── build ─────────────────────────────────────────────────────────────────────
+FROM rust:1-bookworm AS builder
+ARG CUDA_TARGET_VERSION
+ENV CUDARC_CUDA_VERSION=${CUDA_TARGET_VERSION}
+WORKDIR /app
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY .cargo/ .cargo/
+COPY src/ src/
+RUN cargo build --release --features gpu,mimalloc \
+    && strip target/release/ldsc
+
+# ── runtime ───────────────────────────────────────────────────────────────────
+# Use plain Ubuntu — NOT nvidia/cuda base images, which ship compat libcuda.so
+# that conflicts with the host driver. The NVIDIA Container Toolkit on the EC2
+# host automatically mounts the real libcuda.so into the container.
+# We only need libnvrtc.so (for CubeCL's runtime PTX compilation).
+FROM ubuntu:22.04
+
+# Install nvrtc from NVIDIA's apt repo (no compat libcuda.so)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl unzip gnupg && \
+    curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/3bf863cc.pub \
+        | gpg --dearmor -o /usr/share/keyrings/cuda-archive-keyring.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/ /" \
+        > /etc/apt/sources.list.d/cuda.list && \
+    apt-get update && apt-get install -y --no-install-recommends cuda-nvrtc-12-6 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Tell the NVIDIA Container Toolkit we need GPU + compute + utility
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# Install hyperfine
+ARG HYPERFINE_VERSION=1.19.0
+RUN curl -sL "https://github.com/sharkdp/hyperfine/releases/download/v${HYPERFINE_VERSION}/hyperfine_${HYPERFINE_VERSION}_amd64.deb" \
+    -o /tmp/hf.deb && dpkg -i /tmp/hf.deb && rm /tmp/hf.deb
+
+# Install AWS CLI v2 for S3 data download
+RUN curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip && \
+    cd /tmp && unzip -q awscli.zip && ./aws/install && \
+    rm -rf /tmp/aws /tmp/awscli.zip
+
+COPY --from=builder /app/target/release/ldsc /usr/local/bin/ldsc
+COPY scripts/bench-entrypoint.sh /entrypoint.sh
+COPY scripts/gpu-biobank-bench.sh /usr/local/bin/gpu-biobank-bench
+COPY scripts/biobank-bench.sh /usr/local/bin/biobank-bench
+RUN chmod +x /entrypoint.sh /usr/local/bin/gpu-biobank-bench /usr/local/bin/biobank-bench
+
+ENTRYPOINT ["/entrypoint.sh"]

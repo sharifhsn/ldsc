@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "ldsc-rs: Exact and approximate LD Score Regression at biobank scale"
+type: software
+authors:
+  - family-names: "Haason"
+    given-names: "Sharif"
+  - family-names: "Khan"
+    given-names: "Yousef"
+repository-code: "https://github.com/sharifhsn/ldsc"
+license: GPL-3.0-only
+version: "0.4.1"
+date-released: "2026-03-24"
+keywords:
+  - "LD score regression"
+  - "heritability"
+  - "GWAS"
+  - "Rust"
+  - "bioinformatics"
+  - "CountSketch"
