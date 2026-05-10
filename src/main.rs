@@ -40,21 +40,49 @@ fn is_subcommand(arg: &str) -> bool {
     )
 }
 
-fn inject_h2_subcommand(mut args: Vec<String>) -> Vec<String> {
+fn inject_implicit_subcommand(mut args: Vec<String>) -> Vec<String> {
     if args.len() < 2 {
         return args;
     }
     let first = args[1].as_str();
-    if !is_subcommand(first) && args.iter().any(|a| a == "--h2") {
+    if is_subcommand(first) {
+        return args;
+    }
+
+    // Python LDSC uses --h2, --l2, --rg as mode selectors rather than subcommands.
+    // LDlink invokes: `ldsc.py --bfile X --l2 ...`, `ldsc.py --h2 ...`, `ldsc.py --rg ...`
+    // Detect these flags and inject the corresponding subcommand.
+    if args.iter().any(|a| a == "--h2" || a == "--h2-cts") {
+        // --h2 is also a valid clap arg in H2Args, so we keep it
         args.insert(1, "h2".to_string());
-    } else if !is_subcommand(first) && args.iter().any(|a| a == "--l2") {
+    } else if args.iter().any(|a| a == "--rg") {
+        // --rg is also a valid clap arg in RgArgs, so we keep it
+        args.insert(1, "rg".to_string());
+    } else if args.iter().any(|a| a == "--l2") {
+        // --l2 is NOT a valid arg in L2Args, so we must remove it
+        args.retain(|a| a != "--l2");
         args.insert(1, "l2".to_string());
     }
+
+    // Also handle munge_sumstats.py compatibility: if argv[0] contains "munge",
+    // inject the munge-sumstats subcommand.
+    if let Some(argv0) = args.first() {
+        let basename = std::path::Path::new(argv0)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if basename.contains("munge")
+            && !is_subcommand(args.get(1).map(|s| s.as_str()).unwrap_or(""))
+        {
+            args.insert(1, "munge-sumstats".to_string());
+        }
+    }
+
     args
 }
 
 fn main() -> Result<()> {
-    let args = inject_h2_subcommand(std::env::args().collect());
+    let args = inject_implicit_subcommand(std::env::args().collect());
     let cli = Cli::parse_from(args);
     init_tracing(&cli.log_level);
 

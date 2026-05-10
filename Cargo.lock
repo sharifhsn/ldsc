@@ -2535,7 +2535,6 @@ dependencies = [
  "anyhow",
  "bzip2-rs",
  "clap",
- "crossbeam-channel",
  "cubecl",
  "cubek-matmul",
  "faer",

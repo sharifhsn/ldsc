@@ -27,21 +27,26 @@ run_bench() {
     echo ""
 }
 
-# Exact baselines
-run_bench "exact-f64"       ""
-run_bench "exact-f32"       "--fast-f32"
+# Exact baselines (--global-pass required: per-chr at N=50K needs ~70GB, exceeds 28GB container)
+run_bench "exact-f64"       "--global-pass"
+run_bench "exact-f32"       "--global-pass --fast-f32"
 
 # CountSketch (auto-f32, fused decode+normalize+scatter)
-run_bench "countsketch-50"   "--sketch 50"
-run_bench "countsketch-100"  "--sketch 100"
-run_bench "countsketch-200"  "--sketch 200"
-run_bench "countsketch-500"  "--sketch 500"
-run_bench "countsketch-1000" "--sketch 1000"
+# Per-chr parallel is safe here: d=10000 × 22 chr = ~7GB, well within 28GB.
+run_bench "countsketch-50"    "--sketch 50"
+run_bench "countsketch-100"   "--sketch 100"
+run_bench "countsketch-200"   "--sketch 200"
+run_bench "countsketch-500"   "--sketch 500"
+run_bench "countsketch-1000"  "--sketch 1000"
+run_bench "countsketch-2000"  "--sketch 2000"
+run_bench "countsketch-5000"  "--sketch 5000"
+run_bench "countsketch-10000" "--sketch 10000"
 
 echo ""
 echo "=== RAW JSON ==="
 for label in exact-f64 exact-f32 \
-             countsketch-50 countsketch-100 countsketch-200 countsketch-500 countsketch-1000; do
+             countsketch-50 countsketch-100 countsketch-200 countsketch-500 \
+             countsketch-1000 countsketch-2000 countsketch-5000 countsketch-10000; do
     f="/tmp/${label}.json"
     echo "--- $label ---"
     cat "$f" 2>/dev/null || echo "(not available)"

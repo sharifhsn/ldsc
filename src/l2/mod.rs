@@ -684,6 +684,17 @@ pub fn run(args: L2Args) -> Result<()> {
         println!("{}", msg);
     }
 
+    // Print LD Score summary (matches Python's "Summary of LD Scores in ..." output).
+    // LDlink's Flask code parses for this string.
+    print_ld_score_summary(
+        &out_path,
+        &out_snps,
+        &out_l2,
+        &col_names,
+        &maf_per_snp,
+        &out_positions,
+    );
+
     if verbose_timing {
         eprintln!(
             "[perf] write_outputs={:.3}s total={:.3}s",
@@ -692,4 +703,139 @@ pub fn run(args: L2Args) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Print LD Score summary statistics matching Python's output format.
+/// LDlink parses stdout for "Summary of LD Scores in ..." to extract results.
+fn print_ld_score_summary(
+    out_path: &str,
+    out_snps: &[&BimRecord],
+    out_l2: &MatF,
+    col_names: &[String],
+    maf_per_snp: &[f64],
+    out_positions: &[usize],
+) {
+    let n = out_snps.len();
+    if n == 0 {
+        return;
+    }
+
+    // Collect MAF values for output SNPs
+    let maf_vals: Vec<f64> = out_positions.iter().map(|&pos| maf_per_snp[pos]).collect();
+
+    // Build columns: MAF + each L2 column
+    let mut all_cols: Vec<(&str, Vec<f64>)> = Vec::new();
+    all_cols.push(("MAF", maf_vals));
+    for (k, name) in col_names.iter().enumerate() {
+        let vals: Vec<f64> = (0..n).map(|i| out_l2[(i, k)]).collect();
+        all_cols.push((name, vals));
+    }
+
+    println!("\nSummary of LD Scores in {}", out_path);
+
+    // Print header
+    let col_width = 8;
+    print!("{:>8}", "");
+    for (name, _) in &all_cols {
+        print!("{:>col_width$}", name);
+    }
+    println!();
+
+    // Compute and print descriptive stats: mean, std, min, 25%, 50%, 75%, max
+    let labels = ["mean", "std", "min", "25%", "50%", "75%", "max"];
+    for label in &labels {
+        print!("{:>8}", label);
+        for (_, vals) in &all_cols {
+            let stat = compute_descriptive_stat(vals, label);
+            print!("{:>col_width$.4}", stat);
+        }
+        println!();
+    }
+
+    // Print MAF/LD Score Correlation Matrix
+    println!();
+    println!("MAF/LD Score Correlation Matrix");
+    let col_width_corr = 8;
+    print!("{:>8}", "");
+    for (name, _) in &all_cols {
+        print!("{:>col_width_corr$}", name);
+    }
+    println!();
+
+    for (i, (name_i, vals_i)) in all_cols.iter().enumerate() {
+        print!("{:>8}", name_i);
+        for (j, (_, vals_j)) in all_cols.iter().enumerate() {
+            if i == j {
+                print!("{:>col_width_corr$.4}", 1.0);
+            } else {
+                print!("{:>col_width_corr$.4}", pearson_corr(vals_i, vals_j));
+            }
+        }
+        println!();
+    }
+}
+
+fn compute_descriptive_stat(vals: &[f64], stat: &str) -> f64 {
+    let n = vals.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    match stat {
+        "mean" => vals.iter().sum::<f64>() / n as f64,
+        "std" => {
+            let mean = vals.iter().sum::<f64>() / n as f64;
+            let var = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1).max(1) as f64;
+            var.sqrt()
+        }
+        "min" => vals.iter().copied().fold(f64::INFINITY, f64::min),
+        "max" => vals.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        pct => {
+            let q = match pct {
+                "25%" => 0.25,
+                "50%" => 0.50,
+                "75%" => 0.75,
+                _ => return f64::NAN,
+            };
+            percentile(vals, q)
+        }
+    }
+}
+
+fn percentile(vals: &[f64], q: f64) -> f64 {
+    let mut sorted: Vec<f64> = vals.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    if n == 1 {
+        return sorted[0];
+    }
+    // Use linear interpolation (same as pandas default)
+    let pos = q * (n - 1) as f64;
+    let lo = pos.floor() as usize;
+    let hi = lo + 1;
+    let frac = pos - lo as f64;
+    if hi >= n {
+        sorted[lo]
+    } else {
+        sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    }
+}
+
+fn pearson_corr(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len() as f64;
+    let mx = x.iter().sum::<f64>() / n;
+    let my = y.iter().sum::<f64>() / n;
+    let mut cov = 0.0;
+    let mut vx = 0.0;
+    let mut vy = 0.0;
+    for i in 0..x.len() {
+        let dx = x[i] - mx;
+        let dy = y[i] - my;
+        cov += dx * dy;
+        vx += dx * dx;
+        vy += dy * dy;
+    }
+    if vx == 0.0 || vy == 0.0 {
+        return f64::NAN;
+    }
+    cov / (vx * vy).sqrt()
 }

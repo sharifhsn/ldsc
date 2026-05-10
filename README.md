@@ -10,6 +10,8 @@ Implements six subcommands — `munge-sumstats`, `l2`, `h2`, `rg`, `make-annot`,
 numerically identical output and a **~38× speedup** on LD score computation
 (exact mode, 1000G N=2,490; up to **101×** with `--sketch`). Approximate modes
 (`--sketch`) trades per-SNP precision for additional throughput.
+Compatible with Python LDSC's CLI flags (`--l2`, `--h2`, `--rg`) for drop-in replacement in
+platforms like [NCI LDlink](https://ldlink.nih.gov/).
 
 ---
 
@@ -218,6 +220,41 @@ ldsc cts-annot \
   --cts-names DAF,DIST_TO_GENE \
   --annot-file cts.annot.gz
 ```
+
+---
+
+## Python CLI Compatibility
+
+The Rust binary accepts both its native subcommand syntax (`ldsc l2 ...`) and the original
+Python LDSC flag syntax (`ldsc --l2 ...`, `ldsc --h2 ...`, `ldsc --rg ...`). This enables
+drop-in replacement in pipelines and platforms built around the Python tool.
+
+**Supported implicit subcommand flags:**
+
+| Python invocation | Rust equivalent | Status |
+|---|---|---|
+| `ldsc.py --l2 --bfile X --ld-wind-cm 1 --out X` | `ldsc l2 --bfile X --ld-wind-cm 1 --out X` | auto-detected |
+| `ldsc.py --h2 F --ref-ld-chr D --w-ld-chr D --out B` | `ldsc h2 --h2 F --ref-ld-chr D --w-ld-chr D --out B` | auto-detected |
+| `ldsc.py --rg F1,F2 --ref-ld-chr D --w-ld-chr D --out B` | `ldsc rg --rg F1,F2 --ref-ld-chr D --w-ld-chr D --out B` | auto-detected |
+| `munge_sumstats.py --sumstats F --out B` | `ldsc munge-sumstats --sumstats F --out B` | auto-detected via argv[0] |
+
+**argv[0] detection for munge:** If the binary is invoked via a symlink or renamed executable
+whose filename contains "munge" (e.g. `munge_sumstats.py`), it automatically routes to the
+`munge-sumstats` subcommand. Create a symlink to enable zero-change integration:
+
+```bash
+ln -s /usr/local/bin/ldsc /usr/local/bin/munge_sumstats.py
+munge_sumstats.py --sumstats file.txt --out munged  # works
+```
+
+**Output format compatibility:** stdout output matches the Python format for downstream parsing:
+- `l2`: prints "Summary of LD Scores in ..." with descriptive statistics and correlation matrix
+- `h2`: prints "Total Observed scale h2: ...", Lambda GC, Mean Chi^2, Intercept, Ratio
+- `rg`: prints per-phenotype heritability sections, genetic covariance, genetic correlation
+  (with z-score and p-value), and "Summary of Genetic Correlation Results" table
+
+This compatibility is designed for integration with [NCI LDlink](https://ldlink.nih.gov/),
+which invokes LDSC via `subprocess.run()` and parses stdout.
 
 ---
 
@@ -700,3 +737,18 @@ docker build -t ldsc .
 The multi-stage `Dockerfile` uses [cargo-chef](https://github.com/LukeMathWalker/cargo-chef) to
 cache dependency compilation in a separate layer, so incremental rebuilds only recompile changed
 source files.
+
+## How to Cite
+
+If you use ldsc-rs in your research, please cite:
+
+> Haason, S. & Khan, Y. (2026). ldsc-rs: Exact and approximate LD Score Regression at biobank scale. *bioRxiv*. <!-- TODO: add DOI after submission -->
+
+```bibtex
+@article{haason2026ldscrs,
+  author = {Haason, Sharif and Khan, Yousef},
+  title = {ldsc-rs: Exact and approximate {LD} {Score} Regression at biobank scale},
+  journal = {bioRxiv},
+  year = {2026},
+}
+```

@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use faer::{Accum, Par};
 use polars::prelude::*;
 use statrs::distribution::StudentsT;
-use statrs::distribution::{Continuous, ContinuousCDF, Normal};
+use statrs::distribution::{ChiSquared, Continuous, ContinuousCDF, Normal};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
@@ -1571,6 +1571,9 @@ struct HsqFit {
     tot_se: f64,
     intercept: f64,
     intercept_se: f64,
+    lambda_gc: f64,
+    mean_chi2: f64,
+    ratio: Option<(f64, f64)>,
     tot_delete_values: ColF,
 }
 
@@ -1580,6 +1583,7 @@ struct GencovFit {
     tot_se: f64,
     intercept: f64,
     intercept_se: f64,
+    mean_z1z2: f64,
     tot_delete_values: ColF,
 }
 
@@ -1823,11 +1827,37 @@ fn run_hsq_ldsc(
         (jknife.est[(k, 0)], jknife.jknife_se[(k, 0)])
     };
 
+    // Compute Lambda GC, Mean Chi^2, and Ratio (matching Python's Hsq._summarize_chisq())
+    let mean_chi2 = col_mean(chi2);
+    let lambda_gc = {
+        let mut sorted: Vec<f64> = (0..col_len(chi2)).map(|i| chi2[(i, 0)]).collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mid = sorted.len() / 2;
+        let median = if sorted.len().is_multiple_of(2) && sorted.len() > 1 {
+            (sorted[mid - 1] + sorted[mid]) / 2.0
+        } else {
+            sorted[mid]
+        };
+        // Python: lambda_gc = np.median(chisq) / 0.4549
+        // 0.4549 is the median of a chi-squared(1) distribution
+        median / 0.4549
+    };
+    let ratio = if fixed_intercept.is_some() || mean_chi2 <= 1.0 {
+        None
+    } else {
+        let r = (intercept - 1.0) / (mean_chi2 - 1.0);
+        let r_se = intercept_se / (mean_chi2 - 1.0);
+        Some((r, r_se))
+    };
+
     Ok(HsqFit {
         tot,
         tot_se,
         intercept,
         intercept_se,
+        lambda_gc,
+        mean_chi2,
+        ratio,
         tot_delete_values,
     })
 }
@@ -2040,13 +2070,82 @@ fn run_gencov_ldsc(
         (jknife.est[(k, 0)], jknife.jknife_se[(k, 0)])
     };
 
+    // Compute mean(z1*z2) matching Python's self.mean_z1z2 = np.mean(np.multiply(z1, z2))
+    let mean_z1z2 = {
+        let mut sum = 0.0;
+        for i in 0..col_len(z1) {
+            sum += z1[(i, 0)] * z2[(i, 0)];
+        }
+        sum / col_len(z1) as f64
+    };
+
     Ok(GencovFit {
         tot,
         tot_se,
         intercept,
         intercept_se,
+        mean_z1z2,
         tot_delete_values,
     })
+}
+
+struct RgPairResult {
+    p1: String,
+    p2: String,
+    rg: f64,
+    se: f64,
+    z: f64,
+    p: f64,
+    h2_obs: f64,
+    h2_obs_se: f64,
+    h2_int: f64,
+    h2_int_se: f64,
+    gcov_int: f64,
+    gcov_int_se: f64,
+}
+
+/// Print h2 summary matching Python's Hsq.summary() format.
+fn print_hsq_summary(hsq: &HsqFit, fixed_intercept: Option<f64>) {
+    println!(
+        "Total Observed scale h2: {:.4} ({:.4})",
+        hsq.tot, hsq.tot_se
+    );
+    println!("Lambda GC: {:.4}", hsq.lambda_gc);
+    println!("Mean Chi^2: {:.4}", hsq.mean_chi2);
+    if fixed_intercept.is_some() {
+        println!("Intercept: constrained to {:.4}", hsq.intercept);
+    } else {
+        println!("Intercept: {:.4} ({:.4})", hsq.intercept, hsq.intercept_se);
+        match hsq.ratio {
+            Some((r, _r_se)) if r < 0.0 => {
+                println!("Ratio < 0 (usually indicates GC correction).");
+            }
+            Some((r, r_se)) => {
+                println!("Ratio: {:.4} ({:.4})", r, r_se);
+            }
+            None if hsq.mean_chi2 <= 1.0 => {
+                println!("Ratio: NA (mean chi^2 < 1)");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Print gencov summary matching Python's Gencov.summary() format.
+fn print_gencov_summary(gencov: &GencovFit, fixed_intercept: Option<f64>) {
+    println!(
+        "Total Observed scale gencov: {:.4} ({:.4})",
+        gencov.tot, gencov.tot_se
+    );
+    println!("Mean z1*z2: {:.4}", gencov.mean_z1z2);
+    if fixed_intercept.is_some() {
+        println!("Intercept: constrained to {:.4}", gencov.intercept);
+    } else {
+        println!(
+            "Intercept: {:.4} ({:.4})",
+            gencov.intercept, gencov.intercept_se
+        );
+    }
 }
 
 pub fn run_rg(args: RgArgs) -> Result<()> {
@@ -2181,9 +2280,11 @@ To match Python, provide {} values (first ignored).",
 
     let ss1_df = ss1.collect().context("loading primary sumstats")?;
 
+    let mut rg_results: Vec<RgPairResult> = Vec::new();
+
     for trait_idx in 1..n_traits {
         let file2 = &args.rg[trait_idx];
-        println!("Computing rg: {} vs {}", file1, file2);
+        println!("Computing rg for phenotype {}/{}", trait_idx + 1, n_traits);
         if !args.no_check_alleles {
             ensure_sumstats_have_alleles(file2)?;
         }
@@ -2338,11 +2439,6 @@ To match Python, provide {} values (first ignored).",
             None,
             None,
         );
-        let samp_prev1 = args.samp_prev.first().copied();
-        let pop_prev1 = args.pop_prev.first().copied();
-        let samp_prev2 = args.samp_prev.get(trait_idx).copied();
-        let pop_prev2 = args.pop_prev.get(trait_idx).copied();
-
         let h2_int1 = intercept_h2[0];
         let h2_int2 = intercept_h2[trait_idx];
         let gencov_int = intercept_gencov[trait_idx];
@@ -2398,44 +2494,154 @@ To match Python, provide {} values (first ignored).",
             (f64::NAN, f64::NAN)
         };
 
-        println!(
-            "  gencov = {:.4} ({:.4})  (intercept: {:.4} ± {:.4})",
-            gencov.tot, gencov.tot_se, gencov.intercept, gencov.intercept_se
-        );
-        println!(
-            "  h2({}) = {:.4} ({:.4})  (intercept: {:.4} ± {:.4})",
-            file1, hsq1.tot, hsq1.tot_se, hsq1.intercept, hsq1.intercept_se
-        );
-        println!(
-            "  h2({}) = {:.4} ({:.4})  (intercept: {:.4} ± {:.4})",
-            file2, hsq2.tot, hsq2.tot_se, hsq2.intercept, hsq2.intercept_se
-        );
-        if args.return_silly_things {
-            println!("  rg = {:.4} ({:.4})", rg_ratio, rg_se);
-        } else if rg_ratio.is_finite() && !(-1.2..=1.2).contains(&rg_ratio) {
-            println!("  rg = nan (nan) (rg out of bounds)");
+        // Compute z-score and p-value for rg (matches Python's p_z_norm)
+        let (rg_z, rg_p) = if rg_se.is_finite() && rg_se != 0.0 {
+            let z = rg_ratio / rg_se;
+            let p = if z.is_finite() {
+                let chi2_dist = ChiSquared::new(1.0).unwrap();
+                1.0 - chi2_dist.cdf(z * z)
+            } else {
+                0.0
+            };
+            (z, p)
         } else {
-            println!("  rg = {:.4} ({:.4})", rg_ratio, rg_se);
+            (f64::INFINITY, 0.0)
+        };
+
+        let negative_hsq = hsq1.tot <= 0.0 || hsq2.tot <= 0.0;
+
+        // Print h2 summary for phenotype 1 (only on first pair)
+        if trait_idx == 1 {
+            let header = "\nHeritability of phenotype 1\n";
+            println!("{}{}", header, "-".repeat(header.trim().len()));
+            print_hsq_summary(&hsq1, h2_int1);
         }
 
-        if let (Some(sp1), Some(pp1), Some(sp2), Some(pp2)) =
-            (samp_prev1, pop_prev1, samp_prev2, pop_prev2)
-        {
-            let c1 = liability_conversion_factor(sp1, pp1);
-            let c2 = liability_conversion_factor(sp2, pp2);
-            let h2_1_liab = hsq1.tot * c1;
-            let h2_2_liab = hsq2.tot * c2;
-            let gencov_liab = gencov.tot * (c1 * c2).sqrt();
-            let rg_liab = if h2_1_liab > 0.0 && h2_2_liab > 0.0 {
-                gencov_liab / (h2_1_liab * h2_2_liab).sqrt()
-            } else {
-                f64::NAN
-            };
+        // Print h2 summary for phenotype 2
+        let header = format!(
+            "\nHeritability of phenotype {}/{}\n",
+            trait_idx + 1,
+            n_traits
+        );
+        println!("{}{}", header, "-".repeat(header.trim().len()));
+        print_hsq_summary(&hsq2, h2_int2);
+
+        // Print genetic covariance
+        let header = "\nGenetic Covariance\n";
+        println!("{}{}", header, "-".repeat(header.trim().len()));
+        print_gencov_summary(&gencov, gencov_int);
+
+        // Print genetic correlation
+        let header = "\nGenetic Correlation\n";
+        println!("{}{}", header, "-".repeat(header.trim().len()));
+        if negative_hsq {
+            println!("Genetic Correlation: nan (nan) (h2  out of bounds) ");
+            println!("Z-score: nan (nan) (h2  out of bounds)");
+            println!("P: nan (nan) (h2  out of bounds)");
+            println!("WARNING: One of the h2's was out of bounds.");
             println!(
-                "  Liability-scale h2_1={:.4}  h2_2={:.4}  rg={:.4}",
-                h2_1_liab, h2_2_liab, rg_liab
+                "This usually indicates a data-munging error \
+                 or that h2 or N is low."
             );
+        } else if !args.return_silly_things
+            && rg_ratio.is_finite()
+            && !(-1.2..=1.2).contains(&rg_ratio)
+        {
+            println!("Genetic Correlation: nan (nan) (rg out of bounds) ");
+            println!("Z-score: nan (nan) (rg out of bounds)");
+            println!("P: nan (nan) (rg out of bounds)");
+            println!("WARNING: rg was out of bounds.");
+            if gencov_int.is_none() {
+                println!(
+                    "This often means that h2 is not significantly \
+                     different from zero."
+                );
+            } else {
+                println!(
+                    "This often means that you have constrained \
+                     the intercepts to the wrong values."
+                );
+            }
+        } else {
+            println!("Genetic Correlation: {:.4} ({:.4})", rg_ratio, rg_se);
+            println!("Z-score: {:.4}", rg_z);
+            println!("P: {:.4}", rg_p);
         }
+
+        // Collect for summary table
+        rg_results.push(RgPairResult {
+            p1: file1.clone(),
+            p2: file2.clone(),
+            rg: rg_ratio,
+            se: rg_se,
+            z: rg_z,
+            p: rg_p,
+            h2_obs: hsq2.tot,
+            h2_obs_se: hsq2.tot_se,
+            h2_int: hsq2.intercept,
+            h2_int_se: hsq2.intercept_se,
+            gcov_int: gencov.intercept,
+            gcov_int_se: gencov.intercept_se,
+        });
+    }
+
+    // Print summary table (matches Python's _get_rg_table)
+    println!("\nSummary of Genetic Correlation Results");
+    println!(
+        "{:>width_p1$} {:>width_p2$} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10} {:>8} {:>10} {:>9} {:>12}",
+        "p1",
+        "p2",
+        "rg",
+        "se",
+        "z",
+        "p",
+        "h2_obs",
+        "h2_obs_se",
+        "h2_int",
+        "h2_int_se",
+        "gcov_int",
+        "gcov_int_se",
+        width_p1 = rg_results
+            .iter()
+            .map(|r| r.p1.len())
+            .max()
+            .unwrap_or(2)
+            .max(2),
+        width_p2 = rg_results
+            .iter()
+            .map(|r| r.p2.len())
+            .max()
+            .unwrap_or(2)
+            .max(2),
+    );
+    for r in &rg_results {
+        println!(
+            "{:>width_p1$} {:>width_p2$} {:>8.4} {:>8.4} {:>8.4} {:>8.4} {:>8.4} {:>10.4} {:>8.4} {:>10.4} {:>9.4} {:>12.4}",
+            r.p1,
+            r.p2,
+            r.rg,
+            r.se,
+            r.z,
+            r.p,
+            r.h2_obs,
+            r.h2_obs_se,
+            r.h2_int,
+            r.h2_int_se,
+            r.gcov_int,
+            r.gcov_int_se,
+            width_p1 = rg_results
+                .iter()
+                .map(|r| r.p1.len())
+                .max()
+                .unwrap_or(2)
+                .max(2),
+            width_p2 = rg_results
+                .iter()
+                .map(|r| r.p2.len())
+                .max()
+                .unwrap_or(2)
+                .max(2),
+        );
     }
 
     if verbose_timing {

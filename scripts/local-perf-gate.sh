@@ -53,14 +53,12 @@ echo "--- Exact modes ---"
 run_mode "exact-f64"            ""
 run_mode "exact-f32"            "--fast-f32"
 
-echo "--- Sketch Rademacher (auto-f32) ---"
-run_mode "sketch-50"            "--sketch 50"
-run_mode "sketch-100"           "--sketch 100"
-run_mode "sketch-200"           "--sketch 200"
-
-echo "--- Sketch CountSketch (auto-f32) ---"
+echo "--- CountSketch (auto-f32) ---"
 run_mode "countsketch-50"       "--sketch 50"
 run_mode "countsketch-100"      "--sketch 100"
+run_mode "countsketch-200"      "--sketch 200"
+run_mode "countsketch-500"      "--sketch 500"
+run_mode "countsketch-1000"     "--sketch 1000"
 
 echo ""
 echo "--- Parity check (exact-f64 vs Python on bench_5k) ---"
