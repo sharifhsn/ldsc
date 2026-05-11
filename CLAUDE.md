@@ -4,7 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Rust rewrite of [Bulik-Sullivan et al.'s LDSC](https://github.com/bulik/ldsc) (LD Score Regression), a tool for estimating heritability and genetic correlation from GWAS summary statistics. Six subcommands: `munge-sumstats`, `l2`, `h2`, `rg`, `make-annot`, `cts-annot`. Numerically exact parity with Python (`max_abs_diff=0` in f64 mode). Current performance vs Python on AWS EPYC 7R13:
+Rust rewrite of [Bulik-Sullivan et al.'s LDSC](https://github.com/bulik/ldsc) (LD Score Regression), a tool for estimating heritability and genetic correlation from GWAS summary statistics. Six subcommands: `munge-sumstats`, `l2`, `h2`, `rg`, `make-annot`, `cts-annot`.
+
+**Reference implementations and parity.** Three implementations exist for LD-score computation: GCTA (the C++ tool the original LDSC paper used to compute the 1000G reference LD scores; **block-based windowing with two-pass overlap averaging**, not per-SNP exact — see [`docs/gcta-source-audit.md`](docs/gcta-source-audit.md) for the source-code audit), Python LDSC (`bulik/ldsc`, 50-SNP chunked windowing as an undocumented approximation), and ldsc-rs (this project; defaults to 200-SNP chunks for ~4× faster GEMM). Parity verified on chr22 1000G EUR (see [`docs/h2-masking-simulation.md`](docs/h2-masking-simulation.md) and [`docs/gcta-source-audit.md`](docs/gcta-source-audit.md)):
+
+- **`ldsc l2 --python-compat`** produces `max_abs_diff=0` vs Python LDSC (all 18,627 SNPs bit-identical).
+- **`ldsc l2 --snp-level-masking`** implements true per-SNP exact windows (the LDSC paper's mathematical definition `ℓ_j = Σ_k r²_{jk}`). It is *stricter* than GCTA, whose `--ld-score` is block-based with overlap-averaging. Apples-to-apples comparison (GCTA `--ld-wind 2X --ld-score-adj` for ldsc-rs `--ld-wind-kb X`): Pearson r = 0.9995, mean L2 diff +0.18 vs masked, +0.006 vs chunked on chr22 EUR.
+- **GCTA flag tuning to match ldsc-rs.** GCTA's `--ld-wind X` is the BLOCK width in kb (effective per-SNP radius averages ~0.75×X), not a per-SNP radius. GCTA's default r² is BIASED; `--ld-score-adj` enables the same `r² − (1−r²)/(N−2)` correction ldsc-rs always uses. To compare LD scores directly, pass GCTA `--ld-wind 2X --ld-score-adj --ld-rsq-cutoff 0`.
+- **ldsc-rs `h2` regression** is bit-identical to Python LDSC's `h2` on identical LD-score inputs (every digit matches).
+- **Default `ldsc l2`** (c=200, no masking, per-chr parallel) differs from Python by mean L2 ~0.2, max ~6 (Pearson r=0.9997), propagating to <1% h² difference. The 200 default is for speed; switch to `--python-compat` for replication or `--snp-level-masking` for strict per-SNP LD scores (the LDSC paper's math).
+
+Current performance vs Python on AWS EPYC 7R13:
 
 - **1000G (N=2,490)**: 37.7× exact, 101× with `--sketch 50`
 - **Biobank (N=50K)**: 20× with `--sketch 50` (best), 1.84× exact-f32
@@ -46,11 +56,11 @@ Defined in `.github/workflows/ci.yml`: runs `cargo check`, `cargo fmt --check`, 
 All source lives in `src/`. The binary is a clap-derive CLI dispatcher (`main.rs` → `cli.rs`) that routes to subcommand modules:
 
 - **`cli.rs`** — Pure clap derive structs (`MungeArgs`, `L2Args`, `H2Args`, `RgArgs`, `MakeAnnotArgs`, `CtsAnnotArgs`). No logic.
-- **`main.rs`** — CLI dispatch + global thread pool setup. Injects implicit subcommand for backward-compatible `--h2`/`--l2` flag usage.
+- **`main.rs`** — CLI dispatch + global thread pool setup. Injects implicit subcommand for Python-CLI-compat `--l2`/`--h2`/`--rg` flag usage and `argv[0] == munge_sumstats.py` invocations (drop-in replacement for LDlink and other pipelines).
 - **`munge.rs`** — Polars LazyFrame pipeline for GWAS summary statistics preprocessing. Streams input without loading entire file into RAM.
 - **`l2/`** — LD score computation, split into submodules:
-  - **`mod.rs`** (~570 lines) — `run()` orchestrator: arg validation, BIM/FAM loading, `--extract`/`--annot`/`--keep` wiring, output writing.
-  - **`compute.rs`** (~1500 lines) — `compute_ldscore_global`: ring-buffer GEMM loop (sequential global pass, scalar + partitioned + sketch paths). Also `GemmBufs`, GPU compat helpers.
+  - **`mod.rs`** (~840 lines) — `run()` orchestrator: arg validation, BIM/FAM loading, `--extract`/`--annot`/`--keep` wiring, per-chr parallel vs `--global-pass` dispatch, GPU context lifecycle, output writing, Python-style stdout summary (LD score percentiles + cross-annotation correlation matrix).
+  - **`compute.rs`** (~1900 lines) — `compute_ldscore_global`: ring-buffer GEMM loop (scalar + partitioned + CountSketch paths). Also `GemmBufs`, `CountSketchProj`, fused BED-decode-normalize-scatter-add kernel, optional `--snp-level-masking` post-GEMM mask, GPU compat helpers.
   - **`window.rs`** — `WindowMode` enum + `get_block_lefts_*`: per-chromosome window boundary computation.
   - **`normalize.rs`** — `normalize_col_f{32,64}_with_stats`: impute NaN→mean, centre, unit-variance. AVX2+FMA `sum_sumsq_f32`.
   - **`snp_stats.rs`** — `compute_snp_stats`: fast BED scan for MAF + het/missing prefilter.
@@ -124,10 +134,14 @@ Parity/benchmark scripts in `scripts/`:
 - `--extract` pre-filters BIM before LD computation (affects windows); `--print-snps` post-filters output only.
 - `--maf` in l2 is a pre-filter (before LD computation), matching Python.
 - `bed_idx` (original BIM row) differs from `pos` (index in filtered `all_snps`) when `--extract` is active.
-- L2 uses a global sequential pass across all chromosomes (not per-chromosome parallel), matching Python's cross-chromosome window bleeding behavior.
+- **`--chunk-size` defaults differ from Python LDSC.** Python defaults to `--chunk-size 50`; ldsc-rs defaults to 200 (for ~4× faster cache-friendly GEMM). The chunked window-eviction approximation means larger chunks → slightly larger LD scores (more SNPs late in each chunk inherit a wider-than-true window). For exact bit-identical L2 vs Python: pass `--python-compat` (sets `--chunk-size 50 --global-pass`, disables masking). At default 200, mean L2 differs by ~0.2 (max ~6 on chr22 1000G EUR), Pearson r ≈ 0.9997. h² estimate impact is <1%. h² regression code itself is bit-identical to Python.
+- **`--python-compat` flag.** Bit-identical Python LDSC parity in one flag. Implies `--chunk-size 50 --global-pass`, no `--snp-level-masking`. Conflicts with `--snp-level-masking`. Use for replication studies; for paper-canonical per-SNP exact windows (matching GCTA), use `--snp-level-masking` instead.
+- **`--snp-level-masking` is the paper-canonical mode.** Bulik-Sullivan et al. 2015 define LD scores with exact per-SNP windows; the original paper used GCTA (`--ld-meanrsq`) to compute the 1000G reference LD scores. Python LDSC's chunk-level approximation is an undocumented implementation detail (see one-line acknowledgement in `__corSumVarBlocks__` docstring). `--snp-level-masking` reproduces the paper's mathematical definition and matches GCTA's algorithmic intent.
+- L2 defaults to **per-chromosome parallel** (one rayon task per autosome, each calling `compute_ldscore_global` independently). `--global-pass` opts into the legacy single sequential pass that matches Python's cross-chromosome bleeding for `--ld-wind-snps`. `--gpu` auto-enables `--global-pass` (per-chr OOMs and serializes through one GPU). See `docs/per-chr-parallelism-analysis.md`.
+- `--snp-level-masking` zeroes r² contributions outside each SNP's true per-SNP `block_left` window (Python uses `block_left[chunk_start]` for every SNP in a chunk, inflating LD scores). Default off for Python parity. Enabling it changes h² estimates by ~15% at `--ld-wind-kb 1000` and ~48% at `--ld-wind-kb 100`. Cost is O(w+c) per chunk via monotonic cutoff scan.
 - All CM columns in the 1000G reference data are 0 — never use `--ld-wind-cm` for benchmarking with this data.
 - `make-annot` BED intervals are 0-based half-open; SNP BP=b matches [start,end) iff start < b <= end.
-- `--sketch` projection matrix P uses deterministic seed 42 (`fastrand::Rng::with_seed(42)`). Same `--sketch d` on same data always produces identical output.
+- `--sketch d` is **CountSketch-only** (Rademacher and `--sketch-method` were removed in 5209844; `--stochastic` removed in 1dac3a0). Hash arrays use deterministic seed 42 (`fastrand::Rng::with_seed(42)`). Same `--sketch d` on same data always produces identical output.
 
 ## Data Files
 
@@ -150,10 +164,12 @@ Three opt-in modes trade precision for speed in the `l2` subcommand:
 
 - **`--fast-f32`** — Use f32 for genotype storage and GEMM. ~1.85× speedup (bandwidth-bound). Numerically close to f64; safe for downstream h2/rg. Combinable with all other modes.
 
-- **`--sketch <d>`** — Randomized dimensionality reduction via CountSketch before GEMM. Fused BED-decode-normalize-scatter-add kernel, O(N×c) regardless of d. Cost is flat in d until d≈√N, so d=200 has same speed as d=50 but much better accuracy.
-  - Accuracy depends on d: d=50 r≈0.81, d=100 r≈0.85, d=200 r≈0.93, d=500 r≈0.97
+- **`--sketch <d>`** — Randomized dimensionality reduction via CountSketch before GEMM. Fused BED-decode-normalize-scatter-add kernel, O(N×c) regardless of d. Cost is flat in d until d≈√N, so d=200 has same speed as d=50 but much better accuracy — **prefer larger d**.
+  - Accuracy depends on d: d=100 r≈0.85, d=200 r≈0.93, d=500 r≈0.97. **d=200 is the practical sweet spot.**
   - **Automatically enables f32** — CountSketch ±1 entries are exactly representable in f32. `--fast-f32` is redundant with `--sketch`.
   - Deterministic (seed=42). Same `--sketch d` on same data always produces identical output.
+  - **Bias is corrected** via quadratic inversion of the renormalized-cosine bias `(1-r²)(1-2r²)/d`, giving residual O(1/d²). Empirically validated on chr22 EUR; per-bin analysis confirms the correction shifts high-LD-score SNPs in the predicted direction. Wall-clock cost vs no correction is within AWS run-to-run noise. See `docs/countsketch-math-analysis.md` for derivation and Monte Carlo validation.
+  - **WARNING: d ≤ 50 is unstable** — Taylor truncation + sqrt noise amplification make the bias correction no better than uncorrected at the LD-score level. ldsc-rs prints a warning if you specify d ≤ 50. Just use d ≥ 100; cost is essentially flat in d below the GEMM crossover.
 
 
 ### Performance Summary (AWS EPYC 7R13 c6a.4xlarge, 16 vCPU, 1.66M SNPs)
@@ -233,9 +249,10 @@ Reference timings (Ryzen 5 5600X, 2026-03-14):
 
 ### Perf Regression Lessons Learned
 
-- **Fused CountSketch is O(N×c), not O(d×N×c).** Its scatter-add kernel bypasses GEMM entirely; d=200 has the same cost as d=50. A Rademacher-style fused tile kernel (512-individual tiles, many small `Par::Seq` GEMMs) caused a 2.2× regression (285s vs 130s) — avoid fragmenting the GEMM.
+- **Fused CountSketch is O(N×c), not O(d×N×c).** Its scatter-add kernel bypasses GEMM entirely; d=200 has the same cost as d=50 until d ≈ √N. A historical fused-tile-GEMM kernel (512-individual tiles, many small `Par::Seq` GEMMs, used by the now-removed Rademacher path) caused a 2.2× regression (285s vs 130s) — avoid fragmenting the GEMM.
+- **Cost model:** `T(d) = T_scatter + T_GEMM × d`. At biobank N=50K, fitted `T_scatter ≈ 12.8s`, `T_GEMM ≈ 5s/1000 dim`, crossover `d* ≈ 2,545`. At 1000G N=2,490, `d* ≈ 260`. See `docs/perf-log.md` 2026-03-25 entry.
 - **Parallelism is N-dependent.** A change that's neutral at N=2,490 can be catastrophic at N=50,000. Always think about how parallelism scales with N before submitting HPC jobs.
-- **Diff the hot path against the last validated binary before any AWS run.** The sketch projection path in `compute.rs` (search for "Sketch projection") must go through the CountSketch scatter-add path, not any GEMM.
+- **Removed approximate modes (do not reintroduce without strong justification):** `--sketch-method rademacher` (5209844 — strictly dominated by CountSketch at every N), `--stochastic` (1dac3a0 — only worked at small N, scalar-only, T>50 cache thrashed), `--subsample` (0f42997 — compounded sketch error for ~25% extra speedup), `--prefetch-bed` (0f42997 — superseded by `--mmap` which uses `MADV_WILLNEED` without thread contention).
 
 
 ## Release Process

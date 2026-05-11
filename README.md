@@ -8,8 +8,8 @@
 A compiled, statically-typed rewrite of [Bulik-Sullivan et al.'s LDSC](https://github.com/bulik/ldsc) in Rust.
 Implements six subcommands — `munge-sumstats`, `l2`, `h2`, `rg`, `make-annot`, `cts-annot` — with
 numerically identical output and a **~38× speedup** on LD score computation
-(exact mode, 1000G N=2,490; up to **101×** with `--sketch`). Approximate modes
-(`--sketch`) trades per-SNP precision for additional throughput.
+(exact mode, 1000G N=2,490; up to **101×** with `--sketch`). The opt-in `--sketch d`
+mode (CountSketch) trades per-SNP precision for additional throughput.
 Compatible with Python LDSC's CLI flags (`--l2`, `--h2`, `--rg`) for drop-in replacement in
 platforms like [NCI LDlink](https://ldlink.nih.gov/).
 
@@ -311,15 +311,15 @@ r²_unbiased constants, but a single run can show systematic shifts. Requires d 
 | 200     | ~61× (25.4s)                  | ~0.93             | ~6%                 | recommended default |
 | 500     | ~49× (31.5s)                  | ~0.97             | ~3%                 | high accuracy   |
 
-Accuracy measured at N=2,490 (1000G). At biobank scale (N=50K), CountSketch is dramatically
+Accuracy measured at N=2,490 (1000G). At biobank scale (N=50K), `--sketch` is dramatically
 faster — see the [biobank benchmarks](#biobank-scale-n--50000) below.
 
 **Important: downstream h2/rg regression accuracy.** Sketch LD scores introduce measurement
 error that causes attenuation bias in h2 regression — the h2 estimate is systematically low
 and the intercept is inflated. This effect is much larger than the per-SNP LD score error
 suggests. See [Downstream regression impact](#downstream-regression-impact) for detailed
-benchmarks. If exact h2/rg is needed, use `--fast-f32` (exact, 1.84× faster) or CountSketch
-at d ≥ 5000.
+benchmarks. If exact h2/rg is needed, use `--fast-f32` (exact, 1.84× faster) or `--sketch d`
+with d ≥ 5000.
 
 ```bash
 # Sketch (faster, approximate — d=200 is a good default for LD scores)

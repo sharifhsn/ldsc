@@ -390,13 +390,15 @@ exploiting the non-decreasing property of `block_left`. The runtime overhead
 is negligible ($<$1%), since masking operates on the small $r^2$ matrices
 rather than the large genotype matrices.
 
-@tbl:masking-h2 shows the downstream impact. Heritability estimates increase
-by approximately 16% with exact masking (BMI: 0.1048 $arrow.r$ 0.1209; SCZ:
-0.3293 $arrow.r$ 0.3825), consistent with inflated LD scores in the
-regression denominator attenuating $hat(h)^2$. Intercepts decrease slightly,
-reflecting less confounding attributed to LD structure. Genetic correlation
-is robust: $hat(r)_g = -0.0662$ in both modes, identical to four decimal
-places.
+@tbl:masking-h2 shows the downstream impact on real GWAS data. Heritability
+estimates increase by approximately 16% with exact masking (BMI: 0.1048
+$arrow.r$ 0.1209; SCZ: 0.3293 $arrow.r$ 0.3825), and intercepts decrease
+slightly. Genetic correlation is robust: $hat(r)_g = -0.0662$ in both modes,
+identical to four decimal places. We explore the source of this shift below
+(§ chunk-size knob and implementation parity); a controlled simulation
+suggests the algorithmic difference accounts for $tilde$1% of the 15--16%
+shift, with the remainder attributable to interactions between the chunked
+approximation and real-data confounders not captured by the polygenic model.
 
 #figure(
   table(
@@ -423,6 +425,131 @@ places.
     with exact masking; $r_g$ is unaffected.
   ],
 ) <tbl:masking-h2>
+
+== The `--chunk-size` knob and implementation parity
+
+The chunked window-eviction approximation introduced in the previous section
+has, to our knowledge, never been analyzed in the LDSC literature. Its only
+public documentation is a docstring in `ldscore.py::__corSumVarBlocks__`
+@bulik-sullivan2015a:
+
+#quote(block: true)[
+  `if c > 1, then only entries that are multiples of c are examined, and it`
+  `is assumed that block_left[a*c+i] = block_left[a*c]`, except at the
+  beginning of the chromosome where the 0th SNP is included in the window.
+]
+
+The CLI help is famously terse: `--chunk-size` (default 50) is described
+only as "`Chunk size for LD Score calculation. Use the default.`" No
+analysis of the bias appears in any LDSC follow-up paper, fork, or wiki.
+
+To characterize this knob, we computed LD scores at six chunk sizes and ran
+the same heritability-recovery simulation as above (50 replicates per cell,
+true $h^2 in {0.2, 0.5}$). Both mean LD score and mean $hat(h)^2$ vary
+monotonically with chunk size (@tbl:chunksize-sweep):
+
+#figure(
+  table(
+    columns: 5,
+    align: (right, right, right, right, right),
+    table.header(
+      [*`--chunk-size`*], [*mean L2*], [*Δ L2 vs c=50*], [*$hat(h)^2$ at h²=0.2*], [*$hat(h)^2$ at h²=0.5*],
+    ),
+    table.hline(stroke: 0.5pt),
+    [25], [18.71], [$-0.13%$], [0.2115 (+5.8%)], [0.5580 (+11.6%)],
+    [50 (Python default)], [18.73], [---], [0.2115 (+5.7%)], [0.5569 (+11.4%)],
+    [100], [18.77], [+0.20%], [0.2109 (+5.4%)], [0.5556 (+11.1%)],
+    [200 (ldsc-rs default)], [18.85], [+0.62%], [0.2107 (+5.3%)], [0.5528 (+10.6%)],
+    [500], [18.91], [+0.95%], [0.2097 (+4.8%)], [0.5532 (+10.6%)],
+    [1000], [19.05], [+1.68%], [0.2092 (+4.6%)], [0.5526 (+10.5%)],
+  ),
+  caption: [
+    LD-score and heritability sensitivity to `--chunk-size`, computed on
+    chromosome 22 of 1000 Genomes EUR ($N = 503$, 18,627 SNPs after MAF
+    $gt.eq 0.05$, `--ld-wind-kb 1000`, `--global-pass`). Mean LD score grows
+    monotonically with chunk size (range 1.8% of mean) due to chunked
+    over-counting; $hat(h)^2$ correspondingly decreases. The full range of
+    the chunk-size effect on $hat(h)^2$ is $tilde$1.1 percentage points of
+    relative bias---small but systematic.
+  ],
+) <tbl:chunksize-sweep>
+
+The Pearson correlation between any two chunk sizes' LD scores is $gt.eq
+0.999$: the rank-ordering of SNPs by LD intensity is preserved across the
+full chunk-size range. Only the absolute scale shifts, and that shift is
+small enough to produce only $tilde$1% variation in downstream $hat(h)^2$.
+This contrasts with the 15--16% real-data effect of @tbl:masking-h2,
+implying that the real-data shift is dominated by something other than the
+direct algorithmic correction: candidate explanations include
+population-structure interactions, finite-sample biases that compound with
+$M$, or genuine departures from the polygenic infinitesimal model.
+
+== Three implementations: GCTA, Python LDSC, ldsc-rs
+
+LD-score regression in practice rests on three independent implementations
+that all share the same theoretical definition $ell_j = sum_k r^2_(j k)$
+but make different algorithmic choices. We characterize each below; the
+mapping to the LDSC paper's mathematical statement is illuminating.
+
+*GCTA* @yang2011 is the implementation Bulik-Sullivan et al. used to compute
+the 1000 Genomes reference LD scores shipped with the LDSC software
+@bulik-sullivan2015a. Its `--ld-score` (alias `--ld-meanrsq`) routine
+computes per-SNP exact windows---there is no chunking approximation. Its
+block decomposition (`get_ld_blk_pnt` in `main/ld.cpp`) is purely a memory
+optimization: each SNP's LD score is computed from the full set of SNPs
+within its physical-distance window, and overlapping-block boundaries are
+averaged in a second pass to eliminate edge artifacts. GCTA's default r²
+estimator is *biased* (no $-(1-r^2)/(N-2)$ correction); the unbiased form
+matching the LDSC paper requires `--ld-score-adj`.
+
+*Python LDSC* @bulik-sullivan2015a uses the chunked approximation described
+above with default $c = 50$ and always uses unbiased r². It applies the
+chunk-level window eviction in a single forward pass; there is no
+overlapping-block averaging.
+
+*ldsc-rs* (this work) is faithful to Python LDSC by default but introduces
+two configuration knobs absent from the reference: `--chunk-size`
+(default $c = 200$ for $tilde$4$times$ faster GEMM, characterized in
+@tbl:chunksize-sweep) and `--snp-level-masking` (per-SNP exact windows
+matching GCTA's algorithmic intent and the LDSC paper's math). The latter
+flag adds $O(w + c)$ post-GEMM masking per chunk and produces LD scores
+that agree with GCTA's unbiased output at Pearson $r = 0.998$.
+
+@tbl:implementations summarizes the per-implementation algorithmic choices.
+
+#figure(
+  table(
+    columns: 4,
+    align: (left, left, left, left),
+    table.header(
+      [*Aspect*], [*GCTA*], [*Python LDSC*], [*ldsc-rs*],
+    ),
+    table.hline(stroke: 0.5pt),
+    [Window eviction], [Per-SNP exact], [c-SNP chunks, c=50], [c-SNP chunks, c=200 (default); per-SNP exact with `--snp-level-masking`],
+    [Block boundaries], [Two-pass overlap averaging], [Single forward pass], [Single forward pass],
+    [r² estimator default], [Biased ($+$noise floor)], [Unbiased], [Unbiased],
+    [Unbiased r² flag], [`--ld-score-adj`], [n/a (always unbiased)], [n/a (always unbiased)],
+    [Parallelism], [OpenMP per SNP], [Serial], [Rayon per chromosome + SIMD GEMM via faer],
+    [Python-LDSC parity flag], [---], [---], [`--python-compat`],
+  ),
+  caption: [
+    Algorithmic choices across the three independent LD-score implementations.
+    All three share the same theoretical definition $ell_j = sum_k r^2_(j k)$
+    but differ in windowing, edge handling, and r² estimator. GCTA's per-SNP
+    exact semantics match the LDSC paper's mathematical statement; Python
+    LDSC's chunked approximation is undocumented in the paper but inherited
+    by every Python fork. ldsc-rs's `--snp-level-masking` reproduces GCTA's
+    per-SNP semantics; `--python-compat` produces bit-identical Python LDSC
+    output (`max_abs_diff = 0` verified on chr22 1000G EUR).
+  ],
+) <tbl:implementations>
+
+The practical recommendation: users replicating prior Python LDSC results
+should pass `--python-compat`. Users computing new reference LD scores
+should pass `--snp-level-masking` for paper-canonical (and GCTA-consistent)
+per-SNP exact windows. The default (no flag) is appropriate for routine
+$h^2$ analysis where speed matters and $tilde$1% $hat(h)^2$ perturbation
+is acceptable.
 
 == Feature parity
 

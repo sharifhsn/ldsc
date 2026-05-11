@@ -49,50 +49,14 @@ Same algorithm as exact, but genotype storage and GEMM use f32 instead of f64. T
 memory bandwidth (the bottleneck at large N) for a ~1.85× speedup at N=50K. Complexity is
 identical; the constant factor changes.
 
-### `--sketch d` with Rademacher projection (default sketch method)
+### `--sketch d` (fused CountSketch)
 
-Rademacher sketch pre-multiplies each decoded chunk by a fixed random matrix P (d × N) with
-entries ±1/√d, reducing the individual dimension from N to d before all downstream GEMM ops.
-
-```
-Per chunk:
-  BED decode + normalize .... O(N × c)        same as exact
-  Projection P·B ............ O(d × N × c)    dense GEMM (the dominant cost)
-  Ratio estimator renorm .... O(d × c)        rescale columns so ||col||² = N
-  BB = B̃ᵀ·B̃ (within-chunk) .. O(d × c²)      c×c matmul, d inner dimension
-  AB = Ãᵀ·B̃ (cross-window) .. O(d × w × c)   w×c matmul, d inner dimension
-  Ring store ................. O(d × c)       copy c columns (d rows, not N)
-
-Total: O(M × (d × N + d × (c + w)))
-     = O(M × d × N)  when N >> c + w  (projection dominates)
-
-Memory: O(d × N) for projection matrix P, O(d × (w + c)) for ring buffer + scratch,
-        O(N × c) for decoded genotype buffer (b_full)
-BED I/O: O(M × N / 4) bytes   same full scan
-```
-
-The projection GEMM (d × N × c per chunk) is the bottleneck. At d=50, N=50K, c=200: 500M
-FLOPs/chunk. faer's SIMD matmul with Par::rayon(0) parallelizes this across all cores.
-
-Rademacher speedup over exact: the downstream GEMM (BB, AB) shrinks from O(N) to O(d) inner
-dimension, giving a theoretical N/d speedup on those phases. But the projection itself is
-O(d × N × c) — same order as the exact BB — so total speedup is bounded by ~2× from GEMM
-reduction alone. The real win is at large N where the O(N × c²) exact BB is the bottleneck.
-
-**Performance scales with d**: higher d = more projection FLOPs = slower. At d=200, projection
-is 4× more expensive than d=50. This is why Rademacher sketch shows increasing runtimes with d:
-
-| d | Projection FLOPs/chunk (N=50K) | Observed biobank time |
-|---|-------------------------------|----------------------|
-| 50 | 500M | 129.5s |
-| 100 | 1B | 138.6s |
-| 200 | 2B | 159.3s |
-
-### `--sketch d --sketch-method countsketch` (fused CountSketch)
-
-CountSketch replaces the dense projection GEMM with a hash-based scatter-add. Each individual
-i is assigned a random bucket h(i) ∈ {0,...,d−1} and sign σ(i) ∈ {±1}. The projected
-value for bucket k is the sum of σ(i) × x(i) over all individuals i with h(i) = k.
+CountSketch replaces a dense O(d × N × c) projection GEMM with a hash-based scatter-add that
+is O(N × c) regardless of d. Each individual i is assigned a random bucket h(i) ∈ {0,...,d−1}
+and sign σ(i) ∈ {±1}. The projected value for bucket k is the sum of σ(i) × x(i) over all
+individuals i with h(i) = k. This is the only sketch method shipped (the previously available
+Rademacher dense projection was removed in 5209844 — at every realistic workload it was either
+unnecessary at small N or 3.6× slower than CountSketch at biobank N).
 
 The fused kernel reads raw packed BED bytes and performs decode + normalize + scatter-add in a
 single pass, eliminating the N × c intermediate buffer entirely.
@@ -162,64 +126,33 @@ Accuracy depends only on d, not on N: the variance of CountSketch inner products
 Var[⟨x̃,ỹ⟩] ≈ (N² + ⟨x,y⟩²) / d for unit-normalized columns. This ratio is independent of N
 after normalization, so d=500 gives the same r ≈ 0.97 whether N = 2,490 or N = 500,000.
 
-### `--subsample N'`
+### `--snp-level-masking`
 
-Subsampling selects N' individuals before any computation. This reduces the effective N in all
-formulas above:
+Default LDSC (Python and `ldsc-rs` without this flag) uses chunk-level window eviction:
+`block_left[chunk_start]` is applied to all c SNPs in a chunk, so SNPs late in a chunk
+accumulate r² from SNPs outside their *true* per-SNP window. The LDSC paper defines LD scores
+with exact per-SNP windows — chunking is an implementation detail not in the math.
 
-```
-Exact + subsample:      O(M × N' × (c + w))     compute
-Sketch + subsample:     O(M × (d × N' + ...))    compute
-BED I/O:                O(M × N / 4) bytes        still reads full packed bytes
-Decode:                 O(M × N')                 only decodes N' positions
-```
+`--snp-level-masking` corrects this post-GEMM at negligible cost (O(w + c) per chunk via a
+monotonic cutoff scan, exploiting that `block_left` is non-decreasing across the chunk):
 
-BED I/O remains O(M × N / 4) because the PLINK format is SNP-major — the full byte range for
-each SNP must be read even if only N' individuals are extracted. But decode and all GEMM ops
-scale with N', giving near-linear speedup:
+- B×B mask: zeroes within-chunk pairs that cross chromosome boundaries
+- A×B mask: zeroes `r2u_ab[(wi, j)]` where window SNP `wi` falls outside chunk SNP `j`'s
+  per-SNP `block_left`
 
-| N' | Theoretical speedup (GEMM) | Observed (biobank N=50K, AWS) |
-|----|---------------------------|------------------------------|
-| 50,000 (full) | 1× | 665s (exact-f64) |
-| 10,000 | 25× | 90s |
-| 5,000 | 100× | 51s |
-| 2,000 | 625× | I/O-bound |
-
-At N'=5K, LD score variance for common variants (MAF > 5%) increases by only ~10× relative to
-N=50K, which is negligible for downstream h2/rg regression (LD scores are inputs to a second
-regression that averages over ~1M SNPs).
-
-### `--stochastic T`
-
-Hutchinson's trace estimator uses T random probe vectors instead of forming the full correlation
-matrix. Each probe requires an O(N × M_window) matrix-vector product.
-
-```
-Per chunk:
-  BED decode + normalize .... O(N × c)
-  T probe MVPs .............. O(T × N × c)    T matrix-vector products
-  L2 accumulation ........... O(T × c)
-
-Total: O(M × T × N × c)
-
-Memory: O(N × T) for probe buffer + O(N × c) for genotype chunk
-```
-
-Compared to exact (O(M × N × c × (c + w))), stochastic is faster when T < c + w. At
-T=50, c=200, w~2000: T << c + w, so stochastic should be ~44× faster in theory. In practice,
-the sequential MVP loop causes cache pressure at T > 50, and the method is only compatible with
-scalar (non-partitioned) LD scores.
+Impact (1.66M SNPs, `--ld-wind-kb 1000`): 99.99% of SNPs get different L2 scores (avg ~11.3%
+lower), and h² estimates rise ~15-16% on real GWAS (BMI: 0.1045 → 0.1209; SCZ: 0.3292 → 0.3825).
+The effect grows for narrower windows: `--ld-wind-kb 100` produces +47.7% h². Default off for
+exact Python parity.
 
 ### Summary table
 
 | Mode | Compute per chunk | Memory | Performance scales with d? |
 |------|-------------------|--------|---------------------------|
 | Exact f64 | O(N × c × (c + w)) | O(N × (w + c)) | n/a |
-| Exact f32 | Same, 2× bandwidth | Same, half bytes | n/a |
-| Rademacher sketch | O(d × N × c) | O(d × N + d × (w + c)) | Yes — linear in d |
-| **Fused CountSketch** | **O(N × c + d × c × (c + w))** | **O(N + d × (w + c))** | **No** (until d ≈ √N) |
-| Subsample N' (exact) | O(N' × c × (c + w)) | O(N' × (w + c)) | n/a |
-| Stochastic T | O(T × N × c) | O(N × (T + c)) | n/a (scales with T) |
+| Exact f32 (`--fast-f32`) | Same, 2× bandwidth | Same, half bytes | n/a |
+| **Fused CountSketch (`--sketch d`)** | **O(N × c + d × c × (c + w))** | **O(N + d × (w + c))** | **No** (until d ≈ √N) |
+| `--snp-level-masking` (any mode) | + O(w + c) post-GEMM mask | unchanged | n/a |
 
 ## Downstream regression impact
 
@@ -268,10 +201,10 @@ Key observations:
 | Use case | Recommended mode | Speedup vs exact-f64 |
 |----------|-----------------|---------------------|
 | Exact h2/rg needed | `--fast-f32` | 1.84× |
-| h2 within ~2% | `--sketch 5000 --sketch-method countsketch` | ~5× |
-| h2 within ~4% | `--sketch 1000 --sketch-method countsketch` | ~9× |
-| LD scores only (QC, visualization) | `--sketch 200 --sketch-method countsketch` | ~20× |
-| Quick screening | `--sketch 50 --sketch-method countsketch` | ~20× |
+| h2 within ~2% | `--sketch 5000` | ~5× |
+| h2 within ~4% | `--sketch 1000` | ~9× |
+| LD scores only (QC, visualization) | `--sketch 200` | ~20× |
+| Quick screening | `--sketch 50` | ~20× |
 
 ## Scaling to denser SNP panels
 

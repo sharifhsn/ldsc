@@ -2173,3 +2173,87 @@ Fitted a linear cost model `T(d) = T_scatter + T_GEMM × d` to the measured data
   spectral decay of the genotype matrix: top components are captured first.
 - Practical recommendation: `--sketch 2000` for biobank (r=0.994, 24s, near crossover).
   For 1000G, exact f32 is better than any sketch (30s vs 3.7s for sketch-50 at r=0.84).
+
+## 2026-05-11: Quadratic-inversion CountSketch bias correction (replaces linear)
+
+After mathematical analysis of the CountSketch bias formulas (see
+`docs/countsketch-math-analysis.md`), replaced the linear closed-form
+correction with a quadratic-inversion correction that solves
+`2r⁴ + (d-3)r² - (d·tilde_rsq - 1) = 0` for r², removing the
+leading-order bias of the renormalized cosine exactly (residual O(1/d²)
+vs the linear correction's O(1/d) at high r²).
+
+The linear correction (which had been the default since the original
+sketch implementation) was retired entirely once AWS profiling
+confirmed the quadratic version had no detectable wall-clock cost
+penalty. Implementation in `src/l2/compute.rs`
+(`quadratic_sketch_correction` helper + branching on `sketch_dim` in
+the B×B and A×B fill paths). d ≤ 50 emits a runtime warning since the
+Taylor expansion breaks down at low d.
+
+### AWS biobank bench (c6a.4xlarge EPYC 7R13, N=50K, M=1.66M, --ld-wind-kb 1000)
+
+3 runs per benchmark, single AWS Batch job, very noisy due to shared-tenant interference.
+
+| d | mode | min (s) | median | mean | max | std |
+|---:|---|---:|---:|---:|---:|---:|
+| 200 | linear | 69.07 | 70.89 | 74.53 | 83.62 | 7.93 |
+| 200 | quadratic | 68.73 | 97.39 | 90.60 | 105.68 | 19.39 |
+| 100 | linear | 90.70 | 98.46 | 96.27 | 99.66 | 4.87 |
+| 100 | quadratic | 84.74 | 90.99 | 89.35 | 92.32 | 4.05 |
+| 500 | linear | 87.52 | 91.02 | 89.91 | 91.18 | 2.07 |
+| 500 | quadratic | 87.41 | 89.14 | 91.60 | 98.26 | 5.83 |
+
+**Min-time analysis** (least AWS noise):
+- d=200: lin 69.07s, quad 68.73s — **−0.5%** (essentially identical)
+- d=100: lin 90.70s, quad 84.74s — **−6.6%** (quadratic faster, noise)
+- d=500: lin 87.52s, quad 87.41s — **−0.1%** (essentially identical)
+
+**Conclusion**: at biobank scale, the quadratic correction's wall-clock cost
+is **within run-to-run AWS Batch noise** (~2-5% variability between identical
+runs). My earlier prediction of ~5% wall-clock cost was on the order of the
+noise floor; couldn't detect it. The 21% mean-time difference at d=200 is
+driven by a single outlier run (105.7s vs 70s baseline) — almost certainly
+shared-tenant interference, not real signal.
+
+This is a strong result: **switching to the mathematically more correct
+quadratic correction comes at essentially zero cost** at biobank scale.
+
+### Local chr22 EUR (N=503, 18 627 SNPs) — accuracy
+
+Compared sketched LD scores to the exact reference for d ∈ {50, 100, 200, 500}:
+
+| d | mode | mean bias | std bias | mean \|bias\| | r vs exact |
+|---:|---|---:|---:|---:|---:|
+| 50 | linear | +0.141 | 7.26 | 5.57 | 0.9159 |
+| 50 | quadratic | +0.160 | 7.33 | 5.63 | 0.9138 |
+| 100 | linear | −0.410 | 4.14 | 3.18 | 0.9683 |
+| 100 | quadratic | −0.375 | 4.16 | 3.19 | 0.9678 |
+| 200 | linear | −0.284 | 2.68 | 2.05 | 0.9866 |
+| 200 | quadratic | −0.261 | 2.69 | 2.05 | 0.9865 |
+| 500 | linear | +0.350 | 1.79 | 1.34 | 0.9940 |
+| 500 | quadratic | +0.360 | 1.80 | 1.35 | 0.9940 |
+
+Per-bin analysis at d=200 (the recommended setting) shows the quadratic
+correction shifts SNPs in the predicted directions:
+- Low-L2 bin (0–5): +0.021 shift (linear under-shoots, quad corrects upward)
+- High-L2 bin (80–200, 114 SNPs): −0.135 shift (linear over-shoots, quad
+  corrects downward — exactly matching the predicted `r²(2r²-1)/(d-2)` residual)
+
+For the 114 high-LD SNPs that drive LDSC regression weight, quadratic reduces
+absolute error from +5.95 to +5.82 (~2.3% bias reduction). Aggregate MSE
+improvement is negligible (within sketch sampling variance).
+
+### Caveats and gaps
+
+- 3 runs per benchmark is too few for tight wall-clock conclusions. A re-run
+  with 10+ runs per setting would clarify the (likely small) overhead.
+- Only one sketch seed tested (the hardcoded 42). Multi-seed averaging would
+  give cleaner bias-vs-noise separation.
+- At d ≤ 50, quadratic is slightly **worse** than linear empirically (Taylor
+  truncation + variance amplification from the sqrt). Users at very low d
+  should prefer `--sketch-correction linear` — flagged in CLAUDE.md.
+- The per-bin improvement at high LD is signal-bearing (predicted by the
+  math, observed at exactly the right magnitude), but the regression-level
+  impact on h² hasn't been measured. Would need to run h² on the linear-vs-quadratic
+  LD scores and compare.

@@ -1,3 +1,4 @@
+mod bitpacked;
 mod compute;
 mod io;
 mod normalize;
@@ -16,6 +17,7 @@ use crate::gpu::{GpuConfig, GpuContext};
 use crate::la::MatF;
 use crate::parse;
 use anyhow::{Context, Result};
+use bitpacked::compute_ldscore_bitpacked;
 use compute::compute_ldscore_global;
 use io::{
     format_m_vals, load_individual_indices, load_print_snps, load_snp_set, write_annot_matrix,
@@ -330,7 +332,24 @@ pub fn run(args: L2Args) -> Result<()> {
 
     let annot_ref: Option<&MatF> = annot_result.as_ref().map(|(m, _)| m);
 
-    let chunk_c = args.chunk_size;
+    // --python-compat overrides defaults for bit-identical Python LDSC parity.
+    // Effects: chunk-size 50 (Python's default vs ldsc-rs's 200), global-pass
+    // (single sequential pass matching Python's cross-chr window bleeding), no
+    // SNP-level masking (Python doesn't do it). clap already enforces conflict
+    // with --snp-level-masking.
+    let chunk_c = if args.python_compat { 50 } else { args.chunk_size };
+    let force_python_global_pass = args.python_compat && !args.global_pass;
+    if args.python_compat {
+        if args.chunk_size != 200 {
+            eprintln!(
+                "--python-compat overrides --chunk-size {} with c=50 for Python LDSC parity",
+                args.chunk_size
+            );
+        }
+        if !args.global_pass {
+            eprintln!("--python-compat auto-enables --global-pass for Python LDSC parity");
+        }
+    }
 
     let t_maf_pre = t_run_start.elapsed();
     if verbose_timing {
@@ -352,9 +371,9 @@ pub fn run(args: L2Args) -> Result<()> {
         eprintln!("GPU: auto-enabling --global-pass (per-chr parallel wastes GPU with contention)");
     }
     #[cfg(feature = "gpu")]
-    let force_global_pass = args.gpu && !args.global_pass;
+    let force_global_pass = (args.gpu && !args.global_pass) || force_python_global_pass;
     #[cfg(not(feature = "gpu"))]
-    let force_global_pass = false;
+    let force_global_pass = force_python_global_pass;
 
     // Create GPU context once (shared across all chromosomes).
     #[cfg(feature = "gpu")]
@@ -385,7 +404,72 @@ pub fn run(args: L2Args) -> Result<()> {
     };
 
     let t_compute_start = std::time::Instant::now();
-    let (l2, maf_per_snp) = if args.global_pass || force_global_pass {
+    let (l2, maf_per_snp) = if args.exact_bitpacked {
+        // Bit-packed exact path — per-chromosome parallel (matches existing
+        // exact path strategy). Each chromosome runs single-threaded inside
+        // to avoid races on the scatter-add accumulation.
+        let chr_groups: Vec<(u8, usize, usize)> = {
+            let mut groups = Vec::new();
+            let mut start = 0usize;
+            while start < all_snps.len() {
+                let chr = all_snps[start].chr;
+                let mut end = start + 1;
+                while end < all_snps.len() && all_snps[end].chr == chr {
+                    end += 1;
+                }
+                groups.push((chr, start, end));
+                start = end;
+            }
+            groups
+        };
+        println!(
+            "  --exact-bitpacked: {} chromosomes (Phase 1 scalar reference)",
+            chr_groups.len()
+        );
+
+        let bed_path_str = bed_path.as_str();
+        let iid_slice = iid_indices.as_deref();
+        let results: Vec<(MatF, Vec<f64>)> = chr_groups
+            .par_iter()
+            .map(|&(_chr, start, end)| {
+                let chr_snps = &all_snps[start..end];
+                let chr_annot: Option<MatF> = annot_ref.map(|a| {
+                    let mut sub = MatF::zeros(end - start, a.ncols());
+                    for i in 0..end - start {
+                        for j in 0..a.ncols() {
+                            sub[(i, j)] = a[(start + i, j)];
+                        }
+                    }
+                    sub
+                });
+                compute_ldscore_bitpacked(
+                    chr_snps,
+                    bed_path_str,
+                    n_indiv_actual,
+                    mode,
+                    chr_annot.as_ref(),
+                    iid_slice,
+                    pq_exp_for_compute,
+                    args.yes_really,
+                    args.mmap,
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+            .context("computing LD scores (bit-packed per-chromosome)")?;
+
+        let n_annot = annot_ref.map(|a| a.ncols()).unwrap_or(1);
+        let mut l2 = MatF::zeros(all_snps.len(), n_annot);
+        let mut maf = vec![0.0f64; all_snps.len()];
+        for (&(_chr, start, _end), (chr_l2, chr_maf)) in chr_groups.iter().zip(results.iter()) {
+            for i in 0..chr_l2.nrows() {
+                for k in 0..n_annot {
+                    l2[(start + i, k)] = chr_l2[(i, k)];
+                }
+                maf[start + i] = chr_maf[i];
+            }
+        }
+        (l2, maf)
+    } else if args.global_pass || force_global_pass {
         // Legacy single-pass across all chromosomes.
         compute_ldscore_global(
             &all_snps,

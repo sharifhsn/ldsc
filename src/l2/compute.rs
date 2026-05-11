@@ -356,13 +356,13 @@ fn build_norm_byte_lut_f64(mean: f64, inv_std: f64) -> [[f64; 4]; 256] {
 // Byte-level stats LUT: each of the 256 possible BED byte values encodes 4
 // genotypes; this LUT gives (sum, count, sum_sq) for the full byte.
 #[derive(Clone, Copy)]
-struct BedByteStats {
-    sum: u8,
-    count: u8,
-    sum_sq: u8,
+pub(super) struct BedByteStats {
+    pub sum: u8,
+    pub count: u8,
+    pub sum_sq: u8,
 }
 
-fn build_bed_byte_lut() -> [BedByteStats; 256] {
+pub(super) fn build_bed_byte_lut() -> [BedByteStats; 256] {
     std::array::from_fn(|b| {
         let byte = b as u8;
         let (mut sum, mut count, mut sum_sq) = (0u8, 0u8, 0u8);
@@ -391,7 +391,7 @@ fn build_bed_byte_lut() -> [BedByteStats; 256] {
 
 /// Compute (sum, count, sum_sq) of non-missing genotypes for one SNP from raw bytes.
 /// Genotypes are 0, 1, 2 (count_a1=true convention).
-fn snp_stats_from_bytes(
+pub(super) fn snp_stats_from_bytes(
     snp_bytes: &[u8],
     n_indiv: usize,
     iid_positions: &[IidPos],
@@ -734,6 +734,43 @@ pub(super) fn r2_unbiased(r: f64, n: usize) -> f64 {
     sq - (1.0 - sq) / denom
 }
 
+/// Quadratic inversion of the renormalized-cosine bias for CountSketch mode.
+///
+/// Given the sketched-and-renormalized squared cosine `tilde_rsq = (X̃_j·X̃_k)²/(||X̃_j||²·||X̃_k||²)`,
+/// the leading-order bias (from a Taylor expansion of A²/(BC) around the mean) is
+/// `E[tilde_rsq] - r² ≈ (1 - r²)(1 - 2r²)/d`. Inverting this as a quadratic in r²:
+///   `2r⁴ + (d - 3) r² - (d·tilde_rsq - 1) = 0`
+///   `r² = (-(d-3) + √((d-3)² + 8(d·tilde_rsq - 1))) / 4`
+///
+/// Residual bias is O(1/d²) — ~200× tighter than the linear correction at d=200.
+/// See `docs/countsketch-math-analysis.md` for the full derivation and validation.
+///
+/// After the sketch correction, applies the standard LDSC unbiased r² correction
+/// via the precomputed `r2u_a = 1 + 1/(N-2)` and `r2u_b = -1/(N-2)`:
+///   `r²_unbiased = r²_sketch_corrected × r2u_a + r2u_b`
+///
+/// `val` is the un-normalized inner product `X̃_j·X̃_k`; `n_inv_sq = 1/N²` converts
+/// it to `tilde_rsq`. `d_f` is the sketch dimension. Fallback to 0.0 in the
+/// (vanishingly rare) case of a negative discriminant from extreme sketch noise.
+#[inline(always)]
+pub(super) fn quadratic_sketch_correction(
+    val: f64,
+    n_inv_sq: f64,
+    d_f: f64,
+    r2u_a: f64,
+    r2u_b: f64,
+) -> f64 {
+    let tilde_rsq = val * val * n_inv_sq;
+    let dm3 = d_f - 3.0;
+    let disc = dm3 * dm3 + 8.0 * (d_f * tilde_rsq - 1.0);
+    let rsq_sketch = if disc >= 0.0 {
+        (-dm3 + disc.sqrt()) * 0.25
+    } else {
+        0.0
+    };
+    rsq_sketch * r2u_a + r2u_b
+}
+
 /// Compute LD scores for all SNPs. Returns `(l2, maf)`.
 #[allow(clippy::too_many_arguments, clippy::unnecessary_cast)]
 pub(super) fn compute_ldscore_global(
@@ -796,25 +833,53 @@ pub(super) fn compute_ldscore_global(
         None => None,
     };
     let gemm_n: usize; // row dimension for all GEMM matrices (d when sketching, N otherwise)
+    // Constants for the non-sketch path: hot loop is `val² × active_n_inv_sq_r2u_a
+    // + active_r2u_b`, which fuses the val→r̂ conversion (val·n_inv) with the
+    // LDSC unbiased r² correction `r̂² + (-(1-r̂²)/(N-2))`.
     let active_n_inv_sq_r2u_a: f64;
     let active_r2u_b: f64;
+    // Constants for the sketch path: quadratic inversion of the renormalized-cosine
+    // bias, followed by the same LDSC unbiased correction. `quad_d_f` is the
+    // sketch dimension and `n_inv_sq = 1/N²` converts val² → tilde_rsq.
+    let quad_d_f: f64;
+    let n_inv_sq: f64 = n_inv * n_inv;
+
     if let Some(d) = sketch_dim {
         gemm_n = d;
-        // Bias correction with column re-normalization (ratio estimator).
-        // After projecting, each column is rescaled so ||x̃'_j||² = N.
-        // This reduces per-pair variance by ~2× compared to the raw estimator.
-        // The squared cosine r̃² = (val̃'/N)² has bias ≈ (2r⁴ - 7r² + 1)/d;
-        // the leading linear correction is: r²_corr = r̃² × d/(d-2) - 1/(d-2).
-        // Residual r⁴/(d-2) per pair is negligible for typical LD.
-        let d_f = d as f64;
-        let dm2 = d_f - 2.0;
-        active_n_inv_sq_r2u_a = n_inv_sq_r2u_a * d_f / dm2;
-        active_r2u_b = r2u_b - r2u_a / dm2;
-        println!("Sketch mode: projecting N={n_indiv} → d={d} (CountSketch, bias-corrected)");
+        // Bias correction for the sketched, renormalized squared cosine.
+        // After CountSketch projection, each column is rescaled so ||x̃'_j||² = N
+        // (the ratio estimator). The resulting squared cosine
+        //   r̃'² = (X̃_j^T X̃_k)² / (||X̃_j||² · ||X̃_k||²)
+        // has bias `E[r̃'²] - r² ≈ (1 - r²)(1 - 2r²)/d` (Taylor expansion of
+        // A²/(BC) around its mean; validated empirically to Monte Carlo noise).
+        //
+        // We invert this exactly: solve `2r⁴ + (d-3)r² - (d·r̃'² - 1) = 0`
+        // for r², giving residual bias O(1/d²). The LDSC unbiased r² correction
+        // is then applied on top. See `docs/countsketch-math-analysis.md` for
+        // the full derivation, MC validation, and a per-bin analysis on chr22
+        // EUR showing the correction shifts high-LD-score SNPs in exactly the
+        // predicted direction.
+        //
+        // The non-sketch constants below are unused in this branch (the
+        // quadratic path uses `n_inv_sq`, `quad_d_f`, `r2u_a`, `r2u_b` directly).
+        quad_d_f = d as f64;
+        active_n_inv_sq_r2u_a = n_inv_sq_r2u_a;
+        active_r2u_b = r2u_b;
+        if d <= 50 {
+            eprintln!(
+                "WARNING: --sketch {d} is below the recommended minimum (d ≥ 100). \
+                 At d ≤ 50, higher-order bias terms exceed O(1/d) and the quadratic \
+                 correction's sqrt amplifies sketch noise; the corrected LD scores \
+                 are no better than uncorrected at the LD-score level. Increase d \
+                 (cost is essentially flat in d below the GEMM crossover)."
+            );
+        }
+        println!("Sketch mode: projecting N={n_indiv} → d={d} (CountSketch, quadratic bias correction)");
     } else {
         gemm_n = n_indiv;
         active_n_inv_sq_r2u_a = n_inv_sq_r2u_a;
         active_r2u_b = r2u_b;
+        quad_d_f = 0.0;
     }
 
     // CountSketch projection: O(N×c) scatter-add, cost flat in d.
@@ -1279,14 +1344,14 @@ pub(super) fn compute_ldscore_global(
         if !chunk_all_zero {
             // Inline helper: fill r2u_bb from bb matrix values.
             // Generic over closure to avoid dyn dispatch in inner loop.
-            // Uses pre-computed n_inv²·r2u_a to save one multiply per iteration.
+            // The `apply_correction` closure encodes the per-pair correction
+            // (fused linear or quadratic inversion + LDSC unbiased).
             #[inline(always)]
-            fn fill_r2u_bb_from<F: Fn(usize, usize) -> f64>(
+            fn fill_r2u_bb_from<F: Fn(usize, usize) -> f64, G: Fn(f64) -> f64>(
                 r2u_bb: &mut MatF,
                 c: usize,
-                n_inv_sq_r2u_a: f64,
-                r2u_b: f64,
                 bb_val: F,
+                apply_correction: G,
             ) {
                 // Column-major zeroing: inner loop over rows (stride-1)
                 for k in 0..c {
@@ -1298,7 +1363,7 @@ pub(super) fn compute_ldscore_global(
                     r2u_bb[(j, j)] = 1.0;
                     for k in 0..j {
                         let val = bb_val(k, j);
-                        let r2u = val * val * n_inv_sq_r2u_a + r2u_b;
+                        let r2u = apply_correction(val);
                         r2u_bb[(j, k)] = r2u;
                         r2u_bb[(k, j)] = r2u;
                     }
@@ -1347,13 +1412,25 @@ pub(super) fn compute_ldscore_global(
                             Par::rayon(0),
                         );
                     }
-                    fill_r2u_bb_from(
-                        &mut r2u_bb,
-                        c,
-                        active_n_inv_sq_r2u_a,
-                        active_r2u_b,
-                        |k, j| bb_f32[(k, j)] as f64,
-                    );
+                    if sketch_dim.is_some() {
+                        fill_r2u_bb_from(
+                            &mut r2u_bb,
+                            c,
+                            |k, j| bb_f32[(k, j)] as f64,
+                            |val| {
+                                quadratic_sketch_correction(
+                                    val, n_inv_sq, quad_d_f, r2u_a, r2u_b,
+                                )
+                            },
+                        );
+                    } else {
+                        fill_r2u_bb_from(
+                            &mut r2u_bb,
+                            c,
+                            |k, j| bb_f32[(k, j)] as f64,
+                            |val| val * val * active_n_inv_sq_r2u_a + active_r2u_b,
+                        );
+                    }
                 }
                 GemmBufs::F64 { ref b_mat, .. } => {
                     let b_slice = mat_slice(b_mat.as_ref(), 0..gemm_n, 0..c);
@@ -1416,13 +1493,25 @@ pub(super) fn compute_ldscore_global(
                             Par::rayon(0),
                         );
                     }
-                    fill_r2u_bb_from(
-                        &mut r2u_bb,
-                        c,
-                        active_n_inv_sq_r2u_a,
-                        active_r2u_b,
-                        |k, j| bb_f64[(k, j)],
-                    );
+                    if sketch_dim.is_some() {
+                        fill_r2u_bb_from(
+                            &mut r2u_bb,
+                            c,
+                            |k, j| bb_f64[(k, j)],
+                            |val| {
+                                quadratic_sketch_correction(
+                                    val, n_inv_sq, quad_d_f, r2u_a, r2u_b,
+                                )
+                            },
+                        );
+                    } else {
+                        fill_r2u_bb_from(
+                            &mut r2u_bb,
+                            c,
+                            |k, j| bb_f64[(k, j)],
+                            |val| val * val * active_n_inv_sq_r2u_a + active_r2u_b,
+                        );
+                    }
                 }
             }
             // SNP-level B×B masking: zero r2u_bb entries for pairs outside
@@ -1595,18 +1684,40 @@ pub(super) fn compute_ldscore_global(
                         let ab_view = mat_slice_f32(ab_buf.as_ref(), 0..w, 0..c);
                         // Column-major inner loop with column slices: eliminates faer
                         // tuple-indexing bounds checks (~8.3B checks for full genome).
-                        // Pre-computed n_inv²·r2u_a saves one multiply per iteration.
-                        for j in 0..c {
-                            let ab_col = ab_view.col(j).try_as_col_major().unwrap().as_slice();
-                            let r2u_col = r2u_ab
-                                .col_mut(j)
-                                .try_as_col_major_mut()
-                                .unwrap()
-                                .as_slice_mut();
-                            for (ab_val, r2u_val) in ab_col[..w].iter().zip(r2u_col[..w].iter_mut())
-                            {
-                                let val = *ab_val as f64;
-                                *r2u_val = val * val * active_n_inv_sq_r2u_a + active_r2u_b;
+                        // Branch on sketch mode once outside the inner loop.
+                        if sketch_dim.is_some() {
+                            for j in 0..c {
+                                let ab_col =
+                                    ab_view.col(j).try_as_col_major().unwrap().as_slice();
+                                let r2u_col = r2u_ab
+                                    .col_mut(j)
+                                    .try_as_col_major_mut()
+                                    .unwrap()
+                                    .as_slice_mut();
+                                for (ab_val, r2u_val) in
+                                    ab_col[..w].iter().zip(r2u_col[..w].iter_mut())
+                                {
+                                    let val = *ab_val as f64;
+                                    *r2u_val = quadratic_sketch_correction(
+                                        val, n_inv_sq, quad_d_f, r2u_a, r2u_b,
+                                    );
+                                }
+                            }
+                        } else {
+                            for j in 0..c {
+                                let ab_col =
+                                    ab_view.col(j).try_as_col_major().unwrap().as_slice();
+                                let r2u_col = r2u_ab
+                                    .col_mut(j)
+                                    .try_as_col_major_mut()
+                                    .unwrap()
+                                    .as_slice_mut();
+                                for (ab_val, r2u_val) in
+                                    ab_col[..w].iter().zip(r2u_col[..w].iter_mut())
+                                {
+                                    let val = *ab_val as f64;
+                                    *r2u_val = val * val * active_n_inv_sq_r2u_a + active_r2u_b;
+                                }
                             }
                         }
                     }
@@ -1712,17 +1823,39 @@ pub(super) fn compute_ldscore_global(
                         }
                         let ab_view = mat_slice(ab_buf.as_ref(), 0..w, 0..c);
                         // Column-major inner loop with column slices: eliminates faer
-                        // tuple-indexing bounds checks. Pre-computed constant saves 1 mul.
-                        for j in 0..c {
-                            let ab_col = ab_view.col(j).try_as_col_major().unwrap().as_slice();
-                            let r2u_col = r2u_ab
-                                .col_mut(j)
-                                .try_as_col_major_mut()
-                                .unwrap()
-                                .as_slice_mut();
-                            for (ab_val, r2u_val) in ab_col[..w].iter().zip(r2u_col[..w].iter_mut())
-                            {
-                                *r2u_val = *ab_val * *ab_val * active_n_inv_sq_r2u_a + active_r2u_b;
+                        // tuple-indexing bounds checks. Branch on sketch mode once.
+                        if sketch_dim.is_some() {
+                            for j in 0..c {
+                                let ab_col =
+                                    ab_view.col(j).try_as_col_major().unwrap().as_slice();
+                                let r2u_col = r2u_ab
+                                    .col_mut(j)
+                                    .try_as_col_major_mut()
+                                    .unwrap()
+                                    .as_slice_mut();
+                                for (ab_val, r2u_val) in
+                                    ab_col[..w].iter().zip(r2u_col[..w].iter_mut())
+                                {
+                                    *r2u_val = quadratic_sketch_correction(
+                                        *ab_val, n_inv_sq, quad_d_f, r2u_a, r2u_b,
+                                    );
+                                }
+                            }
+                        } else {
+                            for j in 0..c {
+                                let ab_col =
+                                    ab_view.col(j).try_as_col_major().unwrap().as_slice();
+                                let r2u_col = r2u_ab
+                                    .col_mut(j)
+                                    .try_as_col_major_mut()
+                                    .unwrap()
+                                    .as_slice_mut();
+                                for (ab_val, r2u_val) in
+                                    ab_col[..w].iter().zip(r2u_col[..w].iter_mut())
+                                {
+                                    *r2u_val =
+                                        *ab_val * *ab_val * active_n_inv_sq_r2u_a + active_r2u_b;
+                                }
                             }
                         }
                     }

@@ -247,6 +247,29 @@ pub struct L2Args {
     #[arg(long)]
     pub snp_level_masking: bool,
 
+    /// Compute LD scores directly from packed BED bytes (bit-packed exact mode).
+    /// No genotype f32/f64 materialization, no GEMM — for each SNP pair (j, k)
+    /// in its true per-SNP window, decode genotypes inline and accumulate the
+    /// centered dot product. Bit-stable (up to float ULPs) vs `--snp-level-masking`
+    /// since both compute the LDSC paper's `ℓ_j = Σ_k r²_{jk}` definition.
+    ///
+    /// Phase 1 is a scalar reference implementation: expected to be 2–4× slower
+    /// than the default exact path. Phase 2 (AVX2 SIMD) and Phase 3 (AWS bench)
+    /// follow. Opt-in for now; default may change after Phase 3.
+    ///
+    /// Compatible with `--mmap` (recommended), `--annot`, `--extract`, `--keep`,
+    /// `--maf`, `--pq-exp`. The iteration IS the per-SNP mask, so this conflicts
+    /// with `--snp-level-masking` (redundant), `--sketch` / `--gpu` / `--fast-f32`
+    /// / `--global-pass` (those operate on the GEMM path which this skips).
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "sketch", "gpu", "fast_f32", "global_pass", "snp_level_masking",
+            "python_compat",
+        ]
+    )]
+    pub exact_bitpacked: bool,
+
     /// File containing SNP IDs (one per line) to print LD scores for.
     /// Unlike --extract, all SNPs are still used in LD windows; only output is filtered.
     #[arg(long)]
@@ -275,6 +298,14 @@ pub struct L2Args {
     /// Larger values change the window approximation slightly.
     #[arg(long, default_value_t = 200)]
     pub chunk_size: usize,
+
+    /// Replicate Python LDSC's exact default behavior: sets `--chunk-size 50`
+    /// (Python's default) and `--global-pass` (single sequential pass across
+    /// all chromosomes, matching Python's cross-chr window bleeding), and
+    /// disables `--snp-level-masking`. Produces bit-identical L2 vs Python LDSC
+    /// on the same input. Incompatible with `--snp-level-masking`.
+    #[arg(long, conflicts_with = "snp_level_masking")]
+    pub python_compat: bool,
 
     /// Allow whole-chromosome LD windows without warning.
     #[arg(long)]
@@ -312,13 +343,20 @@ pub struct L2Args {
     pub fast_f32: bool,
 
     /// Random projection sketch: compress individual dimension N→d before GEMM.
-    /// Trades precision for speed — larger d is more accurate but slower.
-    /// At 1000G scale (N=2490): d=200 gives ~2× speedup with Pearson r≈0.90
-    /// vs exact; d=50 gives ~2.7× speedup but r≈0.72. For biobank scale
-    /// (N>50k) much smaller d suffices. Works with partitioned annotations.
-    /// Avoid d>500 (cache thrashing). Bias is exactly corrected in expectation.
-    /// Uses CountSketch (hash-based, O(N×c) scatter-add, cost flat in d).
-    /// Automatically enables f32.
+    /// Trades precision for speed — larger d is more accurate. Uses CountSketch
+    /// (hash-based, O(N×c) scatter-add, cost flat in d until d ≈ √N, then linear).
+    /// In practice this means d=200 has the same wall-clock as d=50 at biobank
+    /// scale, so prefer larger d for accuracy. Bias is corrected via quadratic
+    /// inversion of the renormalized-cosine bias `(1-r²)(1-2r²)/d` — residual
+    /// O(1/d²). Automatically enables f32 (CountSketch ±1 entries are exact).
+    /// Deterministic (seed=42). Works with partitioned annotations.
+    ///
+    /// **WARNING: d ≤ 50 is numerically unstable.** The Taylor expansion
+    /// underlying the bias correction breaks down at low d (higher-order
+    /// bias terms become non-negligible, and the sqrt in the quadratic
+    /// inversion amplifies sketch noise). Empirically at d=50, the corrected
+    /// estimator is no better than uncorrected at the LD-score level.
+    /// Use d ≥ 100; d=200 is the practical sweet spot.
     #[arg(long, value_name = "DIM", conflicts_with = "gpu")]
     pub sketch: Option<usize>,
 

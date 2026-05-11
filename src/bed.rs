@@ -40,6 +40,11 @@ impl Bed {
         self.bytes_per_snp
     }
 
+    /// Total number of individuals in the FAM file (and BED row dimension).
+    pub fn iid_count(&self) -> usize {
+        self.iid_count
+    }
+
     pub fn read_snp_bytes(&mut self, sid: usize, buf: &mut [u8]) -> Result<()> {
         anyhow::ensure!(
             sid < self.sid_count,
@@ -337,7 +342,7 @@ fn count_lines(path: &Path) -> Result<usize> {
     Ok(BufReader::new(f).lines().count())
 }
 
-fn resolve_indices(raw: Option<&[isize]>, max: usize) -> Result<Vec<usize>> {
+pub(crate) fn resolve_indices(raw: Option<&[isize]>, max: usize) -> Result<Vec<usize>> {
     match raw {
         None => Ok((0..max).collect()),
         Some(list) => {
@@ -365,7 +370,7 @@ pub(crate) struct IidPos {
     pub shift: u8,
 }
 
-fn precompute_iid_positions(iid_indices: &[usize]) -> Vec<IidPos> {
+pub(crate) fn precompute_iid_positions(iid_indices: &[usize]) -> Vec<IidPos> {
     iid_indices
         .iter()
         .map(|&iid| IidPos {

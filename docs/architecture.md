@@ -33,8 +33,11 @@ src/
 │   │                  calls compute_ldscore_global, writes per-chr .l2.ldscore.gz
 │   │                  and .l2.M / .l2.M_5_50 files
 │   ├── compute.rs   · GemmBufs — enum holding f32 or f64 scratch buffers (--fast-f32)
-│   │                · compute_ldscore_global — ring-buffer GEMM loop (sequential,
-│   │                  scalar and partitioned + sketch + stochastic paths)
+│   │                · CountSketchProj — bucket/sign hash arrays + fused
+│   │                  BED-decode-normalize-scatter-add kernel (`--sketch d`)
+│   │                · compute_ldscore_global — ring-buffer GEMM loop with
+│   │                  scalar / partitioned / CountSketch paths and optional
+│   │                  --snp-level-masking post-GEMM mask
 │   │                · r2_unbiased — r² − (1−r²)/(n−2)
 │   ├── window.rs    · WindowMode — Cm / Kb / Snp enum
 │   │                · get_block_lefts_f64, get_block_lefts_by_chr — window boundaries
@@ -108,5 +111,6 @@ make_annot.rs        BED → 0/1 annotation generator.
 | `flate2` | 1 | gzip output for .sumstats.gz and .ldscore.gz |
 | `cubecl` | 0.10 | (optional, `gpu` feature) multi-backend GPU compute |
 | `cubek-matmul` | 0.2 | (optional, `gpu` feature) autotuned GPU matmul |
-| `fastrand` | 2 | Rademacher random generation for `--stochastic` and `--sketch` modes |
+| `fastrand` | 2 | Hash bucket + sign generation for `--sketch d` (CountSketch); seed 42 |
+| `memmap2` | 0.9 | (`--mmap`) memory-mapped BED I/O with MADV_SEQUENTIAL/WILLNEED for HPC GPFS/Lustre |
 | `mimalloc` | 0.1 | (optional, `mimalloc` feature) fast allocator for musl builds |
