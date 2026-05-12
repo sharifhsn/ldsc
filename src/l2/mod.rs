@@ -405,9 +405,13 @@ pub fn run(args: L2Args) -> Result<()> {
 
     let t_compute_start = std::time::Instant::now();
     let (l2, maf_per_snp) = if args.exact_bitpacked {
-        // Bit-packed exact path — per-chromosome parallel (matches existing
-        // exact path strategy). Each chromosome runs single-threaded inside
-        // to avoid races on the scatter-add accumulation.
+        // Bit-packed exact path. Two parallelism modes, picked by chr count:
+        //   - Many chrs (≥ #cores): outer par_iter, serial inner. Natural
+        //     parallelism from independent chr tasks; inner par_iter would
+        //     oversubscribe the rayon pool.
+        //   - Few chrs (< #cores):  serial outer, parallel inner. Each chr
+        //     uses all cores for its intra-chr scatter (per-thread l2 buffers
+        //     + reduce). Critical for the single-chr benchmark case.
         let chr_groups: Vec<(u8, usize, usize)> = {
             let mut groups = Vec::new();
             let mut start = 0usize;
@@ -422,40 +426,69 @@ pub fn run(args: L2Args) -> Result<()> {
             }
             groups
         };
+        let num_cores = rayon::current_num_threads().max(1);
+        // Pick parallelism mode. We want roughly `num_cores` work items in
+        // flight, balanced between outer (chr-major) and inner (j-chunk).
+        //   - n_chrs ≥ num_cores: outer par alone saturates. inner = 1.
+        //   - Otherwise: each chr gets ~num_cores/n_chrs inner threads so the
+        //     total outer × inner ≈ num_cores. With 1 chr and 8 cores we get
+        //     inner = 8 (full SIMD wall-clock for the chr22-alone bench).
+        //
+        // When outer par is on, the inner par_iter inside
+        // `compute_ldscore_bitpacked` is bypassed (inner_threads = 1 makes
+        // it a serial loop), so nested rayon doesn't oversubscribe.
+        let outer_par = chr_groups.len() >= num_cores;
+        let inner_threads = if outer_par {
+            1
+        } else {
+            num_cores.div_ceil(chr_groups.len().max(1)).max(1)
+        };
         println!(
-            "  --exact-bitpacked: {} chromosomes (Phase 1 scalar reference)",
-            chr_groups.len()
+            "  --exact-bitpacked: {} chromosomes ({} outer par, {} inner threads/chr)",
+            chr_groups.len(),
+            if outer_par { "yes" } else { "no" },
+            inner_threads,
         );
 
         let bed_path_str = bed_path.as_str();
         let iid_slice = iid_indices.as_deref();
-        let results: Vec<(MatF, Vec<f64>)> = chr_groups
-            .par_iter()
-            .map(|&(_chr, start, end)| {
-                let chr_snps = &all_snps[start..end];
-                let chr_annot: Option<MatF> = annot_ref.map(|a| {
-                    let mut sub = MatF::zeros(end - start, a.ncols());
-                    for i in 0..end - start {
-                        for j in 0..a.ncols() {
-                            sub[(i, j)] = a[(start + i, j)];
-                        }
+        let map_chr = |&(_chr, start, end): &(u8, usize, usize)| -> Result<(MatF, Vec<f64>)> {
+            let chr_snps = &all_snps[start..end];
+            let chr_annot: Option<MatF> = annot_ref.map(|a| {
+                let mut sub = MatF::zeros(end - start, a.ncols());
+                for i in 0..end - start {
+                    for j in 0..a.ncols() {
+                        sub[(i, j)] = a[(start + i, j)];
                     }
-                    sub
-                });
-                compute_ldscore_bitpacked(
-                    chr_snps,
-                    bed_path_str,
-                    n_indiv_actual,
-                    mode,
-                    chr_annot.as_ref(),
-                    iid_slice,
-                    pq_exp_for_compute,
-                    args.yes_really,
-                    args.mmap,
-                )
-            })
-            .collect::<Result<Vec<_>>>()
-            .context("computing LD scores (bit-packed per-chromosome)")?;
+                }
+                sub
+            });
+            compute_ldscore_bitpacked(
+                chr_snps,
+                bed_path_str,
+                n_indiv_actual,
+                mode,
+                chr_annot.as_ref(),
+                iid_slice,
+                pq_exp_for_compute,
+                args.yes_really,
+                args.mmap,
+                inner_threads,
+            )
+        };
+        let results: Vec<(MatF, Vec<f64>)> = if outer_par {
+            chr_groups
+                .par_iter()
+                .map(map_chr)
+                .collect::<Result<Vec<_>>>()
+                .context("computing LD scores (bit-packed per-chromosome)")?
+        } else {
+            chr_groups
+                .iter()
+                .map(map_chr)
+                .collect::<Result<Vec<_>>>()
+                .context("computing LD scores (bit-packed per-chromosome)")?
+        };
 
         let n_annot = annot_ref.map(|a| a.ncols()).unwrap_or(1);
         let mut l2 = MatF::zeros(all_snps.len(), n_annot);

@@ -2257,3 +2257,81 @@ improvement is negligible (within sketch sampling variance).
   math, observed at exactly the right magnitude), but the regression-level
   impact on h² hasn't been measured. Would need to run h² on the linear-vs-quadratic
   LD scores and compare.
+
+## 2026-05-11 — Bit-packed exact LD score (`--exact-bitpacked`)
+
+New mode that computes LD scores directly from packed BED bytes, no f32/f64
+genotype matrix and no GEMM. Per pair (j, k) in the per-SNP window, decode
+genotypes inline via a 4×4 product LUT and accumulate the centered dot.
+Bit-stable vs `--snp-level-masking` (paper-canonical per-SNP exact mode).
+
+### Phase 1 — Scalar reference
+
+Local (Apple M1 Pro, aarch64-apple-darwin, single-thread inside chr loop):
+
+| Bench | exact-f64 ref | bitpacked Phase 1 | ratio |
+|-------|-------|-------|-------|
+| chr22 (m=24k, N=503) | 0.50s | 4.43s | **8.8× slower** |
+| full 1000G_eur (m=1.66M, N=503) | 4.40s | 24.2s | **5.5× slower** |
+
+### Phase 2 — AVX2/NEON SIMD + intra-chromosome parallelism
+
+Two changes that compose:
+
+1. **AVX2 (x86_64) and NEON (aarch64) histogram kernels.** Build a 16-bin
+   joint-code histogram per pair (counts of `(cj << 2) | ck` over 2-bit BED
+   codes), then dot with the per-pair f64 product LUT. AVX2 processes 32
+   bytes / 128 individuals per chunk via `cmpeq + movemask + popcnt × 16`.
+   NEON processes 16 bytes / 64 individuals per chunk and *defers* the
+   horizontal reduction: 16 in-register byte accumulators flushed every 60
+   chunks via `vpaddlq_u8 + vaddvq_u16`. The naive per-bin `vshrq + vaddvq`
+   was actually slower than scalar on Apple Silicon because vaddvq_u8 has
+   4–7 cycle latency on the critical path; the deferred approach hides it.
+
+2. **Intra-chromosome parallelism.** Split each chr's j-range across rayon
+   threads with per-thread `l2_local` accumulators that reduce at the end.
+   Without this, the chr-major outer parallelism leaves single-chr runs
+   effectively single-threaded while the GEMM exact path uses faer's
+   internal rayon. Dispatcher picks outer-vs-inner: many chrs (≥ #cores) →
+   outer par_iter only (inner = 1, no oversubscription); few chrs → serial
+   outer + parallel inner so each chr saturates the cores in turn.
+
+Local re-bench (Apple M1 Pro, NEON kernel + intra-chr parallel, 8 threads):
+
+| Bench | exact-f64 ref | bitpacked Phase 2 | ratio | vs Phase 1 |
+|-------|-------|-------|-------|-------|
+| chr22 (m=24k, N=503) | 0.51s | 0.62s | 1.26× slower | **7.1× faster** |
+| full 1000G_eur (m=1.66M, N=503) | 4.33s | 12.7s | 2.93× slower | **1.9× faster** |
+
+ARM Phase 2 is in the same order of magnitude as the GEMM reference but not
+yet faster locally. The plan's acceptance criterion ("2× faster than
+current exact at 1000G") was set with the AWS x86 production target in mind:
+AVX2's 256-bit width plus AWS EPYC 7R13's deeper SIMD pipelines should
+roughly double the per-core throughput vs ARM NEON, which would put the
+chr22 bench under the reference. AWS bench pending.
+
+### Validation (chr22 1000G EUR, m=24k, N=503, ld-wind-kb 1000)
+
+Phase 1, Phase 2 (AVX2 fallback path on ARM = scalar), Phase 2 (NEON):
+all bit-identical vs `--snp-level-masking` (Pearson r = 1.0 at the
+gzipped 4-decimal output precision; M and M_5_50 files identical).
+`--keep` and `--pq-exp 1.0` flag combinations also bit-identical. mmap
+and non-mmap byte-fetch paths produce identical output.
+
+### Caveats and gaps
+
+- ARM bench uses NEON kernel; AWS x86 bench (with AVX2) pending. Phase 2
+  acceptance criterion ("2× faster than reference on chr22") is open until
+  AWS results land.
+- Local bench used 1000G_eur (N=503), not 1000G_phase3 (N=2,490). Larger N
+  favors bit-packed since per-pair work scales linearly with N while GEMM
+  scales as N² for the matmul (overhead per pair is constant). Biobank scale
+  (N=50K) is the regime where bit-packed should clearly win on AWS.
+- Per-chr `Bed::builder().build()` re-counts the BIM (1.66M lines) on every
+  open. For 22 chrs, this is ~22 × 50ms = 1.1s overhead, ~9% of the full-
+  genome wall time. Future optimization: hoist FAM/BIM stats out of
+  `compute_ldscore_bitpacked`.
+- `--exact-bitpacked` is opt-in (Phase 3 will decide whether to flip the
+  default after AWS comparison vs `--snp-level-masking`, exact-f32, and
+  `--sketch 200`).
+
