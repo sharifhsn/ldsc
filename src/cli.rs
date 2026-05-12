@@ -249,13 +249,22 @@ pub struct L2Args {
 
     /// Compute LD scores directly from packed BED bytes (bit-packed exact mode).
     /// No genotype f32/f64 materialization, no GEMM — for each SNP pair (j, k)
-    /// in its true per-SNP window, decode genotypes inline and accumulate the
-    /// centered dot product. Bit-stable (up to float ULPs) vs `--snp-level-masking`
-    /// since both compute the LDSC paper's `ℓ_j = Σ_k r²_{jk}` definition.
+    /// in its true per-SNP window, decode genotypes inline via a per-pair 4×4
+    /// product LUT and accumulate the centered dot product. AVX2 (x86_64) and
+    /// NEON (aarch64) histogram kernels do the heavy lifting; intra-chromosome
+    /// rayon parallelism keeps single-chr runs fully core-saturated.
     ///
-    /// Phase 1 is a scalar reference implementation: expected to be 2–4× slower
-    /// than the default exact path. Phase 2 (AVX2 SIMD) and Phase 3 (AWS bench)
-    /// follow. Opt-in for now; default may change after Phase 3.
+    /// Bit-stable (up to float ULPs) vs `--snp-level-masking` since both
+    /// compute the LDSC paper's `ℓ_j = Σ_k r²_{jk}` definition.
+    ///
+    /// **Performance niche.** AWS bench (1000G phase3, EPYC 7R13) found this
+    /// mode ~2.6× *slower* wall-clock than the default exact-f64 GEMM path —
+    /// per-pair fixed overhead doesn't amortize the way GEMM's c² output
+    /// entries per chunk do. Use this flag when you want a clean reference
+    /// implementation of the math (e.g. validating the GEMM path on
+    /// adversarial datasets), NOT for production speed. The recommended fast
+    /// exact mode is `--snp-level-masking --fast-f32`; for approximate use
+    /// `--sketch 200`.
     ///
     /// Compatible with `--mmap` (recommended), `--annot`, `--extract`, `--keep`,
     /// `--maf`, `--pq-exp`. The iteration IS the per-SNP mask, so this conflicts

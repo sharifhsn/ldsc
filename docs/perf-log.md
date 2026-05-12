@@ -2335,3 +2335,79 @@ and non-mmap byte-fetch paths produce identical output.
   default after AWS comparison vs `--snp-level-masking`, exact-f32, and
   `--sketch 200`).
 
+
+### Phase 3 — AWS bench (verdict: bit-packed loses)
+
+AWS Batch, c6a.4xlarge (16 vCPU AMD EPYC 7R13), 1000G phase3
+(N=2,490, M=1.66M), `--ld-wind-kb 1000`, hyperfine 3 runs each:
+
+| Mode                                  | Time (mean ± σ) | vs sketch-200 | vs exact-f64 |
+|---------------------------------------|-----------------|---------------|--------------|
+| `--exact-bitpacked --mmap` (Phase 2)  | 105.4s ± 4.5s   | 25.4× slower  | **2.6× slower** |
+| `--snp-level-masking` (exact-f64)     | 41.2s ± 2.0s    | 9.9× slower   | 1.0×         |
+| `--snp-level-masking --fast-f32`      | 16.9s ± 0.6s    | 4.1× slower   | 2.4× faster  |
+| `--sketch 200`                        | 4.15s ± 0.03s   | 1.0×          | 9.9× faster  |
+
+The plan's "6–12s estimated for bit-packed at 1000G" was off by ~10×. Why
+GEMM wins despite touching way more bytes:
+
+GEMM amortizes per-chunk setup across c² output entries (with c=200, that's
+40k r² values per chunk). Bit-packed has fixed per-pair overhead — joint
+code construction, 16-bin histogram, two scatter-adds into l2[j] and l2[k]
+per (j, k) pair — that doesn't get cheaper with bigger windows. Per-pair
+cost on paper: GEMM ≈ N/8 cycles (one AVX2 FMA per individual, fully
+pipelined, ≈ 311 cycles at N=2,490) vs bit-packed ≈ 16 chunks × ~130 cycles
++ scatter ≈ 2200 cycles. ~7× per-pair gap, ~2.6× wall after intra-chr
+parallelism + per-thread l2 reduction overhead amortizes some of it. The
+measurement (1356s user time / 105s wall = 12.9× CPU usage) confirms full
+parallelism — the bottleneck is per-core efficiency, not scheduling.
+
+Biobank bench skipped. Linear per-pair scaling means the 2.6× ratio holds
+roughly constant at N=50K — projected ~30 min wall vs exact-f32's ~6 min
+and sketch-200's ~30s. No plausible biobank result flips the verdict, and
+the bench costs ~$1–2 + 2 hr for confirmatory data.
+
+### Decision
+
+Per Phase 3 of the plan:
+- ❌ Do **not** make `--exact-bitpacked` the default for exact mode.
+- ❌ Do **not** deprecate the f64 GEMM path.
+- ✅ Keep `--exact-bitpacked` as an **opt-in flag**. Justifications for
+  keeping it:
+  - **Algorithmic-correctness reference**: implements `ℓ_j = Σ_k r²_{jk}`
+    directly from the math, no chunked-window approximation, no GEMM
+    round-off accumulation. Useful as a validation oracle for the GEMM
+    path on adversarial datasets (very low MAF, all-missing windows,
+    monomorphic SNPs).
+  - **Architectural simplicity**: the entire path is ~480 lines vs
+    `compute.rs`'s ~1900 lines of ring-buffer/chunk-mode/GPU/sketch
+    juggling — clean to read and modify.
+  - **Cross-platform SIMD coverage**: AVX2 (x86_64) + NEON (aarch64,
+    incl. AWS Graviton) + scalar fallback. The deferred-vaddvq NEON
+    pattern is reusable for other byte-histogram problems in the codebase.
+
+The recommended LD-score path stands as before:
+- Replication / paper-canonical exact: `--snp-level-masking`
+- Production exact (best wall-clock, near-bit-stable): `--snp-level-masking
+  --fast-f32`
+- Production approximate (10× faster, near-exact accuracy at d=200):
+  `--sketch 200`
+- `--exact-bitpacked` is for reference/validation, not production.
+
+### What this teaches us about future bit-packed-style optimizations
+
+- **Per-pair fixed overhead matters more than per-byte SIMD throughput**
+  at moderate N. PLINK 2's published bit-packed wins likely come from (a)
+  much larger N regimes where the per-pair overhead amortizes better, or
+  (b) deeper SIMD pipelining via bit-plane reformatting (which we explicitly
+  scoped out — Phase 4 follow-up if ever revisited).
+- **Histogram + dot was the wrong factoring at this N**. Direct per-byte
+  product accumulation in SIMD f32 — without the histogram intermediate —
+  might do better, since it cuts the per-pair fixed overhead in half (no
+  16-bin tally, just one f32 reduce). But the gap-to-close vs GEMM is
+  large enough that this is unlikely to flip the verdict either.
+- **The right "fastest exact" optimization to chase next** is probably to
+  improve the GEMM exact path itself — e.g., adopt `--fast-f32` as the
+  default for `--snp-level-masking` (already 2.4× faster than f64 at zero
+  cost on this bench), or revisit the chunk-size for L2-cache fit at
+  biobank scale.
