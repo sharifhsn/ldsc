@@ -385,59 +385,128 @@ a single high-LD region the correlation could amplify systematic biases.
 
 ## 10. Alternative algorithms worth considering
 
-### Option A: Median-of-k CountSketch (**implemented + rejected, 2026-05-12**)
+### Option A: Median-of-k / Mean-of-k CountSketch (**implemented + rejected, 2026-05-12**)
 
-Replace one $d$-dim sketch with $k$ independent $(d/k)$-dim sketches;
-take the median of the $k$ estimates. Total memory and scatter cost
-were claimed to be unchanged with concentration improving from Chebyshev
-(polynomial tails) to Hoeffding (exponential tails).
+Originally proposed: replace one $d$-dim sketch with $k$ independent
+$(d/k)$-dim sketches and take the median of the $k$ estimates. Promised:
+total memory and scatter cost unchanged, concentration improves from
+Chebyshev (polynomial tails) to Hoeffding (exponential tails).
 
 **Outcome: implemented as `--sketch-k <K>` on the `experiment/median-of-k`
-branch and empirically broken at K>1.** Two reasons:
+branch (commits `364897e` and `5e2c4dd`), with both median and arithmetic-
+mean aggregators tested. Both rejected, but for different reasons.**
 
-1. **Scatter cost is K× current, not unchanged.** The "total scatter
-   cost unchanged" framing was about bytes-written (K × DIM/K = DIM)
-   but mis-counts operations: each individual still requires K hash
-   lookups + K scatter-add operations. Wall-clock perf scaled K×
-   (chr22 local: K=1 → 2.08s, K=3 → 4.82s, K=5 → 10.74s).
-2. **The median is biased downward under CountSketch noise.**
-   The Alon-Matias-Szegedy median-of-K trick preserves the unbiased
-   mean only when the per-estimate noise is symmetric. CountSketch's
-   $\tilde r^2$ distribution is right-skewed (bounded below at 0,
-   long upper tail), so median < mean systematically. Empirically on
-   chr22 1000G EUR vs `--snp-level-masking` exact reference (mean
-   L2 = 16.08):
+#### Why median-of-K fails: the $\tilde r^2$ distribution is right-skewed at low $r^2$
 
-   | Mode                                | Pearson r | mean L2 |
-   |-------------------------------------|-----------|---------|
-   | `--sketch 200` (K=1)                | 0.97937   | 14.97   |
-   | `--sketch 450 --sketch-k 3` (d_sub=150) | 0.98545 | 10.67   |
-   | `--sketch 300 --sketch-k 3` (d_sub=100) | 0.97607 |  8.20   |
-   | `--sketch 201 --sketch-k 3` (d_sub=67)  | 0.95240 |  4.85   |
+The Alon-Matias-Szegedy median trick assumes the per-estimate noise is
+symmetric around the mean. CountSketch's $\tilde r^2$ has a strongly
+right-skewed distribution at low $r^2$. Monte Carlo on N=2,490 standardized
+vectors with controlled true $r^2$ (`docs/countsketch-mc-distribution.py`,
+`docs/countsketch-mc-aggregator-bias.py`):
 
-   Pearson r barely moves but the mean is systematically pushed down
-   as d_sub shrinks. The bias correction (quadratic inversion) is
-   applied to the median of K $\tilde r^2$ values, but the median of
-   K iid right-skewed estimates converges to the population median,
-   not the population mean — and only the mean has the
-   `r² + (1-r²)(1-2r²)/d` bias structure the quadratic inversion
-   undoes. This would propagate as systematic h² underestimation
-   downstream.
+| true $r^2$ | distribution skewness | $\mathbb{E}[X] - \mathrm{median}(X)$ |
+|-----------:|---------------------:|-------------------------------------:|
+| 0.0   | **+2.54** | +0.0032 |
+| 0.01  | +1.74     | +0.0043 |
+| 0.1   | +0.32     | +0.0014 |
+| 0.3   | +0.02     | -0.0001 |
+| 0.7   | -0.37     | -0.0023 |
 
-The single-sketch `--sketch d` path with quadratic correction remains
-the recommended fast approximate mode. The `experiment/median-of-k`
-branch is preserved as a documented negative result.
+The skewness is most severe at $r^2 = 0$ — exactly the regime that
+dominates LD-score sums under rapid LD decay (most pairs in a 1 Mb window
+are at $r^2 \approx 0$).
 
-**Fix paths (not pursued)**:
+Median-of-K convergence: for K iid samples from a right-skewed
+distribution, $\mathbb{E}[\text{median of K}]$ converges to the
+*population median*, which is strictly less than the *population mean*.
+Since the quadratic correction inverts the bias structure of the *mean*
+($r^2 + (1-r^2)(1-2r^2)/d$), applying it to a median that's below the
+mean leaves a residual systematic downward bias.
 
-- *Mean-of-K* instead of median: variance reduction by 1/K, no bias,
-  but tail concentration is only CLT/Gaussian-like rather than
-  Hoeffding. Probably the right operation for LD-score work but not
-  what this section originally proposed.
-- *Anti-skew correction for median's bias under CountSketch*:
-  possible in principle but requires fresh math, and the existing
-  d=200 single-sketch error envelope is already small enough that
-  the marginal value isn't obvious.
+Per-pair median-of-3 corrected bias at $d_\text{sub} = 67$:
+
+| true $r^2$ | median-of-K bias | mean-of-K bias |
+|-----------:|-----------------:|---------------:|
+| 0.0   | **-0.0052** | +0.0002 |
+| 0.01  | -0.0054     | +0.0006 |
+| 0.1   | -0.0070     | +0.0023 |
+| 0.3   | -0.0008     | +0.0031 |
+| 0.7   | +0.0035     | +0.0022 |
+
+Summed over a typical chr22 1 Mb LD window (~2,400 pairs, mostly at
+$r^2 \approx 0$), the median-of-3 path produces a per-SNP bias of
+$\approx -12$ on the LD score. This matches the empirical end-to-end
+measurement on chr22 1000G EUR with `--exact-bitpacked` as the reference
+(mean L2 = 16.08):
+
+| Mode | Pearson r vs exact | mean L2 | total bias |
+|------|-------------------:|--------:|-----------:|
+| `--sketch 200` (K=1)                    | 0.979 | 14.97 | -1.10  |
+| `--sketch 450 --sketch-k 3` (d_sub=150) | 0.985 | 10.67 | -5.41  |
+| `--sketch 300 --sketch-k 3` (d_sub=100) | 0.976 |  8.20 | -7.88  |
+| `--sketch 201 --sketch-k 3` (d_sub=67)  | 0.952 |  4.85 | -11.23 |
+
+Per-pair bias × window size ≈ measured bias, to ~0.5 LD-score units.
+
+#### Why mean-of-K *doesn't help either*: variance at low $r^2$
+
+Replacing median with arithmetic mean (also implemented on the experiment
+branch, behind `LDSC_SKETCH_AGG=mean|median` env var) eliminates the
+skewness bias: mean of K iid unbiased corrections is unbiased. But mean-
+of-K at the same *total* budget DIM = K × d_sub is **not statistically
+equivalent to single-sketch d=DIM**, because the variance bound
+$\mathrm{Var}[\tilde r^2] \approx (1+r^2)/d$ is asymptotic in $d$ and
+loose at $r^2 = 0$ for small $d$.
+
+Empirical variance at fixed (X_j, X_k), 1,500 sketches each
+(`docs/countsketch-mc-variance-check.py`):
+
+| true $r^2$ | single d=200 SD | mean-of-3 d_sub=67 SD | ratio | single-d=67/√3 prediction |
+|-----------:|----------------:|----------------------:|------:|--------------------------:|
+| 0.0  | 0.00894 | **0.01416** | 1.58× | 0.01374 ✓ |
+| 0.1  | 0.04028 | 0.03936     | 0.98× | 0.03991 ✓ |
+| 0.3  | 0.05378 | 0.05460     | 1.02× | 0.05365 ✓ |
+
+At $r^2 \geq 0.1$ the equivalence holds to within 2%, but at $r^2 = 0$
+mean-of-3 has 1.58× higher SD than single-sketch d=200. The variance of
+mean-of-K matches the canonical iid prediction $\mathrm{SD}_\text{single-d=67} / \sqrt{K}$
+almost exactly — the loss vs single-d=200 isn't a bug; it's because
+single-sketch d=67 has more than 3× the variance of single-d=200 at
+$r^2 = 0$, breaking the "same total budget" claim.
+
+End-to-end empirics with mean-of-K aggregator:
+
+| Mode | Pearson r vs exact | mean L2 |
+|------|-------------------:|--------:|
+| `--sketch 200` (K=1)                                  | 0.979 | 14.97 |
+| `--sketch 450 --sketch-k 3` (d_sub=150) + mean        | 0.978 | 14.99 |
+| `--sketch 300 --sketch-k 3` (d_sub=100) + mean        | 0.963 | 14.37 |
+| `--sketch 201 --sketch-k 3` (d_sub=67)  + mean        | 0.926 | 13.85 |
+
+Mean-of-K is unbiased (mean L2 stays at the single-sketch baseline
+~15.0), but Pearson r degrades as d_sub shrinks because each sub-sketch
+contributes more variance than the asymptotic formula predicts.
+
+#### Conclusion
+
+Neither aggregator beats single-sketch d=DIM at fixed total compute
+budget for LDSC:
+
+- **Median-of-K**: systematically downward-biased in the regime that
+  dominates LD-score sums. Catastrophic on real data (-11 LD-score
+  units at K=3 d_sub=67).
+- **Mean-of-K**: unbiased, but variance at low $r^2$ is sqrt(K)× higher
+  than single-sketch d=DIM at the same compute. Pearson r drops; the
+  user's path to higher accuracy is "increase $d$", not "add K".
+
+The "Hoeffding concentration" promise of median-of-K applies only to
+symmetric noise. For the LDSC use case the noise is bimodal in
+skewness sign (right at low $r^2$, left at high $r^2$) and dominated by
+the right-skew at low $r^2$ where most pair-contributions live.
+
+Both implementations preserved on the `experiment/median-of-k` branch
+along with the MC scripts under `docs/countsketch-mc-*.py` (the
+experiment branch is the only place those scripts live).
 
 ### Option B: Bit-packed exact computation (**implemented + rejected, 2026-05-11**)
 
@@ -524,18 +593,26 @@ removed from main (commit `287902b`) and preserved on the
 oracle on adversarial datasets, or as a starting point for a PLINK-2-
 style bit-plane reformat).
 
-**Tier 4 (tested + rejected 2026-05-12)**: median-of-k CountSketch
-(Option A) was implemented as `--sketch-k <K>` on the
-`experiment/median-of-k` branch. K=1 byte-identical to current
+**Tier 4 (tested + rejected 2026-05-12)**: median-of-k AND mean-of-k
+CountSketch (Option A) were both implemented as `--sketch-k <K>` on the
+`experiment/median-of-k` branch, with the aggregator chosen at runtime
+via `LDSC_SKETCH_AGG=mean|median`. K=1 byte-identical to current
 `--sketch`; K>1 wall-clock scales K× (confirming the predicted
-per-pair cost). However, the median is biased downward under
-CountSketch's right-skewed $\tilde r^2$ noise distribution, so mean L2
-drops systematically as K (or 1/d_sub) increases — see §10 Option A
-for the empirical evidence. Single-sketch `--sketch d` with quadratic
-correction remains the recommended fast approximate mode. A future
-"mean-of-K" variant (variance reduction without the bias issue but
-without Hoeffding tail concentration) is the obvious follow-up if
-heavy-tail behavior is ever reported.
+per-pair cost). Neither aggregator beats single-sketch `--sketch d`:
+- *Median* is severely downward-biased because the per-sketch
+  $\tilde r^2$ distribution is right-skewed at low $r^2$ (where most
+  LD-window pairs live; skewness +2.5 at $r^2=0$). End-to-end bias on
+  chr22 EUR: -11 LD-score units at K=3 d_sub=67.
+- *Mean* eliminates the bias but has $\sqrt{K}$ × higher variance than
+  single-sketch d=DIM at low $r^2$, because the asymptotic
+  $(1+r^2)/d$ variance bound is loose at small $d$ — Pearson r vs
+  exact drops from 0.979 (K=1 d=200) to 0.926 (K=3 d_sub=67) even
+  though the mean is unbiased.
+
+The right way to get higher LD-score accuracy is to increase
+`--sketch d`, not split into K sub-sketches. See §10 Option A for the
+full empirical analysis and the MC scripts on the `experiment/median-of-k`
+branch.
 
 ## 13. Empirical comparison: quadratic vs linear correction (chr22 EUR, historical)
 
