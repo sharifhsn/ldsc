@@ -199,6 +199,23 @@ where `active_n_inv_sq_r2u_a = n_inv² · r2u_a · d/(d-2)` and
 sketch correction into the same linear-in-$\tilde r^2$ form as the
 LDSC unbiased r² correction.
 
+The base unbiased correction $\hat r^2 - (1 - \hat r^2)/(N-2)$ ldsc-rs
+applies is from Bulik-Sullivan 2015, citing **Yin & Fan 2001, "Estimating
+$R^2$ Shrinkage in Multiple Regression," J Experimental Education
+69:203-224** — a general-statistics regression-shrinkage estimator
+(Olkin-Pratt-style), not an LD-population-genetics result. This is the
+only such citation in the LDSC math; it is mathematically reasonable for
+diploid biallelic data treated as Pearson correlation. A more rigorous
+LD-population-genetics alternative is **Ragsdale & Gravel 2020,
+"Unbiased Estimation of Linkage Disequilibrium from Unphased Data" (Mol
+Biol Evol 37:923, DOI 10.1093/molbev/msz265)**, which accounts for
+Hardy-Weinberg / unphased-genotype sampling structure and notes that
+"widely used estimators for r² and D² exhibit large and variable upward
+biases." We do not adopt Ragsdale-Gravel here because (a) consistency
+with reference LDSC outputs is the higher priority for replication
+studies, and (b) the difference is small in our regime; flagged for
+future consideration.
+
 The correction is exact iff the bias model is $(1 - 2r^2)/d$, but the
 true bias is $(1 - r^2)(1 - 2r^2)/d$. So the corrected estimator has
 residual bias:
@@ -383,7 +400,7 @@ cost goes from 1 mul-add to $k$ mul-adds + 1 median (~$k \log k$).
 Worth implementing if anyone reports heavy-tail problems on real biobank
 data. The standard literature recommendation for exactly this use case.
 
-### Option B: Bit-packed exact computation (**biggest potential win**)
+### Option B: Bit-packed exact computation (**implemented + rejected, 2026-05-11**)
 
 Genotype data is bit-packed in BED format (2 bits per genotype, 4 per
 byte). For pair $(j, k)$, the inner product $X_j^\top X_k$ can be
@@ -391,27 +408,38 @@ computed via SIMD popcount and shuffle operations on raw BED bytes —
 no f32 expansion. Compute the joint 3×3 genotype contingency table by
 counting 2-bit-pair matches, then compute r² from the 9 counts.
 
-This is what PLINK 2 does. Cost: O(N/4) per pair (one byte per 4
-individuals), vs O(N) for the dense f32 dot product. **Roughly 4-8×
-faster than dense f32 GEMM for the same exact answer.**
+This is what PLINK 2 does. Original estimate (this section, pre-implementation):
+~4–8× faster than dense f32 GEMM and ~2× faster than `--sketch 200`,
+making CountSketch obsolete for the LDSC use case.
 
-Catch: it's per-pair, not batched. For chunked LD scoring you'd want
-to batch — possibly by computing several pairs simultaneously via a
-SIMD tile, exploiting the bit-packed format's natural alignment.
+**Outcome: this estimate was wrong.** Implemented as `--exact-bitpacked`
+(Phase 1 scalar + Phase 2 AVX2 + NEON histogram kernels + intra-chr
+parallelism) and benchmarked on AWS Batch (c6a.4xlarge, EPYC 7R13, full
+1000G phase3 N=2,490, M=1.66M, --ld-wind-kb 1000, 3 runs each):
 
-Estimated benefit at biobank scale (N=50K, M=1.66M, window=2000):
-- Current f32 GEMM: ~6.7 × 10¹³ FMA ops → ~66 s on AVX2 @ 1 TFLOP/s
-- Bit-packed: ~1.6 × 10¹³ byte ops → ~16 s
-- Current `--sketch 200`: ~33 s (scatter + reduced GEMM)
+| Mode                                  | Time (mean ± σ) | vs sketch-200 | vs exact-f64 |
+|---------------------------------------|-----------------|---------------|--------------|
+| `--exact-bitpacked --mmap`            | 105.4s ± 4.5s   | 25.4× slower  | 2.6× slower  |
+| `--snp-level-masking` (exact-f64)     | 41.2s ± 2.0s    | 9.9× slower   | 1.0×         |
+| `--snp-level-masking --fast-f32`      | 16.9s ± 0.6s    | 4.1× slower   | 2.4× faster  |
+| `--sketch 200`                        | 4.15s ± 0.03s   | 1.0×          | 9.9× faster  |
 
-**Bit-packed would be ~2× faster than the current sketch while
-delivering exact LD scores.** This makes CountSketch obsolete for the
-LDSC use case if implemented well.
+The "~1.6 × 10¹³ byte ops → ~16s" estimate assumed AVX2 popcount at
+~1 TB/s throughput; actual per-pair cost is dominated by fixed overhead
+(joint-code construction + 16-bin histogram + scatter to `l2[j]`,
+`l2[k]`) that doesn't amortize the way GEMM's c² output entries per
+chunk do. Per-pair on paper: GEMM ≈ N/8 cycles (one AVX2 FMA per
+individual, fully pipelined) ≈ 311 cycles at N=2,490; bit-packed ≈ 16
+chunks × ~130 cycles + scatter ≈ 2,200 cycles. ~7× per-pair gap, ~2.6×
+wall after parallelism amortizes some of it. See `docs/perf-log.md`
+2026-05-11 entry for the full analysis.
 
-Implementation cost: real (SIMD kernel, missing-data handling,
-chunk-loop integration), but contained — probably 1-2 weeks of work
-plus benchmarking. The math is straightforward — popcount on the
-match-mask of two 2-bit codes gives the contingency-table entries.
+**Implication for this doc**: CountSketch is **not** obsolete.
+`--sketch 200` remains the fastest path that produces statistically
+useful LD scores, and `--snp-level-masking --fast-f32` remains the
+fastest path for bit-stable LD scores. The bit-packed code has been
+removed from main (commit `287902b`) and preserved on the
+`experiment/bitpacked-exact` branch.
 
 ### Option C: int8 / lower-precision GEMM
 
@@ -444,17 +472,28 @@ known O(1/d) residual that the quadratic eliminates, and AWS
 profiling showed no measurable wall-clock cost. d ≤ 50 emits a
 runtime warning since the Taylor expansion breaks down there.
 
-**Tier 3 (big win, ambitious, not yet done)**: prototype bit-packed
-exact computation (Option B). If it delivers the predicted 2× speedup
-at biobank scale, **CountSketch becomes obsolete** for ldsc-rs's use
-case — `--sketch` can be deprecated in favor of `--exact-fast`. This
-would substantially simplify the codebase (drop all the CountSketch
-infrastructure) and remove the need for any of the bias-correction
-machinery.
+**Tier 3 (tested + rejected 2026-05-11)**: bit-packed exact computation
+(Option B) was implemented as `--exact-bitpacked`, benchmarked on AWS,
+and found to be 25× slower than `--sketch 200` and 2.6× slower than the
+existing exact-f64 GEMM path at 1000G scale. The predicted ~2× speedup
+over CountSketch did not materialize; the original throughput estimate
+assumed per-byte AVX2 popcount would dominate, but per-pair fixed
+overhead (joint-code construction + 16-bin histogram + scatter) is the
+actual bottleneck. **CountSketch is NOT obsolete.** Implementation
+removed from main (commit `287902b`) and preserved on the
+`experiment/bitpacked-exact` branch for future reference (validation
+oracle on adversarial datasets, or as a starting point for a PLINK-2-
+style bit-plane reformat).
 
-**Tier 4 (research direction)**: median-of-k CountSketch (Option A) for
-production-grade robustness, if anyone reports outlier LD scores on
-heavy-tailed cohorts.
+**Tier 4 (research direction, still not done)**: median-of-k CountSketch
+(Option A) for production-grade robustness. Per-bin chr22 validation
+of the quadratic correction at d=200 (§13) showed the predicted-direction
+shift in high-LD-score SNPs, and AWS biobank `--sketch 200` is already
+~20× faster than exact-f64 with negligible h² impact, so there is no
+current motivation to implement median-of-k. Worth revisiting if anyone
+reports outlier LD scores on heavy-tailed cohorts (large populations
+with extreme LD structure, e.g. isolated founder populations) where the
+single-sketch tail-risk would manifest.
 
 ## 13. Empirical comparison: quadratic vs linear correction (chr22 EUR, historical)
 
@@ -601,3 +640,11 @@ LD decay.
 - PLINK 2 bit-packed inner products: Chang et al., "Second-generation
   PLINK: rising to the challenge of larger and richer datasets",
   GigaScience 2015
+- Source of the unbiased $r^2$ correction $\hat r^2 - (1-\hat r^2)/(N-2)$
+  used by LDSC: Yin & Fan 2001, "Estimating $R^2$ Shrinkage in Multiple
+  Regression," J Experimental Education 69:203-224 (cited by
+  Bulik-Sullivan 2015 supplementary note)
+- LD-genetics-rigorous alternative unbiased $r^2$ estimator:
+  Ragsdale & Gravel 2020, "Unbiased Estimation of Linkage Disequilibrium
+  from Unphased Data," Mol Biol Evol 37:923,
+  doi:10.1093/molbev/msz265

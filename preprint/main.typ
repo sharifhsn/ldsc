@@ -744,7 +744,14 @@ GEMM kernel being the natural target for GPU execution.
 
 LD scores are defined as $ell_j = sum_(k in W_j) r^2_(j k)$ where $W_j$ is
 the set of SNPs within a specified window of SNP $j$, and $r^2_(j k)$ is the
-squared Pearson correlation between genotypes at SNPs $j$ and $k$.
+squared Pearson correlation between genotypes at SNPs $j$ and $k$. The
+quantity $sum r^2$ appears in earlier population-genetics work — Yang et
+al.~@yang2011a derived that GWAS test-statistic inflation under polygenic
+inheritance scales with surrounding LD, and the GCTA implementation
+@yang2011 exposes regional $sum r^2$ over sliding 200-kb blocks via
+`--ld-score`. Bulik-Sullivan et al.~@bulik-sullivan2015a reformulated
+$sum r^2$ as a per-SNP regressor with a per-SNP-exact window, yielding the
+LD score regression equation that gives LDSC its name.
 
 The sample squared correlation $hat(r)^2_(j k)$ is a biased estimator of
 $r^2_(j k)$. Bulik-Sullivan et al.~@bulik-sullivan2015a show via the
@@ -759,6 +766,15 @@ $ hat(r)^2_"adj" = hat(r)^2 - (1 - hat(r)^2) / (N - 2) = ((N-1) hat(r)^2 - 1) / 
 ldsc-rs uses the same formula. The two corrections differ by
 $O(1 slash N^2)$; at $N = 2{,}490$, the maximum per-entry difference is
 $< 2 times 10^(-7)$.
+
+We note for completeness that the adjusted-$R^2$ form is the
+general-statistics regression-shrinkage estimator @yin2001 (cited in the
+Bulik-Sullivan supplementary note), not an LD-population-genetics
+estimator specifically. A more rigorous treatment of unbiased $r^2$
+from unphased diploid data — explicitly accounting for Hardy-Weinberg
+sampling structure — is given by Ragsdale and Gravel @ragsdale2020; we
+do not adopt it here to preserve bit-stable parity with reference LDSC
+outputs, but flag it as a candidate refinement for future work.
 
 *Chunked GEMM decomposition.* Directly computing all pairwise $r^2$ within
 each window would require $O(m w^2 N)$ work. Instead, both the Python
