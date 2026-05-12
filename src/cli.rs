@@ -247,38 +247,6 @@ pub struct L2Args {
     #[arg(long)]
     pub snp_level_masking: bool,
 
-    /// Compute LD scores directly from packed BED bytes (bit-packed exact mode).
-    /// No genotype f32/f64 materialization, no GEMM — for each SNP pair (j, k)
-    /// in its true per-SNP window, decode genotypes inline via a per-pair 4×4
-    /// product LUT and accumulate the centered dot product. AVX2 (x86_64) and
-    /// NEON (aarch64) histogram kernels do the heavy lifting; intra-chromosome
-    /// rayon parallelism keeps single-chr runs fully core-saturated.
-    ///
-    /// Bit-stable (up to float ULPs) vs `--snp-level-masking` since both
-    /// compute the LDSC paper's `ℓ_j = Σ_k r²_{jk}` definition.
-    ///
-    /// **Performance niche.** AWS bench (1000G phase3, EPYC 7R13) found this
-    /// mode ~2.6× *slower* wall-clock than the default exact-f64 GEMM path —
-    /// per-pair fixed overhead doesn't amortize the way GEMM's c² output
-    /// entries per chunk do. Use this flag when you want a clean reference
-    /// implementation of the math (e.g. validating the GEMM path on
-    /// adversarial datasets), NOT for production speed. The recommended fast
-    /// exact mode is `--snp-level-masking --fast-f32`; for approximate use
-    /// `--sketch 200`.
-    ///
-    /// Compatible with `--mmap` (recommended), `--annot`, `--extract`, `--keep`,
-    /// `--maf`, `--pq-exp`. The iteration IS the per-SNP mask, so this conflicts
-    /// with `--snp-level-masking` (redundant), `--sketch` / `--gpu` / `--fast-f32`
-    /// / `--global-pass` (those operate on the GEMM path which this skips).
-    #[arg(
-        long,
-        conflicts_with_all = [
-            "sketch", "gpu", "fast_f32", "global_pass", "snp_level_masking",
-            "python_compat",
-        ]
-    )]
-    pub exact_bitpacked: bool,
-
     /// File containing SNP IDs (one per line) to print LD scores for.
     /// Unlike --extract, all SNPs are still used in LD windows; only output is filtered.
     #[arg(long)]

@@ -164,8 +164,6 @@ Three opt-in modes trade precision for speed in the `l2` subcommand:
 
 - **`--fast-f32`** — Use f32 for genotype storage and GEMM. ~1.85× speedup (bandwidth-bound). Numerically close to f64; safe for downstream h2/rg. Combinable with all other modes.
 
-- **`--exact-bitpacked`** — Reference implementation that computes LD scores directly from packed BED bytes (no f32/f64 materialization, no GEMM). AVX2/NEON histogram kernels + intra-chromosome rayon parallelism. Bit-stable vs `--snp-level-masking`. **Not for production speed**: AWS bench (1000G phase3, EPYC 7R13) found it ~2.6× slower than the default exact-f64 GEMM path — per-pair fixed overhead doesn't amortize the way GEMM's c² output entries per chunk do (see `docs/perf-log.md` 2026-05-11 Phase 3 entry). Use this flag only when you want a clean reference of the math (`ℓ_j = Σ_k r²_{jk}` directly, no chunked-window approximation, no GEMM round-off accumulation), e.g. for validating the GEMM path on adversarial datasets. For production exact, use `--snp-level-masking --fast-f32`.
-
 - **`--sketch <d>`** — Randomized dimensionality reduction via CountSketch before GEMM. Fused BED-decode-normalize-scatter-add kernel, O(N×c) regardless of d. Cost is flat in d until d≈√N, so d=200 has same speed as d=50 but much better accuracy — **prefer larger d**.
   - Accuracy depends on d: d=100 r≈0.85, d=200 r≈0.93, d=500 r≈0.97. **d=200 is the practical sweet spot.**
   - **Automatically enables f32** — CountSketch ±1 entries are exactly representable in f32. `--fast-f32` is redundant with `--sketch`.

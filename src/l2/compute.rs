@@ -356,13 +356,13 @@ fn build_norm_byte_lut_f64(mean: f64, inv_std: f64) -> [[f64; 4]; 256] {
 // Byte-level stats LUT: each of the 256 possible BED byte values encodes 4
 // genotypes; this LUT gives (sum, count, sum_sq) for the full byte.
 #[derive(Clone, Copy)]
-pub(super) struct BedByteStats {
-    pub sum: u8,
-    pub count: u8,
-    pub sum_sq: u8,
+struct BedByteStats {
+    sum: u8,
+    count: u8,
+    sum_sq: u8,
 }
 
-pub(super) fn build_bed_byte_lut() -> [BedByteStats; 256] {
+fn build_bed_byte_lut() -> [BedByteStats; 256] {
     std::array::from_fn(|b| {
         let byte = b as u8;
         let (mut sum, mut count, mut sum_sq) = (0u8, 0u8, 0u8);
@@ -391,7 +391,7 @@ pub(super) fn build_bed_byte_lut() -> [BedByteStats; 256] {
 
 /// Compute (sum, count, sum_sq) of non-missing genotypes for one SNP from raw bytes.
 /// Genotypes are 0, 1, 2 (count_a1=true convention).
-pub(super) fn snp_stats_from_bytes(
+fn snp_stats_from_bytes(
     snp_bytes: &[u8],
     n_indiv: usize,
     iid_positions: &[IidPos],
