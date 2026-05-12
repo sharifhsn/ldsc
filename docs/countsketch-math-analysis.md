@@ -385,20 +385,59 @@ a single high-LD region the correlation could amplify systematic biases.
 
 ## 10. Alternative algorithms worth considering
 
-### Option A: Median-of-k CountSketch
+### Option A: Median-of-k CountSketch (**implemented + rejected, 2026-05-12**)
 
 Replace one $d$-dim sketch with $k$ independent $(d/k)$-dim sketches;
 take the median of the $k$ estimates. Total memory and scatter cost
-unchanged. **Concentration improves from Chebyshev (polynomial tails) to
-Hoeffding (exponential tails)**, giving $\Pr[|\tilde r - r| > \epsilon]
-\leq 2^{-k}$ at appropriate $\epsilon$.
+were claimed to be unchanged with concentration improving from Chebyshev
+(polynomial tails) to Hoeffding (exponential tails).
 
-Engineering cost: modest. Replace one `CountSketchProj` with a `Vec<CountSketchProj>`
-of length $k$, compute $k$ estimates per pair, take median. Per-pair
-cost goes from 1 mul-add to $k$ mul-adds + 1 median (~$k \log k$).
+**Outcome: implemented as `--sketch-k <K>` on the `experiment/median-of-k`
+branch and empirically broken at K>1.** Two reasons:
 
-Worth implementing if anyone reports heavy-tail problems on real biobank
-data. The standard literature recommendation for exactly this use case.
+1. **Scatter cost is K× current, not unchanged.** The "total scatter
+   cost unchanged" framing was about bytes-written (K × DIM/K = DIM)
+   but mis-counts operations: each individual still requires K hash
+   lookups + K scatter-add operations. Wall-clock perf scaled K×
+   (chr22 local: K=1 → 2.08s, K=3 → 4.82s, K=5 → 10.74s).
+2. **The median is biased downward under CountSketch noise.**
+   The Alon-Matias-Szegedy median-of-K trick preserves the unbiased
+   mean only when the per-estimate noise is symmetric. CountSketch's
+   $\tilde r^2$ distribution is right-skewed (bounded below at 0,
+   long upper tail), so median < mean systematically. Empirically on
+   chr22 1000G EUR vs `--snp-level-masking` exact reference (mean
+   L2 = 16.08):
+
+   | Mode                                | Pearson r | mean L2 |
+   |-------------------------------------|-----------|---------|
+   | `--sketch 200` (K=1)                | 0.97937   | 14.97   |
+   | `--sketch 450 --sketch-k 3` (d_sub=150) | 0.98545 | 10.67   |
+   | `--sketch 300 --sketch-k 3` (d_sub=100) | 0.97607 |  8.20   |
+   | `--sketch 201 --sketch-k 3` (d_sub=67)  | 0.95240 |  4.85   |
+
+   Pearson r barely moves but the mean is systematically pushed down
+   as d_sub shrinks. The bias correction (quadratic inversion) is
+   applied to the median of K $\tilde r^2$ values, but the median of
+   K iid right-skewed estimates converges to the population median,
+   not the population mean — and only the mean has the
+   `r² + (1-r²)(1-2r²)/d` bias structure the quadratic inversion
+   undoes. This would propagate as systematic h² underestimation
+   downstream.
+
+The single-sketch `--sketch d` path with quadratic correction remains
+the recommended fast approximate mode. The `experiment/median-of-k`
+branch is preserved as a documented negative result.
+
+**Fix paths (not pursued)**:
+
+- *Mean-of-K* instead of median: variance reduction by 1/K, no bias,
+  but tail concentration is only CLT/Gaussian-like rather than
+  Hoeffding. Probably the right operation for LD-score work but not
+  what this section originally proposed.
+- *Anti-skew correction for median's bias under CountSketch*:
+  possible in principle but requires fresh math, and the existing
+  d=200 single-sketch error envelope is already small enough that
+  the marginal value isn't obvious.
 
 ### Option B: Bit-packed exact computation (**implemented + rejected, 2026-05-11**)
 
@@ -485,15 +524,18 @@ removed from main (commit `287902b`) and preserved on the
 oracle on adversarial datasets, or as a starting point for a PLINK-2-
 style bit-plane reformat).
 
-**Tier 4 (research direction, still not done)**: median-of-k CountSketch
-(Option A) for production-grade robustness. Per-bin chr22 validation
-of the quadratic correction at d=200 (§13) showed the predicted-direction
-shift in high-LD-score SNPs, and AWS biobank `--sketch 200` is already
-~20× faster than exact-f64 with negligible h² impact, so there is no
-current motivation to implement median-of-k. Worth revisiting if anyone
-reports outlier LD scores on heavy-tailed cohorts (large populations
-with extreme LD structure, e.g. isolated founder populations) where the
-single-sketch tail-risk would manifest.
+**Tier 4 (tested + rejected 2026-05-12)**: median-of-k CountSketch
+(Option A) was implemented as `--sketch-k <K>` on the
+`experiment/median-of-k` branch. K=1 byte-identical to current
+`--sketch`; K>1 wall-clock scales K× (confirming the predicted
+per-pair cost). However, the median is biased downward under
+CountSketch's right-skewed $\tilde r^2$ noise distribution, so mean L2
+drops systematically as K (or 1/d_sub) increases — see §10 Option A
+for the empirical evidence. Single-sketch `--sketch d` with quadratic
+correction remains the recommended fast approximate mode. A future
+"mean-of-K" variant (variance reduction without the bias issue but
+without Hoeffding tail concentration) is the obvious follow-up if
+heavy-tail behavior is ever reported.
 
 ## 13. Empirical comparison: quadratic vs linear correction (chr22 EUR, historical)
 
