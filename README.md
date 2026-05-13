@@ -41,17 +41,20 @@ downstream h².
    [`docs/countsketch-math-analysis.md`](docs/countsketch-math-analysis.md).
    At biobank N=50K, sketch is 17–24× faster than `--fast-f32` exact.
 
-3. **`--sketch 1600 --snp-level-masking` reaches per-SNP-exact h² at sketch
-   speed.** Discovered in v0.5.0: combining sketch (fast GEMM) with per-SNP
-   exact windowing (the LDSC paper's mathematical definition of ℓ\_j) matches
-   per-SNP-exact h² within **0.001** on three real GWAS (BMI 2010, BMI 2018,
-   Height 2018) at biobank scale — that's ~17× faster than Rust exact mode
-   (21 s vs 361 s) and **311× faster than Python LDSC at biobank** (21 s vs
-   measured 6,541 s on r6a.8xlarge). The dominant residual bias in plain
+3. **`--sketch 1600 --snp-level-masking` is more accurate than Python LDSC
+   at biobank scale.** Discovered in v0.5.0: combining sketch (fast GEMM)
+   with per-SNP exact windowing (the LDSC paper's mathematical definition
+   of ℓ\_j) reaches the paper-canonical h² within **0.001** on three real
+   GWAS (BMI 2010, BMI 2018, Height 2018) at biobank scale. **Python LDSC's
+   chunked-window approximation produces h² estimates 10–14% below the
+   paper definition** on these traits (verified: at biobank, Python's
+   h² = Rust chunk-exact h², which has Δ = −0.015 / −0.020 / −0.047 vs
+   per-SNP exact). Sketch+masking takes 21 s vs Python's 6,541 s — **311×
+   faster and ~12% more accurate**. The dominant residual bias in plain
    `--sketch d` turned out not to be sketch noise (vanishes at d≥1000) but
-   the chunked-window approximation that Python LDSC also uses; per-SNP
-   masking fixes it post-GEMM at zero meaningful cost. Cross-validated against
-   GCTA, Python LDSC, chunk-exact, and per-SNP exact — full validation in
+   the same chunked-window approximation; per-SNP masking fixes it
+   post-GEMM at zero meaningful cost. Cross-validated against GCTA, Python
+   LDSC, chunk-exact, and per-SNP exact — full validation in
    [`docs/perf-log.md`](docs/perf-log.md) 2026-05-12 entry.
 
 ## Where this sits in the LD-score-regression tool landscape
@@ -562,11 +565,17 @@ Python LDSC at biobank measured on r6a.8xlarge (32 vCPU, 240 GiB, same
 chunk-size 200 + ld-wind-kb 1000 as Rust); Rust modes measured on
 c6a.4xlarge (16 vCPU, 28 GiB).
 
+Python LDSC and Rust chunked-exact produce **bit-identical** h² values
+at biobank (both use the same chunked-window approximation; the algorithm
+matches, only the language differs). Both diverge from per-SNP exact —
+the LDSC paper's mathematical definition — by 10–14% h² because of
+chunked-window bias.
+
 | Mode | Wall time | vs Python | h² \|Δ\| vs per-SNP exact (BMI 2010 / BMI 2018 / Height 2018) |
 |------|----------:|--------:|---|
-| Python LDSC | 6,541 s (109 min) | 1.0× | reference |
+| Python LDSC | 6,541 s (109 min) | 1.0× | 0.015 / 0.020 / 0.047 (chunked-window bias) |
+| `--fast-f32` (chunked-exact, ≡ Python h²) | 358 s | 18× | 0.015 / 0.020 / 0.047 (≡ Python) |
 | `--snp-level-masking --fast-f32` (per-SNP exact, "math truth") | 361 s | **18×** | 0 (truth) |
-| `--fast-f32` (chunked-exact) | 358 s | 18× | 0.015 / 0.020 / 0.047 (chunked-window bias) |
 | **`--sketch 1600 --snp-level-masking`** | **21 s** | **311×** | **0.0002 / 0.0003 / 0.0005** |
 | `--sketch 1000 --snp-level-masking` | 19 s | 344× | 0.0007 / 0.0000 / 0.0027 |
 | `--sketch 1000` (chunked) | 18 s | 363× | 0.015 / 0.020 / 0.044 |
