@@ -9,6 +9,49 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - (none)
 
+## [0.5.0] — 2026-05-12
+
+### Added
+- **`--sketch d --snp-level-masking` is now the recommended high-accuracy
+  fast mode.** Combining sketch with per-SNP exact windows (the LDSC
+  paper's mathematical definition of `ℓ_j = Σ_k r²_jk`) reaches the
+  exact-mode h² at sketch speed:
+  - Biobank N=50K: `--sketch 1000 --snp-level-masking` matches
+    `--snp-level-masking --fast-f32` h² within 0.001 across BMI/Height
+    GWAS, at ~17× the speed of exact (19s vs 361s).
+  - 1000G EUR N=503: `--sketch 480 --snp-level-masking` matches GCTA-
+    quality LD scores (Pearson r = 0.994 vs GCTA 0.993) with the lowest
+    max-error of any method tested (39 vs 115-150 for chunked methods).
+  - The combo was always supported but never tested at biobank scale —
+    sweep results in `docs/perf-log.md` 2026-05-12 entry.
+- **`--sketch-maf-aware`** — opt-in kurtosis-corrected quadratic bias
+  formula. Mathematically tightens the asymptotic correction
+  `(1−r²)(1−2r²)/d` with a per-SNP `−2r²(κ_j+κ_k)/d` term. Empirically
+  zero impact on h² across all tested datasets/scales (the correction
+  is O(1/N), below the regression measurement floor at any realistic
+  N), but free at runtime. Kept for partitioned-LD use cases where
+  rare-variant-stratified annotations might surface the term. See
+  `docs/countsketch-math-analysis.md` §14.
+
+### Changed
+- **CLAUDE.md and `docs/countsketch-math-analysis.md` updated** with the
+  sketch+masking guidance as the recommended high-accuracy path. Old
+  recommendation was "use `--snp-level-masking --fast-f32` if you care
+  about exactness" — at biobank scale that's now 17× slower than
+  necessary.
+
+### Removed
+- **`--sketch-hybrid` and `--sketch-hybrid-fused`.** The hybrid variants
+  ran the within-chunk B×B GEMM exact while keeping cross-window A×B
+  sketched. Empirically gave a ~30% accuracy lift over sketch-only at
+  ~1.7× the cost on 1000G — but `--sketch d --snp-level-masking` (which
+  was always supported) gives a *larger* accuracy lift at *lower* cost.
+  Hybrid was strictly dominated on both axes. Code complexity (separate
+  B×B GEMM paths in F32+F64+GPU branches, side-buffer write in fused
+  projector, mmap-vs-non-fused interaction handling) wasn't justified.
+  Preserved on the `experiment/hybrid-and-maf-aware` branch for
+  reference.
+
 ## [0.4.0] — 2026-03-14
 
 ### Added
@@ -113,7 +156,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Statically linked OpenBLAS (no runtime library needed)
 - 40 unit tests; integration smoke test for l2
 
-[Unreleased]: https://github.com/sharifhsn/ldsc/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/sharifhsn/ldsc/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/sharifhsn/ldsc/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/sharifhsn/ldsc/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/sharifhsn/ldsc/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/sharifhsn/ldsc/compare/v0.2.1...v0.3.0

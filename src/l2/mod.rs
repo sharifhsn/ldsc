@@ -335,7 +335,11 @@ pub fn run(args: L2Args) -> Result<()> {
     // (single sequential pass matching Python's cross-chr window bleeding), no
     // SNP-level masking (Python doesn't do it). clap already enforces conflict
     // with --snp-level-masking.
-    let chunk_c = if args.python_compat { 50 } else { args.chunk_size };
+    let chunk_c = if args.python_compat {
+        50
+    } else {
+        args.chunk_size
+    };
     let force_python_global_pass = args.python_compat && !args.global_pass;
     if args.python_compat {
         if args.chunk_size != 200 {
@@ -421,6 +425,7 @@ pub fn run(args: L2Args) -> Result<()> {
             use_f32,
             args.verbose_timing,
             args.sketch,
+            args.sketch_maf_aware,
             args.mmap,
             args.snp_level_masking,
         )
@@ -480,6 +485,7 @@ pub fn run(args: L2Args) -> Result<()> {
                     use_f32,
                     false, // verbose_timing disabled per-chr (noisy)
                     args.sketch,
+                    args.sketch_maf_aware,
                     args.mmap,
                     args.snp_level_masking,
                 )

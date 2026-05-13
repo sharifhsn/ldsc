@@ -101,6 +101,7 @@ if [ "$SKIP_BUILD" = false ]; then
     docker cp target/release/ldsc.musl ldsc-bench-assemble:/usr/local/bin/ldsc
     docker cp scripts/bench-entrypoint.sh ldsc-bench-assemble:/entrypoint.sh
     docker cp scripts/biobank-bench.sh ldsc-bench-assemble:/usr/local/bin/biobank-bench
+    docker cp scripts/biobank-dsweep.sh ldsc-bench-assemble:/usr/local/bin/biobank-dsweep
     docker commit \
         --change 'ENTRYPOINT ["/entrypoint.sh"]' \
         ldsc-bench-assemble "${PREFIX}:latest"

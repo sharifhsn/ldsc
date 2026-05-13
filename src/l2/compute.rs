@@ -362,6 +362,16 @@ struct BedByteStats {
     sum_sq: u8,
 }
 
+// Higher-moments LUT used by the MAF-aware bias correction path. Kept
+// separate from `BedByteStats` so the existing fast paths don't pay the
+// extra-load cost. Sum of G³ per byte ≤ 4·8 = 32 (fits u8). Sum of G⁴ per
+// byte ≤ 4·16 = 64 (fits u8).
+#[derive(Clone, Copy)]
+struct BedByteMoments {
+    sum_cube: u8,
+    sum_4th: u8,
+}
+
 fn build_bed_byte_lut() -> [BedByteStats; 256] {
     std::array::from_fn(|b| {
         let byte = b as u8;
@@ -457,6 +467,156 @@ fn snp_stats_from_bytes(
     }
 }
 
+/// Build the higher-moments LUT (sum of G³ and G⁴ per byte). G ∈ {0, 1, 2}:
+/// G³ values are {0, 1, 8}, G⁴ values are {0, 1, 16}.
+fn build_bed_byte_moments_lut() -> [BedByteMoments; 256] {
+    std::array::from_fn(|b| {
+        let byte = b as u8;
+        let (mut sum_cube, mut sum_4th) = (0u8, 0u8);
+        for k in 0..4 {
+            match (byte >> (2 * k)) & 0b11 {
+                0 => {
+                    sum_cube += 8;
+                    sum_4th += 16;
+                } // hom A1 = 2 → 2³=8, 2⁴=16
+                1 => {} // missing
+                2 => {
+                    sum_cube += 1;
+                    sum_4th += 1;
+                } // het = 1 → 1³=1, 1⁴=1
+                3 => {} // hom A2 = 0 → 0³=0, 0⁴=0
+                _ => {}
+            }
+        }
+        BedByteMoments { sum_cube, sum_4th }
+    })
+}
+
+/// Compute (sum_cube, sum_4th) of non-missing genotypes for one SNP. Parallels
+/// `snp_stats_from_bytes`. Only called when `--sketch-maf-aware` is active so
+/// the K=1 sketch path is byte-identical to the pre-MAF-aware code.
+fn snp_higher_moments_from_bytes(
+    snp_bytes: &[u8],
+    n_indiv: usize,
+    iid_positions: &[IidPos],
+    all_iids: bool,
+    moments_lut: &[BedByteMoments; 256],
+) -> (u32, u32) {
+    if all_iids {
+        let full_bytes = n_indiv / 4;
+        let rem = n_indiv % 4;
+        let (mut sum_cube, mut sum_4th) = (0u32, 0u32);
+        for &byte in &snp_bytes[..full_bytes] {
+            let m = moments_lut[byte as usize];
+            sum_cube += m.sum_cube as u32;
+            sum_4th += m.sum_4th as u32;
+        }
+        if rem > 0 {
+            let byte = snp_bytes[full_bytes];
+            for k in 0..rem {
+                match (byte >> (2 * k)) & 0b11 {
+                    0 => {
+                        sum_cube += 8;
+                        sum_4th += 16;
+                    }
+                    1 => {}
+                    2 => {
+                        sum_cube += 1;
+                        sum_4th += 1;
+                    }
+                    3 => {}
+                    _ => {}
+                }
+            }
+        }
+        (sum_cube, sum_4th)
+    } else {
+        let (mut sum_cube, mut sum_4th) = (0u32, 0u32);
+        for pos in iid_positions {
+            let byte = snp_bytes[pos.byte_idx];
+            match (byte >> pos.shift) & 0b11 {
+                0 => {
+                    sum_cube += 8;
+                    sum_4th += 16;
+                }
+                1 => {}
+                2 => {
+                    sum_cube += 1;
+                    sum_4th += 1;
+                }
+                3 => {}
+                _ => {}
+            }
+        }
+        (sum_cube, sum_4th)
+    }
+}
+
+/// Per-SNP kurtosis quantity `κ_j = K_jj / N² = (Σ_i X_ij⁴) / N²` where X_j is
+/// the standardized vector (mean-imputed at missing positions). Derived from
+/// raw moments via the centered-fourth-moment identity:
+///
+///   Σ (G − μ)⁴ = sum_4th − 4μ·sum_cube + 6μ²·sum_sq − 3μ⁴·count
+///
+/// (using `μ·count = sum` to fold the `−4μ³·sum + μ⁴·count` terms together).
+/// Standardization divides by σ⁴ where σ² = centered_ss/N (the normalize.rs
+/// convention), giving `K_jj = Σ(G-μ)⁴ × N² / centered_ss²` so
+/// `K_jj/N² = Σ(G-μ)⁴ / centered_ss²`. See `docs/countsketch-math-analysis.md` §14.
+#[inline]
+fn per_snp_kappa(sum: u32, count: u32, sum_sq: u32, sum_cube: u32, sum_4th: u32) -> f64 {
+    if count == 0 {
+        return 0.0;
+    }
+    let count_f = count as f64;
+    let mean = sum as f64 / count_f;
+    let m4 = sum_4th as f64 - 4.0 * mean * sum_cube as f64 + 6.0 * mean * mean * sum_sq as f64
+        - 3.0 * mean.powi(4) * count_f;
+    let centered_ss = sum_sq as f64 - count_f * mean * mean;
+    if centered_ss <= 0.0 {
+        return 0.0;
+    }
+    m4 / (centered_ss * centered_ss)
+}
+
+/// Per-SNP κ_j = K_jj/N² computed directly from a decoded f32 column (raw
+/// genotype values 0/1/2 with NaN for missing). Used in the non-fused sketch
+/// path where raw bytes have already been decoded into a matrix. The result
+/// matches `per_snp_kappa` byte-for-byte modulo f64 ordering. `mean` and
+/// `centered_ss` are the moments over non-NaN entries (i.e. `sum/count` and
+/// `sum_sq - count*mean²` from the existing stats pass).
+#[inline]
+fn per_snp_kappa_from_col_f32(col: &[f32], mean: f64, centered_ss: f64) -> f64 {
+    if centered_ss <= 0.0 {
+        return 0.0;
+    }
+    let mut m4 = 0.0f64;
+    for &v in col {
+        if !v.is_nan() {
+            let d = v as f64 - mean;
+            let d2 = d * d;
+            m4 += d2 * d2;
+        }
+    }
+    m4 / (centered_ss * centered_ss)
+}
+
+/// f64 counterpart of `per_snp_kappa_from_col_f32`.
+#[inline]
+fn per_snp_kappa_from_col_f64(col: &[f64], mean: f64, centered_ss: f64) -> f64 {
+    if centered_ss <= 0.0 {
+        return 0.0;
+    }
+    let mut m4 = 0.0f64;
+    for &v in col {
+        if !v.is_nan() {
+            let d = v - mean;
+            let d2 = d * d;
+            m4 += d2 * d2;
+        }
+    }
+    m4 / (centered_ss * centered_ss)
+}
+
 // ── Fused CountSketch: BED-decode-normalize-scatter-add ─────────────────────
 // Avoids materializing the full N×c intermediate matrix AND avoids any GEMM.
 // Pass 1: compute per-SNP stats (mean, inv_std, maf) from packed BED bytes.
@@ -475,7 +635,9 @@ fn snp_stats_from_bytes(
 /// independent, giving c-way parallelism (c=chunk_size, typically 200).
 ///
 /// On return, `out[0..d, 0..c]` contains the projected+renormalized columns,
-/// and `maf_out[0..c]` contains the per-SNP MAF.
+/// `maf_out[0..c]` contains the per-SNP MAF, and (when `kurt_out` is `Some`)
+/// `kurt_out[0..c]` contains the per-SNP kurtosis quantity κ_j = K_jj/N²
+/// used by the MAF-aware quadratic bias correction.
 #[allow(clippy::too_many_arguments)]
 fn countsketch_fused_project_f32(
     raw_bytes: &[u8],
@@ -487,16 +649,23 @@ fn countsketch_fused_project_f32(
     iid_positions: &[IidPos],
     all_iids: bool,
     maf_out: &mut [f64],
+    kurt_out: Option<&mut [f64]>,
     out: &mut MatF32,
 ) {
     let d = cs.d;
     let byte_lut = build_bed_byte_lut();
+    let moments_lut = if kurt_out.is_some() {
+        Some(build_bed_byte_moments_lut())
+    } else {
+        None
+    };
 
     // --- Pass 1: per-SNP statistics from packed bytes ---
     struct SnpStats {
         mean: f32,
         inv_std: f32,
         maf: f64,
+        kurt: f64,
     }
     let stats: Vec<SnpStats> = (0..c)
         .map(|j| {
@@ -518,16 +687,34 @@ fn countsketch_fused_project_f32(
             } else {
                 0.0f32
             };
+            let kurt = if let Some(ref m_lut) = moments_lut {
+                let (sum_cube, sum_4th) = snp_higher_moments_from_bytes(
+                    snp_bytes,
+                    n_indiv,
+                    iid_positions,
+                    all_iids,
+                    m_lut,
+                );
+                per_snp_kappa(sum, count, sum_sq, sum_cube, sum_4th)
+            } else {
+                0.0
+            };
             SnpStats {
                 mean: mean_f64 as f32,
                 inv_std,
                 maf,
+                kurt,
             }
         })
         .collect();
 
     for (j, s) in stats.iter().enumerate() {
         maf_out[j] = s.maf;
+    }
+    if let Some(kurt_slice) = kurt_out {
+        for (j, s) in stats.iter().enumerate() {
+            kurt_slice[j] = s.kurt;
+        }
     }
 
     // --- Pass 2: column-parallel fused decode + normalize + scatter-add ---
@@ -621,16 +808,23 @@ fn countsketch_fused_project_f64(
     iid_positions: &[IidPos],
     all_iids: bool,
     maf_out: &mut [f64],
+    kurt_out: Option<&mut [f64]>,
     out: &mut MatF,
 ) {
     let d = cs.d;
     let byte_lut = build_bed_byte_lut();
+    let moments_lut = if kurt_out.is_some() {
+        Some(build_bed_byte_moments_lut())
+    } else {
+        None
+    };
 
     // --- Pass 1: per-SNP statistics from packed bytes ---
     struct SnpStats {
         mean: f64,
         inv_std: f64,
         maf: f64,
+        kurt: f64,
     }
     let stats: Vec<SnpStats> = (0..c)
         .map(|j| {
@@ -648,12 +842,34 @@ fn countsketch_fused_project_f64(
             let var = centered_ss / n_indiv as f64;
             let std = var.sqrt();
             let inv_std = if std > 0.0 { 1.0 / std } else { 0.0 };
-            SnpStats { mean, inv_std, maf }
+            let kurt = if let Some(ref m_lut) = moments_lut {
+                let (sum_cube, sum_4th) = snp_higher_moments_from_bytes(
+                    snp_bytes,
+                    n_indiv,
+                    iid_positions,
+                    all_iids,
+                    m_lut,
+                );
+                per_snp_kappa(sum, count, sum_sq, sum_cube, sum_4th)
+            } else {
+                0.0
+            };
+            SnpStats {
+                mean,
+                inv_std,
+                maf,
+                kurt,
+            }
         })
         .collect();
 
     for (j, s) in stats.iter().enumerate() {
         maf_out[j] = s.maf;
+    }
+    if let Some(kurt_slice) = kurt_out {
+        for (j, s) in stats.iter().enumerate() {
+            kurt_slice[j] = s.kurt;
+        }
     }
 
     // --- Pass 2: column-parallel fused decode + normalize + scatter-add ---
@@ -771,6 +987,41 @@ pub(super) fn quadratic_sketch_correction(
     rsq_sketch * r2u_a + r2u_b
 }
 
+/// MAF-aware variant of `quadratic_sketch_correction`. The asymptotic Taylor
+/// derivation dropped a subleading term in `Var(B), Var(C)` involving the
+/// per-SNP kurtosis `κ_j = K_jj/N² = E[X_j⁴]/N`. Restoring it gives:
+///
+///   E[r̃²] − r² ≈ (1−r²)(1−2r²)/d − 2r²(κ_j + κ_k)/d
+///
+/// which inverts to the same quadratic with the linear coefficient shifted:
+///
+///   2r⁴ + (d − 3 − 2(κ_j + κ_k)) r² − (d·tilde_rsq − 1) = 0
+///
+/// Active only when `--sketch-maf-aware` is set. At biobank scale (N=50K) the
+/// kurtosis term is O(1/N) ≈ 10⁻⁵ to 10⁻³ depending on MAF, so the practical
+/// correction is small; the benchmark cross-product quantifies whether it's
+/// measurable. See `docs/countsketch-math-analysis.md` §14.
+#[inline(always)]
+pub(super) fn quadratic_sketch_correction_maf_aware(
+    val: f64,
+    n_inv_sq: f64,
+    d_f: f64,
+    r2u_a: f64,
+    r2u_b: f64,
+    kurt_j: f64,
+    kurt_k: f64,
+) -> f64 {
+    let tilde_rsq = val * val * n_inv_sq;
+    let dm3 = d_f - 3.0 - 2.0 * (kurt_j + kurt_k);
+    let disc = dm3 * dm3 + 8.0 * (d_f * tilde_rsq - 1.0);
+    let rsq_sketch = if disc >= 0.0 {
+        (-dm3 + disc.sqrt()) * 0.25
+    } else {
+        0.0
+    };
+    rsq_sketch * r2u_a + r2u_b
+}
+
 /// Compute LD scores for all SNPs. Returns `(l2, maf)`.
 #[allow(clippy::too_many_arguments, clippy::unnecessary_cast)]
 pub(super) fn compute_ldscore_global(
@@ -788,6 +1039,7 @@ pub(super) fn compute_ldscore_global(
     use_f32: bool,
     verbose_timing: bool,
     sketch: Option<usize>,
+    sketch_maf_aware: bool,
     use_mmap: bool,
     snp_level_masking: bool,
 ) -> Result<(MatF, Vec<f64>)> {
@@ -874,7 +1126,9 @@ pub(super) fn compute_ldscore_global(
                  (cost is essentially flat in d below the GEMM crossover)."
             );
         }
-        println!("Sketch mode: projecting N={n_indiv} → d={d} (CountSketch, quadratic bias correction)");
+        println!(
+            "Sketch mode: projecting N={n_indiv} → d={d} (CountSketch, quadratic bias correction)"
+        );
     } else {
         gemm_n = n_indiv;
         active_n_inv_sq_r2u_a = n_inv_sq_r2u_a;
@@ -891,6 +1145,15 @@ pub(super) fn compute_ldscore_global(
     let use_fused_sketch = sketch_dim.is_some();
 
     let mut maf_per_snp = vec![0.0f64; m];
+    // Per-SNP kurtosis κ_j = K_jj/N² (Σ_i X_ij⁴ / N²) for MAF-aware bias correction.
+    // Allocated only when --sketch-maf-aware is active; populated in the chunk loop
+    // stats pass and consumed at the fill_r2u sites. See compute.rs::per_snp_kappa
+    // and docs/countsketch-math-analysis.md §14.
+    let mut kurt_per_snp: Vec<f64> = if sketch_maf_aware && sketch_dim.is_some() {
+        vec![0.0f64; m]
+    } else {
+        Vec::new()
+    };
 
     let block_sizes: Vec<usize> = (0..m)
         .map(|i| {
@@ -1098,6 +1361,12 @@ pub(super) fn compute_ldscore_global(
             let ai = cr_ref.all_iids_flag();
             if let Some(ref cs) = count_sketch {
                 // Fused CountSketch: decode + normalize + scatter-add (no GEMM)
+                // Split borrows: maf and kurt are disjoint slices of the global vec(s)
+                let kurt_slice: Option<&mut [f64]> = if sketch_maf_aware {
+                    Some(&mut kurt_per_snp[chunk_start..chunk_start + c])
+                } else {
+                    None
+                };
                 match bufs {
                     GemmBufs::F32 { ref mut b_mat, .. } => {
                         countsketch_fused_project_f32(
@@ -1110,6 +1379,7 @@ pub(super) fn compute_ldscore_global(
                             &ipos,
                             ai,
                             &mut maf_per_snp[chunk_start..chunk_start + c],
+                            kurt_slice,
                             b_mat,
                         );
                     }
@@ -1124,6 +1394,7 @@ pub(super) fn compute_ldscore_global(
                             &ipos,
                             ai,
                             &mut maf_per_snp[chunk_start..chunk_start + c],
+                            kurt_slice,
                             b_mat,
                         );
                     }
@@ -1221,6 +1492,17 @@ pub(super) fn compute_ldscore_global(
                         } else {
                             (sum, n_indiv, sum_sq)
                         };
+                        // MAF-aware kurtosis: compute κ_j before normalization
+                        // (raw_col still holds 0/1/2/NaN). Cheap O(N) scan.
+                        if sketch_maf_aware && sketching {
+                            let mean_f64 = if count > 0 { sum / count as f64 } else { 0.0 };
+                            let centered_ss = sum_sq - count as f64 * mean_f64 * mean_f64;
+                            kurt_per_snp[chunk_start + j] = per_snp_kappa_from_col_f32(
+                                &raw_col[..n_indiv],
+                                mean_f64,
+                                centered_ss,
+                            );
+                        }
                         let snp_maf =
                             normalize_col_f32_with_stats(col, n_indiv, sum, count, sum_sq);
                         maf_per_snp[chunk_start + j] = snp_maf as f64;
@@ -1268,6 +1550,14 @@ pub(super) fn compute_ldscore_global(
                         } else {
                             (sum, n_indiv, sum_sq)
                         };
+                        // MAF-aware kurtosis: compute κ_j before normalization
+                        // (col still holds 0/1/2/NaN as f64 from the widening copy).
+                        if sketch_maf_aware && sketching {
+                            let mean_f64 = if count > 0 { sum / count as f64 } else { 0.0 };
+                            let centered_ss = sum_sq - count as f64 * mean_f64 * mean_f64;
+                            kurt_per_snp[chunk_start + j] =
+                                per_snp_kappa_from_col_f64(&col[..n_indiv], mean_f64, centered_ss);
+                        }
                         let snp_maf =
                             normalize_col_f64_with_stats(col, n_indiv, sum, count, sum_sq);
                         maf_per_snp[chunk_start + j] = snp_maf;
@@ -1345,9 +1635,11 @@ pub(super) fn compute_ldscore_global(
             // Inline helper: fill r2u_bb from bb matrix values.
             // Generic over closure to avoid dyn dispatch in inner loop.
             // The `apply_correction` closure encodes the per-pair correction
-            // (fused linear or quadratic inversion + LDSC unbiased).
+            // (fused linear or quadratic inversion + LDSC unbiased). Indices
+            // `(k, j)` are passed through so the MAF-aware correction can look
+            // up per-SNP κ for both members of the pair.
             #[inline(always)]
-            fn fill_r2u_bb_from<F: Fn(usize, usize) -> f64, G: Fn(f64) -> f64>(
+            fn fill_r2u_bb_from<F: Fn(usize, usize) -> f64, G: Fn(usize, usize, f64) -> f64>(
                 r2u_bb: &mut MatF,
                 c: usize,
                 bb_val: F,
@@ -1363,7 +1655,7 @@ pub(super) fn compute_ldscore_global(
                     r2u_bb[(j, j)] = 1.0;
                     for k in 0..j {
                         let val = bb_val(k, j);
-                        let r2u = apply_correction(val);
+                        let r2u = apply_correction(k, j, val);
                         r2u_bb[(j, k)] = r2u;
                         r2u_bb[(k, j)] = r2u;
                     }
@@ -1413,22 +1705,42 @@ pub(super) fn compute_ldscore_global(
                         );
                     }
                     if sketch_dim.is_some() {
-                        fill_r2u_bb_from(
-                            &mut r2u_bb,
-                            c,
-                            |k, j| bb_f32[(k, j)] as f64,
-                            |val| {
-                                quadratic_sketch_correction(
-                                    val, n_inv_sq, quad_d_f, r2u_a, r2u_b,
-                                )
-                            },
-                        );
+                        if sketch_maf_aware {
+                            let kp = &kurt_per_snp;
+                            fill_r2u_bb_from(
+                                &mut r2u_bb,
+                                c,
+                                |k, j| bb_f32[(k, j)] as f64,
+                                |k, j, val| {
+                                    quadratic_sketch_correction_maf_aware(
+                                        val,
+                                        n_inv_sq,
+                                        quad_d_f,
+                                        r2u_a,
+                                        r2u_b,
+                                        kp[chunk_start + j],
+                                        kp[chunk_start + k],
+                                    )
+                                },
+                            );
+                        } else {
+                            fill_r2u_bb_from(
+                                &mut r2u_bb,
+                                c,
+                                |k, j| bb_f32[(k, j)] as f64,
+                                |_k, _j, val| {
+                                    quadratic_sketch_correction(
+                                        val, n_inv_sq, quad_d_f, r2u_a, r2u_b,
+                                    )
+                                },
+                            );
+                        }
                     } else {
                         fill_r2u_bb_from(
                             &mut r2u_bb,
                             c,
                             |k, j| bb_f32[(k, j)] as f64,
-                            |val| val * val * active_n_inv_sq_r2u_a + active_r2u_b,
+                            |_k, _j, val| val * val * active_n_inv_sq_r2u_a + active_r2u_b,
                         );
                     }
                 }
@@ -1494,22 +1806,42 @@ pub(super) fn compute_ldscore_global(
                         );
                     }
                     if sketch_dim.is_some() {
-                        fill_r2u_bb_from(
-                            &mut r2u_bb,
-                            c,
-                            |k, j| bb_f64[(k, j)],
-                            |val| {
-                                quadratic_sketch_correction(
-                                    val, n_inv_sq, quad_d_f, r2u_a, r2u_b,
-                                )
-                            },
-                        );
+                        if sketch_maf_aware {
+                            let kp = &kurt_per_snp;
+                            fill_r2u_bb_from(
+                                &mut r2u_bb,
+                                c,
+                                |k, j| bb_f64[(k, j)],
+                                |k, j, val| {
+                                    quadratic_sketch_correction_maf_aware(
+                                        val,
+                                        n_inv_sq,
+                                        quad_d_f,
+                                        r2u_a,
+                                        r2u_b,
+                                        kp[chunk_start + j],
+                                        kp[chunk_start + k],
+                                    )
+                                },
+                            );
+                        } else {
+                            fill_r2u_bb_from(
+                                &mut r2u_bb,
+                                c,
+                                |k, j| bb_f64[(k, j)],
+                                |_k, _j, val| {
+                                    quadratic_sketch_correction(
+                                        val, n_inv_sq, quad_d_f, r2u_a, r2u_b,
+                                    )
+                                },
+                            );
+                        }
                     } else {
                         fill_r2u_bb_from(
                             &mut r2u_bb,
                             c,
                             |k, j| bb_f64[(k, j)],
-                            |val| val * val * active_n_inv_sq_r2u_a + active_r2u_b,
+                            |_k, _j, val| val * val * active_n_inv_sq_r2u_a + active_r2u_b,
                         );
                     }
                 }
@@ -1685,10 +2017,32 @@ pub(super) fn compute_ldscore_global(
                         // Column-major inner loop with column slices: eliminates faer
                         // tuple-indexing bounds checks (~8.3B checks for full genome).
                         // Branch on sketch mode once outside the inner loop.
-                        if sketch_dim.is_some() {
+                        if sketch_dim.is_some() && sketch_maf_aware {
+                            // Precompute per-window-row κ_wi for cache-friendliness.
+                            let kurt_a: Vec<f64> = window
+                                .iter()
+                                .map(|&(g_idx, _)| kurt_per_snp[g_idx])
+                                .collect();
                             for j in 0..c {
-                                let ab_col =
-                                    ab_view.col(j).try_as_col_major().unwrap().as_slice();
+                                let kurt_b_j = kurt_per_snp[chunk_start + j];
+                                let ab_col = ab_view.col(j).try_as_col_major().unwrap().as_slice();
+                                let r2u_col = r2u_ab
+                                    .col_mut(j)
+                                    .try_as_col_major_mut()
+                                    .unwrap()
+                                    .as_slice_mut();
+                                for (wi, (ab_val, r2u_val)) in
+                                    ab_col[..w].iter().zip(r2u_col[..w].iter_mut()).enumerate()
+                                {
+                                    let val = *ab_val as f64;
+                                    *r2u_val = quadratic_sketch_correction_maf_aware(
+                                        val, n_inv_sq, quad_d_f, r2u_a, r2u_b, kurt_a[wi], kurt_b_j,
+                                    );
+                                }
+                            }
+                        } else if sketch_dim.is_some() {
+                            for j in 0..c {
+                                let ab_col = ab_view.col(j).try_as_col_major().unwrap().as_slice();
                                 let r2u_col = r2u_ab
                                     .col_mut(j)
                                     .try_as_col_major_mut()
@@ -1705,8 +2059,7 @@ pub(super) fn compute_ldscore_global(
                             }
                         } else {
                             for j in 0..c {
-                                let ab_col =
-                                    ab_view.col(j).try_as_col_major().unwrap().as_slice();
+                                let ab_col = ab_view.col(j).try_as_col_major().unwrap().as_slice();
                                 let r2u_col = r2u_ab
                                     .col_mut(j)
                                     .try_as_col_major_mut()
@@ -1824,10 +2177,31 @@ pub(super) fn compute_ldscore_global(
                         let ab_view = mat_slice(ab_buf.as_ref(), 0..w, 0..c);
                         // Column-major inner loop with column slices: eliminates faer
                         // tuple-indexing bounds checks. Branch on sketch mode once.
-                        if sketch_dim.is_some() {
+                        if sketch_dim.is_some() && sketch_maf_aware {
+                            let kurt_a: Vec<f64> = window
+                                .iter()
+                                .map(|&(g_idx, _)| kurt_per_snp[g_idx])
+                                .collect();
                             for j in 0..c {
-                                let ab_col =
-                                    ab_view.col(j).try_as_col_major().unwrap().as_slice();
+                                let kurt_b_j = kurt_per_snp[chunk_start + j];
+                                let ab_col = ab_view.col(j).try_as_col_major().unwrap().as_slice();
+                                let r2u_col = r2u_ab
+                                    .col_mut(j)
+                                    .try_as_col_major_mut()
+                                    .unwrap()
+                                    .as_slice_mut();
+                                for (wi, (ab_val, r2u_val)) in
+                                    ab_col[..w].iter().zip(r2u_col[..w].iter_mut()).enumerate()
+                                {
+                                    *r2u_val = quadratic_sketch_correction_maf_aware(
+                                        *ab_val, n_inv_sq, quad_d_f, r2u_a, r2u_b, kurt_a[wi],
+                                        kurt_b_j,
+                                    );
+                                }
+                            }
+                        } else if sketch_dim.is_some() {
+                            for j in 0..c {
+                                let ab_col = ab_view.col(j).try_as_col_major().unwrap().as_slice();
                                 let r2u_col = r2u_ab
                                     .col_mut(j)
                                     .try_as_col_major_mut()
@@ -1843,8 +2217,7 @@ pub(super) fn compute_ldscore_global(
                             }
                         } else {
                             for j in 0..c {
-                                let ab_col =
-                                    ab_view.col(j).try_as_col_major().unwrap().as_slice();
+                                let ab_col = ab_view.col(j).try_as_col_major().unwrap().as_slice();
                                 let r2u_col = r2u_ab
                                     .col_mut(j)
                                     .try_as_col_major_mut()

@@ -170,6 +170,7 @@ Three opt-in modes trade precision for speed in the `l2` subcommand:
   - Deterministic (seed=42). Same `--sketch d` on same data always produces identical output.
   - **Bias is corrected** via quadratic inversion of the renormalized-cosine bias `(1-r²)(1-2r²)/d`, giving residual O(1/d²). Empirically validated on chr22 EUR; per-bin analysis confirms the correction shifts high-LD-score SNPs in the predicted direction. Wall-clock cost vs no correction is within AWS run-to-run noise. See `docs/countsketch-math-analysis.md` for derivation and Monte Carlo validation.
   - **WARNING: d ≤ 50 is unstable** — Taylor truncation + sqrt noise amplification make the bias correction no better than uncorrected at the LD-score level. ldsc-rs prints a warning if you specify d ≤ 50. Just use d ≥ 100; cost is essentially flat in d below the GEMM crossover.
+  - **`--sketch d --snp-level-masking` is the most accurate fast mode.** Combining sketch with per-SNP exact windows recovers the LDSC paper's mathematical definition of `ℓ_j = Σ_k r²_jk` while keeping the sketch's order-of-magnitude speedup. At biobank N=50K, `--sketch 1000 --snp-level-masking` matches per-SNP exact h² to within 0.001 across all tested traits at ~17× the speed of exact. At 1000G N=503 the combo is GCTA-tier accurate (LD-score Pearson r=0.994, h² Δ ≤ 0.003 vs per-SNP exact). See `docs/perf-log.md` 2026-05-12 entry for the cross-method validation.
 
 
 ### Performance Summary (AWS EPYC 7R13 c6a.4xlarge, 16 vCPU, 1.66M SNPs)

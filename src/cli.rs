@@ -337,6 +337,18 @@ pub struct L2Args {
     #[arg(long, value_name = "DIM", conflicts_with = "gpu")]
     pub sketch: Option<usize>,
 
+    /// MAF-aware bias correction: extend `quadratic_sketch_correction` with
+    /// a per-SNP kurtosis term (κ_j = K_jj/N² = E[X_j⁴]/N) to invert the
+    /// kurtosis-corrected bias `(1−r²)(1−2r²)/d − 2r²(κ_j+κ_k)/d` instead
+    /// of the asymptotic `(1−r²)(1−2r²)/d`. Adds one byte-level moments
+    /// pass during stats collection (~free) and ~3 flops per pair in the
+    /// correction (~free). At biobank scale the correction is O(1/N) ≈ 10⁻⁵
+    /// to 10⁻³ depending on MAF; benchmark to quantify whether it's
+    /// measurable. See `docs/countsketch-math-analysis.md` §14. Requires
+    /// `--sketch`.
+    #[arg(long, requires = "sketch")]
+    pub sketch_maf_aware: bool,
+
     /// Print per-section timing breakdown to stderr.
     #[arg(long)]
     pub verbose_timing: bool,

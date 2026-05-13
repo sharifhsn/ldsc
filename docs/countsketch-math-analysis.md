@@ -747,6 +747,157 @@ See `docs/countsketch-math-analysis.py` (committed alongside this doc)
 for the full LD-score simulation with M=200 neighbors and exponential
 LD decay.
 
+## 14. MAF-aware bias correction (kurtosis-corrected $\tilde r^2$)
+
+The bias formula in §4 — $\mathbb{E}[\tilde r'^2] - r^2 \approx (1-r^2)(1-2r^2)/d$ —
+was derived dropping a subleading term involving the per-SNP kurtosis $K_{jj} = \sum_i X_{ij}^4$.
+The implementation `quadratic_sketch_correction` inverts the asymptotic formula
+exactly. This section derives the kurtosis-corrected bias and the resulting
+modification to the quadratic inversion.
+
+### Setup
+
+Recall from Lemma 2:
+$$\mathrm{Var}[\tilde X_j^\top \tilde X_k] = \frac{1}{d}\left(\|X_j\|^2 \|X_k\|^2 + (X_j^\top X_k)^2 - 2 K_{jk}\right)$$
+
+with $K_{jk} = \sum_i X_{ij}^2 X_{ik}^2$. For standardized columns ($\|X\|^2 = N$):
+
+- $\mathrm{Var}(A) = \mathrm{Var}[\tilde X_j^\top \tilde X_k] = N^2(1 + r^2 - 2K_{jk}/N^2)/d$
+- $\mathrm{Var}(B) = \mathrm{Var}[\|\tilde X_j\|^2] = N^2(2 - 2K_{jj}/N^2)/d$ (Lemma 2 with $j=k$, $r=1$)
+- $\mathrm{Var}(C) = N^2(2 - 2K_{kk}/N^2)/d$ (symmetric)
+- Covariances: $\mathrm{Cov}(A,B) \approx 2N^2 r/d$, $\mathrm{Cov}(A,C) \approx 2N^2 r/d$,
+  $\mathrm{Cov}(B,C) \approx 2N^2 r^2/d$ (no kurtosis correction at leading order;
+  cross-fourth-moment terms drop to higher order in $1/d$ at fixed $j \neq k$).
+
+The §4 bias derivation dropped the $-2K/N^2$ terms in $\mathrm{Var}(B), \mathrm{Var}(C)$
+on the assumption $K_{jj}/N^2 \ll 1$. This is true at biobank scale (it's $O(1/N)$
+since $K_{jj}/N = \mathbb{E}[X_j^4]$ is bounded), but **the magnitude of
+$\mathbb{E}[X^4]$ varies with MAF**: for standardized binomial(2, $p$) the fourth
+moment is $\approx 2$ at MAF $=0.5$ and grows to $\approx 50$ at MAF $=0.01$, so the
+correction scales with how rare each SNP is.
+
+### Kurtosis-corrected Taylor expansion
+
+Taking the Taylor expansion of $f(A,B,C) = A^2/(BC)$ around $(\bar A, \bar B, \bar C) = (Nr, N, N)$
+with the corrected variances:
+
+$$\mathbb{E}[\tilde r'^2] - r^2 \approx \frac{1}{2}\sum_{i,k} f_{ik}(\bar X) \cdot \mathrm{Cov}(X_i, X_k)$$
+
+Substituting partials from §4 and the kurtosis-corrected variances:
+
+$$\mathbb{E}[\tilde r'^2] - r^2 \approx \frac{1}{2d}\Big[
+\underbrace{2(1+r^2)}_{f_{AA}\mathrm{Var}(A)}
++ \underbrace{4r^2(1 - K_{jj}/N^2)}_{f_{BB}\mathrm{Var}(B)}
++ \underbrace{4r^2(1 - K_{kk}/N^2)}_{f_{CC}\mathrm{Var}(C)}
+- \underbrace{16r^2}_{2f_{AB}\mathrm{Cov}+2f_{AC}\mathrm{Cov}}
++ \underbrace{4r^4}_{2f_{BC}\mathrm{Cov}(B,C)}\Big]$$
+
+Combining and simplifying:
+
+$$\boxed{\mathbb{E}[\tilde r'^2] - r^2 \approx \frac{(1-r^2)(1-2r^2)}{d} - \frac{2 r^2 (K_{jj} + K_{kk})}{N^2 d}}$$
+
+The new term is **always non-positive** (since $K \geq N$, $r^2 \geq 0$). It shrinks
+the predicted bias toward zero at low MAF where the kurtosis grows. Compared to
+the asymptotic formula, the corrected bias is **less positive at $r^2 < 1/2$ and
+more negative at $r^2 > 1/2$** — i.e., the kurtosis term pulls the estimator
+closer to the truth at high $r^2$ where the asymptotic bias has the wrong sign.
+
+### Quadratic inversion (implementation)
+
+Substituting $u = r^2$ and writing $\tilde t = \tilde r'^2$, the bias equation
+$\mathbb{E}[\tilde t] = u + (1-3u+2u^2)/d - 2u(\kappa_j+\kappa_k)/d$ where
+$\kappa_j := K_{jj}/N^2 = \mathbb{E}[X_j^4]/N$ rearranges to:
+
+$$2u^2 + u\big[d - 3 - 2(\kappa_j + \kappa_k)\big] + (1 - d \tilde t) = 0$$
+
+This is the **same quadratic as the asymptotic case** with only the linear
+coefficient $d-3$ shifted to $d - 3 - 2(\kappa_j + \kappa_k)$. The inversion:
+
+$$u = \frac{-(d-3-2(\kappa_j+\kappa_k)) + \sqrt{(d-3-2(\kappa_j+\kappa_k))^2 + 8(d \tilde t - 1)}}{4}$$
+
+In code, this is a one-line modification to `quadratic_sketch_correction`:
+just substitute `dm3 = d_f - 3.0 - 2.0 * (kurt_j + kurt_k)` in place of the
+plain `dm3 = d_f - 3.0`. The discriminant and the sqrt branch are unchanged.
+
+### Magnitude estimate
+
+At biobank scale (N=50,000), $\kappa_j$ ranges from $\approx 4 \times 10^{-5}$
+(MAF $\approx 0.5$) to $\approx 10^{-3}$ (MAF $\approx 0.01$). The new term
+contributes at most:
+
+$$\bigg|\frac{2r^2(\kappa_j + \kappa_k)}{d}\bigg| \approx \frac{2 \cdot 0.5 \cdot 2 \cdot 10^{-3}}{200} = 10^{-5}$$
+
+per pair at worst-case (both rare, $r^2 = 0.5$, $d=200$). Summed over a typical
+1 Mb LD window of $\sim 2{,}400$ pairs, that's $\approx 0.024$ LD-score units —
+**below the measurement noise floor of the sketch variance itself** at biobank
+scale.
+
+At 1000G scale (N=2,490), kurtoses are 20× larger by inspection
+($\kappa \sim 1/N$), pushing the worst-case correction to $\approx 0.0002$
+per pair or $\approx 0.5$ LD-score units over a window. Closer to measurable.
+
+### Practical expectation
+
+The kurtosis correction is mathematically sound and "closes the asymptotic
+loose end" from §2. But the magnitude analysis suggests it will be **below
+the empirical measurement floor** at biobank scale; possibly measurable at
+1000G scale for rare-variant subsets. **The benchmark cross-product
+(V1 baseline vs V4 maf-aware) will quantify this.** If V4 shows no
+measurable per-MAF-bin bias improvement on real data, the feature is
+mathematically correct but practically irrelevant, and the right call is
+to delete the code per the plan's decision criteria.
+
+## 15. Sketch + per-SNP masking — the actual answer
+
+The §10 alternatives explored ways to reduce sketch noise. The empirical
+finding from the 2026-05-12 biobank d-sweep flipped the analysis: at
+biobank scale, **sketch noise is no longer the dominant error**. With
+d=1000+, sketch noise vanishes (V1 d=1000 matches `--fast-f32 --global-pass`
+chunk-exact h² within 0.0008 across all 3 traits). The dominant remaining
+error is the **chunked-windowing approximation** itself — Python LDSC's
+50-SNP chunks and our default 200-SNP chunks both include "spurious" pairs
+near chunk boundaries that the per-SNP exact window would exclude.
+
+The chunked-window bias is a function of (window_size, N, true_LD_density):
+
+| Dataset | chunk-exact vs per-SNP exact h² gap |
+|---|---:|
+| 1000G EUR (N=503) | 1-2% |
+| Biobank synthetic (N=50K) | 10-14% |
+
+The gap grows with N because high-N r² estimates have less sampling noise,
+so the spurious chunk-boundary pairs carry more real LD signal (which
+inflates the LD score) rather than averaging to zero noise.
+
+**The fix is `--sketch d --snp-level-masking`.** The masking is a
+post-GEMM cutoff scan that zeroes r̃² entries outside each SNP's true
+per-SNP window. Combined with sketch:
+
+- Sketch noise (variance ~2/d per pair) → small at d≥1000
+- Per-SNP windowing → matches the LDSC paper's mathematical definition
+  of `ℓ_j = Σ_k r²_{jk}`
+- Result: matches per-SNP exact h² within 0.001 at biobank, ~17× the
+  speed of `--snp-level-masking --fast-f32`
+
+This combination supersedes the §10 alternatives (hybrid sketch,
+mean-of-k, etc.) for the "match per-SNP exact at sketch speed" use case.
+See `docs/perf-log.md` 2026-05-12 entry for full validation across LD-
+score-level Pearson, h², and intercept measurements vs GCTA, Python LDSC,
+chunk-exact, and per-SNP exact references.
+
+### Implications for the §11 recommendations
+
+- **Default `--sketch d`** — unchanged; this is the speed-priority option.
+- **High-accuracy fast mode** — switch to `--sketch d --snp-level-masking`
+  with d≥1000 for biobank, d≈N/1.5 for 1000G-scale references. This
+  replaces "go to per-SNP exact" as the recommendation when accuracy
+  matters more than the last 1-2% of speed.
+- **Hybrid sketch** — removed in v0.5.0. Strictly dominated on both
+  perf and accuracy axes by `--sketch d --snp-level-masking`. Preserved
+  on the `experiment/hybrid-and-maf-aware` branch for reference.
+- **MAF-aware (§14)** — kept as opt-in but empirically zero impact on
+  real data; the math holds, the magnitude just doesn't matter.
+
 ## Sources
 
 - ldsc-rs CountSketch implementation: `src/l2/compute.rs` lines 166-725

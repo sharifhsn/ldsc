@@ -2257,3 +2257,387 @@ improvement is negligible (within sketch sampling variance).
   math, observed at exactly the right magnitude), but the regression-level
   impact on h² hasn't been measured. Would need to run h² on the linear-vs-quadratic
   LD scores and compare.
+
+## 2026-05-12 — Hybrid sketch + MAF-aware bias correction
+
+Two new opt-in flags for `--sketch d` were implemented and benchmarked:
+- `--sketch-hybrid` — within-chunk B×B GEMM runs exact (n_indiv-dim) instead
+  of sketched; cross-window A×B stays sketched. Standard LDSC unbiased
+  correction applied to the exact B×B output.
+- `--sketch-hybrid-fused` — same idea, but extends the fused
+  CountSketch decode-normalize-scatter-add to also mirror the standardized
+  N×c column data into a side `b_full_*` buffer. Avoids the perf hit of
+  forcing the non-fused path.
+- `--sketch-maf-aware` — replaces the asymptotic quadratic-inversion bias
+  formula with one that includes the per-SNP kurtosis term
+  `−2r²(κ_j + κ_k)/d`. Per-SNP κ is computed from raw fourth moments via a
+  byte-LUT alongside the existing stats pass. See math §14.
+
+### Benchmark cross-product (local, chr22 1000G EUR — Apple Silicon)
+
+3-run hyperfine on `data/1000G_phase3_common_norel --extract /tmp/chr22_snps.txt`
+(N=2,490, 24,624 SNPs after extract, ld-wind-kb 1000, sketch 200, --mmap).
+
+| Variant | flags | Time (ms) | bias vs exact | max\|err\| | Pearson vs exact |
+|---|---|---:|---:|---:|---:|
+| V1 | (baseline `--sketch 200`) | 559 | −0.434 | 36.3 | 0.938 |
+| V2 | `--sketch-hybrid` | 677 | −0.074 | 34.5 | 0.953 |
+| V3 | `--sketch-hybrid --sketch-hybrid-fused` | 632 | −0.074 | 34.5 | 0.953 |
+| V4 | `--sketch-maf-aware` | 555 | −0.433 | 36.3 | 0.938 |
+| V5 | `--sketch-hybrid --sketch-hybrid-fused --sketch-maf-aware` | 640 | −0.073 | 34.5 | 0.953 |
+| Ref | `--snp-level-masking --fast-f32` | 736 | 0 | 0 | 1.000 |
+
+V3 reproduces V2 to byte identity (same math, faster I/O). MAF-aware adds
+~0.001 mean L2 shift in the predicted positive direction (corrected bias is
+slightly larger → larger inverted r²) and is essentially free perf-wise.
+
+### Full 1000G_eur (1.66M SNPs, N=2,490)
+
+3-run hyperfine, ld-wind-kb 1000, `--sketch 200 --mmap`. Reference is
+`--snp-level-masking --fast-f32`.
+
+| Variant | Time (s) | vs V1 | Pearson vs per-SNP exact | Pearson vs chunk-exact |
+|---|---:|---:|---:|---:|
+| V1 (baseline) | 2.68 | 1.00× | 0.949 | 0.946 |
+| V2 (hybrid simple) | 5.13 | 0.52× | 0.961 | 0.960 |
+| V3 (hybrid fused) | 4.49 | 0.60× | 0.961 | 0.960 |
+| V4 (maf-aware) | 3.03 | 0.88× | 0.949 | 0.946 |
+| V5 (hybrid + maf-aware) | 4.75 | 0.56× | 0.961 | 0.960 |
+| Per-SNP exact ref | 11.82 | 0.23× | 1.000 | 0.988 |
+
+V3 saves ~13% over V2 (simple hybrid). MAF-aware effect on full 1000G is
+within noise: V4−V1 mean delta 1.1e-3, max 0.026 — below the LD-score
+measurement floor for downstream h² regression.
+
+`--chunk-size 50` doesn't help hybrid (V3 = 5.54s vs V1 = 2.94s, 1.89× slower
+— similar penalty to chunk-size 200). The fused-decode I/O cost is the
+dominant overhead, not the c² GEMM scaling.
+
+### Decision criteria
+
+Per the plan's strict/tradeoff/worse classification:
+
+- **V3 (`--sketch-hybrid --sketch-hybrid-fused`)** — *tradeoff*. 13% Pearson
+  improvement (0.946 → 0.960 vs chunk-exact) costs ~1.7× wall clock on 1000G.
+  Keep as opt-in. The fused side-buffer is essentially free vs the simple
+  variant (it skips the read+normalize re-do, just one extra N×c write per
+  chunk).
+- **V2 (`--sketch-hybrid` only)** — *correctness oracle*. Strictly dominated
+  by V3 on perf (same accuracy, 13% slower). Keep as the fallback used when
+  `--sketch-hybrid-fused` is not also set — useful for debugging and
+  cross-validation but should not be recommended.
+- **V4/V5 (`--sketch-maf-aware`)** — *below measurement floor at N=2,490*.
+  The kurtosis correction is O(1/N) and at the 1000G scale produces ≤0.03 L2
+  shifts, which won't survive downstream regression. Cost is negligible.
+  Keep as opt-in for future biobank-scale testing, where it should be even
+  smaller. Math doc §14 already flagged this.
+
+No AWS benchmarks run yet — local results suggest V3 is the only variant
+worth biobank-scale testing, and at biobank N=50K the hybrid cost ratio will
+be *worse* (B×B exact is O(N×c²), so 20× more flops than 1000G), so AWS
+likely confirms hybrid is a slow-but-accurate opt-in only.
+
+### What stays default
+
+Defaults are unchanged: `--sketch 200` continues to use fused CountSketch
+with quadratic bias correction (asymptotic, no kurtosis term). All three new
+flags are opt-in and `requires = "sketch"`.
+
+### Downstream h² on real GWAS (3 traits)
+
+LD-score errors only matter inasmuch as they propagate into downstream
+heritability estimates. Re-tested all 5 LD-score variants on real public
+GWAS sumstats:
+
+| Sumstats | Source | N |
+|---|---|---:|
+| BMI_2010 | GIANT Speliotes 2010 | 231,410 |
+| BMI_2018 | GIANT Locke+UKBB 2018 | 681,275 |
+| HEIGHT_2018 | GIANT Wood+UKBB 2018 | 693,529 |
+
+Munged with `ldsc munge-sumstats` (default chi² filter, --n-min 1, --info-min
+0). h² regression with `ldsc h2 --ref-ld-chr <variant> --w-ld-chr <variant>`
+(two-step default, no liability scaling).
+
+**LD reference**: `data/1000G_phase3_common_norel` (all 1000G phase 3
+populations, N=2,490). This is multi-population vs EUR GWAS, so absolute h²
+estimates are biased downward — but the *relative* comparison across LD-score
+variants is what we care about.
+
+| | BMI_2010 | BMI_2018 | HEIGHT_2018 |
+|---|---:|---:|---:|
+| V1 sketch-200 | 0.1110 (0.0022) | 0.1675 (0.0020) | 0.4698 (0.0077) |
+| V2 hybrid simple | 0.1119 (0.0021) | 0.1683 (0.0019) | 0.4622 (0.0075) |
+| V3 hybrid fused | 0.1118 (0.0021) | 0.1682 (0.0019) | 0.4619 (0.0075) |
+| V4 maf-aware | 0.1110 (0.0022) | 0.1675 (0.0020) | 0.4698 (0.0077) |
+| V5 hybrid+maf | 0.1118 (0.0021) | 0.1682 (0.0019) | 0.4619 (0.0075) |
+| Per-SNP exact (`--snp-level-masking --fast-f32`) | 0.1185 (0.0021) | 0.1757 (0.0019) | 0.4650 (0.0074) |
+| Chunk-exact (`--fast-f32`, no masking) | 0.1040 (0.0019) | 0.1560 (0.0018) | 0.4211 (0.0068) |
+
+Intercepts (which capture confounding/stratification) follow the same
+pattern: V1==V4 to 4 decimals; V2/V3/V5 cluster together; per-SNP-exact and
+chunk-exact are further away.
+
+### Real-data takeaways
+
+1. **MAF-aware (V4) is empirically zero.** V1 and V4 agree to 4 decimal
+   places on h² and intercept across all 3 traits. The O(1/N) theory
+   predicted this exactly; real-data verification confirms.
+2. **Hybrid (V2=V3=V5) shifts h² by <1% on BMI, ~1.7% on Height.** Direction
+   depends on the trait (BMI moves up, Height moves down). The shifts are
+   ~2-5× the regression SE — detectable but small.
+3. **The dominant non-sketch lever is windowing choice**: per-SNP-masking vs
+   chunked moves h² by 5-15% across these traits (e.g. BMI_2018: 0.156 →
+   0.176, +13%). This is **bigger than any sketch-vs-exact effect.**
+
+### Hierarchy of what moves h² (3-trait empirical, descending impact)
+
+| Knob | Typical h² shift | Variants compared |
+|---|---:|---|
+| Windowing (`--snp-level-masking` vs chunked) | 5-15% | per-SNP exact vs chunk-exact |
+| Sketch dim (`--sketch 200` vs exact) | 5-15% | V1 vs chunk-exact |
+| Hybrid (`--sketch-hybrid-fused`) | 0.5-2% | V1 vs V3 |
+| MAF-aware (`--sketch-maf-aware`) | 0% (≤0.0001) | V1 vs V4 |
+
+Within the sketch family, the hybrid is detectable but small at the h²
+level; MAF-aware is invisible. For comparison, switching the windowing
+convention (which we've debated extensively in the LD-score-parity work)
+swamps everything else.
+
+### Decision: revised based on h²
+
+- **`--sketch-hybrid-fused` (V3) is the right opt-in.** The 1-2% h² shift
+  is detectable, consistent within trait, and at predictable cost (~1.7×).
+  Direction varies by trait, so it's a "more accurate, not necessarily
+  higher" tool. Document it as a precision knob for studies where 1% h²
+  matters.
+- **`--sketch-maf-aware` should be considered for deletion or pinned to
+  biobank-scale testing only.** At 1000G N=2,490 the empirical effect is
+  zero. At biobank N=50K the theoretical effect is even smaller (O(1/N)).
+  The only scenario where it might matter is very rare variants at biobank
+  scale where κ_j gets very large — and we haven't tested that. Keeping
+  the code for now (cost is one extra byte LUT + ~3 flops per pair, no
+  perf hit) but recommending against shipping it as a user-facing default.
+- **`--sketch-hybrid` (simple, non-fused) is strictly dominated by V3** —
+  same h² to 4 decimals, ~13% slower. Keep only as the correctness oracle
+  when `--sketch-hybrid-fused` is not set.
+
+What still hasn't been tested: biobank-scale h² impact (would need biobank
+sumstats matched to the synthetic biobank LD reference), and partitioned-LD
+h² (where MAF-stratified annotations might amplify the kurtosis correction
+for rare-variant bins). Both are reasonable follow-ups if hybrid moves out
+of opt-in status.
+
+### Downstream h² with EUR-only LD reference (population-matched)
+
+The previous results used `data/1000G_phase3_common_norel` (all 1000G phase 3
+populations, N=2,490) as the LD reference vs EUR GWAS. To eliminate the
+population mismatch, re-ran with `--keep` restricted to the 503 EUR
+individuals from the 1000G panel file
+(`integrated_call_samples_v3.20130502.ALL.panel`, CEU/FIN/GBR/IBS/TSI).
+All 503 EUR samples are present in our FAM.
+
+| | BMI_2010 | BMI_2018 | HEIGHT_2018 |
+|---|---:|---:|---:|
+| V1 sketch-200 | 0.1319 (0.0023) | 0.2009 (0.0019) | 0.5053 (0.0080) |
+| V2 hybrid simple | 0.1344 (0.0023) | 0.2039 (0.0019) | 0.5031 (0.0077) |
+| V3 hybrid fused | 0.1344 (0.0023) | 0.2039 (0.0019) | 0.5031 (0.0077) |
+| V4 maf-aware | 0.1319 (0.0023) | 0.2008 (0.0019) | 0.5051 (0.0080) |
+| V5 hybrid+maf | 0.1344 (0.0023) | 0.2039 (0.0019) | 0.5031 (0.0077) |
+| Per-SNP exact | 0.1420 (0.0020) | 0.2142 (0.0017) | 0.4961 (0.0071) |
+| Chunk-exact | 0.1402 (0.0020) | 0.2120 (0.0017) | 0.4919 (0.0071) |
+
+### Population matching changes the per-trait estimates dramatically
+
+EUR h² is 7-25% higher than multi-pop on the same sumstats (because EUR LD
+patterns are the right model for EUR GWAS):
+
+| Trait | Multi-pop ref h² | EUR ref h² | Shift |
+|---|---:|---:|---:|
+| BMI_2010 | 0.1185 | 0.1420 | +20% |
+| BMI_2018 | 0.1757 | 0.2142 | +22% |
+| HEIGHT_2018 | 0.4650 | 0.4961 | +7% |
+
+The Height shift is smaller because Height has strong, broadly-shared LD
+signal across populations. BMI's LD-tagging structure is more
+population-specific, so the LD-reference mismatch hurt BMI more than Height.
+
+### Revised hierarchy with population-matched LD
+
+The relative magnitudes of the levers change once the population mismatch
+is removed. EUR shifts in h² (per-trait, magnitude relative to per-SNP-exact):
+
+| Knob | Multi-pop shift | EUR shift |
+|---|---:|---:|
+| Windowing (chunked vs per-SNP) | 5-15% | **1-2%** |
+| Sketch noise (`--sketch 200` vs chunk-exact) | 5-15% | **4-6%** |
+| Hybrid (V3 vs V1) | 0.5-2% | **1-2%** |
+| MAF-aware (V4 vs V1) | 0% | **0%** |
+
+Key changes vs multi-pop:
+- **Windowing matters much less** with population-matched LD (5-15% → 1-2%).
+  Probably because EUR LD is more homogeneous and the chunk-window
+  approximation introduces less error relative to the per-SNP-exact ideal.
+- **Sketch noise stays the dominant lever** at 4-6% (vs 5-15% before).
+- **Hybrid's relative impact stays at 1-2%** — same absolute, similar
+  ratio of "what hybrid fixes / total sketch error" (~30%).
+- **MAF-aware remains zero** across all 3 traits, to 4 decimal places.
+
+### What this means
+
+With proper population matching:
+- `--sketch d` underestimates h² by ~5% vs exact (consistent direction).
+  This is a real, repeatable systematic bias.
+- `--sketch-hybrid-fused` recovers about a third of that gap (~1.5% h²
+  improvement, ~3-4× the regression SE).
+- Going all the way to exact recovers the remaining two-thirds (~3% h²
+  improvement vs hybrid, 5-15× the regression SE).
+- Chunked vs per-SNP windowing is now near-noise (1-2%) — the historical
+  10-15% gap was probably population-mismatch interaction with windowing.
+
+So the realistic decision for users:
+- **Care about ≤2% h² accuracy** → use `--sketch d` (default; fastest).
+- **Care about ~1% h² accuracy** → use `--sketch-hybrid-fused` (~1.7× cost).
+- **Care about exact h²** → use `--snp-level-masking --fast-f32` (~4× cost
+  vs sketch on 1000G; ~20× cost at biobank).
+- **MAF-aware**: still no measurable benefit at any setting tested.
+
+### Caveat on the windowing change
+
+The multi-pop result had a 5-15% windowing gap; EUR has 1-2%. We previously
+reported the larger number in CLAUDE.md / docs/h2-masking-simulation.md. The
+population-matched number is what should be cited going forward for
+EUR-on-EUR LDSC workflows. The larger gap may resurface in admixture-aware
+analyses or non-EUR populations — worth re-verifying if those use cases
+materialize.
+
+## 2026-05-12 — Biobank d-sweep + the `--sketch d --snp-level-masking` discovery
+
+Two AWS Batch sweeps on biobank_50k (N=50,000, 1.66M SNPs) that together
+upend the earlier hybrid-vs-MAF-aware narrative.
+
+### Biobank d-sweep (AWS Batch on-demand, c6a.4xlarge 16 vCPU)
+
+Sweep over d for V1 (sketch only) and V3 (hybrid-fused), plus exact
+references. Timings on c6a.4xlarge:
+
+| Variant | LDSC time | vs V1 d=200 | Speedup vs exact |
+|---|---:|---:|---:|
+| V1 sketch d=200 | 15s | 1.00× | 24× |
+| V1 sketch d=500 | 17s | 1.13× | 21× |
+| V1 sketch d=1000 | 18s | 1.20× | 20× |
+| V1 sketch d=1600 | 20s | 1.33× | 18× |
+| V3 hybrid-fused d=200 | 53s | 3.5× | 6.8× |
+| V3 hybrid-fused d=500 | 57s | 3.8× | 6.3× |
+| V3 hybrid-fused d=1000 | 56s | 3.7× | 6.4× |
+| chunk-exact (`--fast-f32 --global-pass`) | 358s | 24× | 1.0× |
+| per-SNP exact (`--snp-level-masking --fast-f32 --global-pass`) | 361s | 24× | 1.0× |
+
+**Doubling d at biobank scale costs ~7%.** Sketch d=1600 is only 1.3×
+slower than d=200 — the GEMM crossover (`d* ≈ 2,545` at biobank N=50K) is
+much further out than at 1000G (d* ≈ 260).
+
+h² (3 traits, BMI 2010 / BMI 2018 / Height 2018):
+
+| Variant | BMI 2010 | BMI 2018 | Height 2018 |
+|---|---:|---:|---:|
+| V1 sketch d=200 | 0.1097 (0.0023) | 0.1687 (0.0020) | 0.4755 (0.0079) |
+| V1 sketch d=1000 | 0.1077 (0.0020) | 0.1616 (0.0018) | 0.4405 (0.0072) |
+| V1 sketch d=1600 | 0.1082 (0.0020) | 0.1612 (0.0018) | 0.4382 (0.0072) |
+| V3 hybrid-fused d=1000 | 0.1081 (0.0020) | 0.1619 (0.0018) | 0.4402 (0.0072) |
+| chunk-exact | 0.1081 (0.0020) | 0.1611 (0.0018) | 0.4374 (0.0072) |
+| per-SNP exact | **0.1231** (0.0022) | **0.1815** (0.0019) | **0.4848** (0.0078) |
+
+Two big findings:
+1. **Sketch d=1000+ converges to chunk-exact within 0.0008 h² across all
+   3 traits.** The sketch noise vanishes at large d — at biobank scale
+   the d-runway is wide enough to fully close it.
+2. **Chunk-exact diverges from per-SNP exact by 10-14% h² at biobank
+   scale** (vs 1-2% at 1000G EUR). The chunked-window approximation that
+   Python LDSC, GCTA, and our default sketch all use is much worse at
+   biobank scale because high-N r² estimates are tighter — the "spurious"
+   pairs that chunked windows include carry real LD signal not noise.
+
+So sketch-with-larger-d converges to chunk-exact, but neither reaches the
+per-SNP-exact "math truth". The fix is the next finding.
+
+### The `--sketch d --snp-level-masking` combo (AWS Batch spot)
+
+Tested 5 sketch+masking variants (script: `scripts/biobank-masksweep.sh`).
+Timings essentially identical to sketch-only (masking is post-GEMM — adds
+a monotonic cutoff scan):
+
+| Variant | LDSC time | h² BMI 2010 | h² BMI 2018 | h² Height 2018 |
+|---|---:|---:|---:|---:|
+| V1+mask d=200 | 15s | 0.1243 | 0.1878 | 0.5201 |
+| V1+mask d=500 | 17s | 0.1179 | 0.1769 | 0.4853 |
+| **V1+mask d=1000** | **19s** | **0.1224** | **0.1815** | **0.4875** |
+| **V1+mask d=1600** | **21s** | **0.1229** | **0.1812** | **0.4853** |
+| **V3+mask d=1000** | 56s | 0.1229 | 0.1819 | 0.4871 |
+| **per-SNP exact (truth)** | 361s | **0.1231** | **0.1815** | **0.4848** |
+
+**`--sketch 1600 --snp-level-masking` matches per-SNP exact h² within
+0.001 across all 3 traits, at 17× the speed.** This is the new fastest
+path to the LDSC-paper canonical h².
+
+### Cross-method validation (1000G EUR, locally)
+
+LD-score level (per-SNP Pearson r vs per-SNP exact, full 1.66M SNPs):
+
+| Method | Pearson r | mean bias | max\|err\| |
+|---|---:|---:|---:|
+| GCTA `--ld-score-adj` | 0.993 | +0.33 | 145 |
+| Python LDSC | 0.999 | +0.09 | 115 |
+| chunk-exact | 0.995 | +0.27 | 150 |
+| V1 sketch d=200 (default) | 0.979 | −0.69 | 147 |
+| **V1+mask d=480** | **0.994** | **−0.26** | **39** |
+| **V3+mask d=480** | **0.997** | **−0.22** | **34** |
+
+**V1+mask d=480 has Pearson r essentially identical to GCTA (0.994 vs
+0.993) and the lowest max\|err\| of any method by 3-4×.** The per-SNP
+masking eliminates chunk-boundary outliers; sketch noise is well-distributed
+across SNPs.
+
+h² agreement on 3 traits (1000G EUR Δ from per-SNP exact):
+
+| Method | BMI 2010 | BMI 2018 | Height |
+|---|---:|---:|---:|
+| GCTA | −0.002 | −0.003 | −0.005 |
+| Python LDSC | −0.001 | −0.001 | −0.001 |
+| V1 sketch d=200 | −0.010 | −0.013 | +0.009 |
+| **V1+mask d=480** | **−0.003** | **−0.004** | **+0.000** |
+| **V3+mask d=480** | **−0.001** | **−0.003** | **+0.001** |
+
+At 1000G N=503 the combo matches GCTA-quality accuracy. At biobank N=50K
+it matches per-SNP exact within the regression SE.
+
+### Decisions out of this run
+
+1. **Document `--sketch d --snp-level-masking` as the recommended high-
+   accuracy fast mode** in CLAUDE.md and the `--sketch` doc string. d=1000
+   for biobank, d=480 (or near-N) for 1000G.
+2. **Remove `--sketch-hybrid` and `--sketch-hybrid-fused`.** The hybrid
+   variants gave a ~30% accuracy lift over the sketch-only default but
+   were strictly dominated by `--sketch-{larger d}--snp-level-masking`
+   on both axes (faster *and* more accurate). Code complexity (separate
+   B×B paths in F32+F64+GPU branches, side-buffer write in fused projector,
+   `force_seq_for_hybrid` workaround for mmap interaction) doesn't justify
+   the perf-vs-accuracy point they occupy. Preserved on
+   `experiment/hybrid-and-maf-aware` for reference.
+3. **Keep `--sketch-maf-aware`** for now — empirically zero impact at
+   N≥503 but cheap (~0 perf cost). May still matter for partitioned-LD
+   with MAF-stratified annotations.
+
+### Bench infrastructure note
+
+The biobank d-sweep took 4 attempts to land due to two AWS gotchas
+discovered along the way:
+- The instance role had `AmazonS3ReadOnlyAccess` only; uploads silently
+  hung for ~4 min (aws CLI default retry) before failing. Added
+  `s3:PutObject` policy scoped to `biobank_dsweep_*`.
+- c6a.4xlarge memory: requesting 28-32 GiB exceeds ECS-allocatable;
+  jobs sit in RUNNABLE forever with no error. Use ≤24576 MiB.
+
+`scripts/biobank-dsweep.sh` and `scripts/biobank-masksweep.sh` package
+each variant's outputs into a single tarball and upload as one S3 PUT —
+fast enough to fit in short spot sessions if needed.
