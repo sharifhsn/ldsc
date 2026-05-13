@@ -170,7 +170,7 @@ Three opt-in modes trade precision for speed in the `l2` subcommand:
   - Deterministic (seed=42). Same `--sketch d` on same data always produces identical output.
   - **Bias is corrected** via quadratic inversion of the renormalized-cosine bias `(1-r²)(1-2r²)/d`, giving residual O(1/d²). Empirically validated on chr22 EUR; per-bin analysis confirms the correction shifts high-LD-score SNPs in the predicted direction. Wall-clock cost vs no correction is within AWS run-to-run noise. See `docs/countsketch-math-analysis.md` for derivation and Monte Carlo validation.
   - **WARNING: d ≤ 50 is unstable** — Taylor truncation + sqrt noise amplification make the bias correction no better than uncorrected at the LD-score level. ldsc-rs prints a warning if you specify d ≤ 50. Just use d ≥ 100; cost is essentially flat in d below the GEMM crossover.
-  - **`--sketch d --snp-level-masking` is the most accurate fast mode.** Combining sketch with per-SNP exact windows recovers the LDSC paper's mathematical definition of `ℓ_j = Σ_k r²_jk` while keeping the sketch's order-of-magnitude speedup. At biobank N=50K, `--sketch 1000 --snp-level-masking` matches per-SNP exact h² to within 0.001 across all tested traits at ~17× the speed of exact. At 1000G N=503 the combo is GCTA-tier accurate (LD-score Pearson r=0.994, h² Δ ≤ 0.003 vs per-SNP exact). See `docs/perf-log.md` 2026-05-12 entry for the cross-method validation.
+  - **`--sketch d --snp-level-masking` is the most accurate fast mode.** Combining sketch with per-SNP exact windows recovers the LDSC paper's mathematical definition of `ℓ_j = Σ_k r²_jk` while keeping the sketch's order-of-magnitude speedup. At biobank N=50K, `--sketch 1600 --snp-level-masking` matches per-SNP exact h² within 0.001 across BMI/Height GWAS at ~17× the speed of `--snp-level-masking --fast-f32` exact (21s vs 361s); `--sketch 1000 --snp-level-masking` is slightly faster (19s, ~19×) but Height shifts ~0.003 h². At 1000G N=503 the combo is GCTA-tier accurate (LD-score Pearson r=0.994, h² Δ ≤ 0.003 vs per-SNP exact). See `docs/perf-log.md` 2026-05-12 entry for the cross-method validation.
 
 
 ### Performance Summary (AWS EPYC 7R13 c6a.4xlarge, 16 vCPU, 1.66M SNPs)
@@ -194,14 +194,16 @@ Three opt-in modes trade precision for speed in the `l2` subcommand:
 | --sketch 500 | 36.2s | 18.4× |
 | --sketch 1000 | 39.7s | 16.8× |
 
-Per the 2026-05-12 d-sweep on biobank (`docs/perf-log.md`):
+Per the 2026-05-12 d-sweep on biobank (`docs/perf-log.md`); h² |Δ| ranges
+across BMI 2010 / BMI 2018 / Height 2018:
 
-| Mode | Time | vs exact-f32 | h² Δ vs per-SNP exact |
+| Mode | Time | vs per-SNP exact | h² \|Δ\| vs per-SNP exact |
 |------|------|-------------|---|
 | `--snp-level-masking --fast-f32` (per-SNP exact) | 361s | 1.0× | 0 (truth) |
-| **`--sketch 1000 --snp-level-masking`** | **19s** | **~19×** | **≤ 0.001** |
-| `--sketch 1000` (chunked) | 18s | ~20× | ~0.020 (chunked-window bias) |
-| `--sketch 200` (default) | 15s | ~24× | ~0.013 |
+| **`--sketch 1600 --snp-level-masking`** | **21s** | **~17×** | **≤ 0.001** |
+| `--sketch 1000 --snp-level-masking` | 19s | ~19× | ≤ 0.003 (Height) |
+| `--sketch 1000` (chunked) | 18s | ~20× | 0.015 – 0.044 |
+| `--sketch 200` (default) | 15s | ~24× | 0.009 – 0.013 |
 
 Key insight: Fused CountSketch eliminates the N×c intermediate buffer entirely — it reads packed BED bytes and scatter-adds directly into the d×c sketch buffer. Cost is O(N×c) independent of d, so d=200 is "free" accuracy vs d=50. Combine with `--snp-level-masking` to get per-SNP exact h² at sketch speed.
 

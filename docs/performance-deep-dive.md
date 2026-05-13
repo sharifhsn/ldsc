@@ -120,10 +120,10 @@ individuals dwarfs the d²-scaling GEMM. At UKB scale (N=500K), d up to ~5000 wo
 **The best d depends on your downstream use case** — see
 [Downstream regression impact](#downstream-regression-impact) below. For LD scores alone
 (visualization, QC), d=500 is sufficient. For downstream h2/rg regression at biobank scale,
-**combine `--sketch d` with `--snp-level-masking`** (d ≥ 1000 matches per-SNP exact h²
-within 0.001 — see the 2026-05-12 entry in `perf-log.md`). Plain `--sketch d` without
-masking carries attenuation bias from the chunked-window approximation, not just sketch
-noise; large d alone does not fix it.
+**combine `--sketch d` with `--snp-level-masking`** — d=1600 matches per-SNP exact h²
+within 0.001 across BMI/Height GWAS (d=1000 within 0.003); see the 2026-05-12 entry in
+`perf-log.md`. Plain `--sketch d` without masking carries attenuation bias from the
+chunked-window approximation, not just sketch noise; large d alone does not fix it.
 
 Accuracy depends only on d, not on N: the variance of CountSketch inner products is
 Var[⟨x̃,ỹ⟩] ≈ (N² + ⟨x,y⟩²) / d for unit-normalized columns. This ratio is independent of N
@@ -203,14 +203,20 @@ Key observations:
 
 The 2026-05-12 sketch+masking sweep (see `perf-log.md`) supersedes the
 "go to large d for h²" recommendation that previously appeared here.
-At biobank scale, `--sketch d --snp-level-masking` matches per-SNP-exact
-h² within 0.001 — combining masking with sketch is far more effective
-than chasing larger d alone.
+At biobank scale, `--sketch d --snp-level-masking` at d=1600 matches
+per-SNP-exact h² within 0.001 across BMI/Height GWAS — combining masking
+with sketch is far more effective than chasing larger d alone.
 
-| Use case | Recommended mode | Biobank speedup vs exact-f64 |
-|----------|-----------------|---------------------|
-| Exact per-SNP h2 (math truth) | `--snp-level-masking --fast-f32` | 1.84× |
-| **High-accuracy h2/rg** (within ~0.001 of per-SNP exact) | **`--sketch 1000 --snp-level-masking`** | **~17×** |
+Speedups below are vs `--snp-level-masking --fast-f32` (per-SNP exact f32
+= 361 s on AWS biobank), which is the natural baseline since the
+recommendation is to match its h². vs exact-f64 (665 s), all sketch
+speedups roughly double.
+
+| Use case | Recommended mode | Biobank speedup vs per-SNP exact f32 |
+|----------|-----------------|---------------------:|
+| Exact per-SNP h2 (math truth) | `--snp-level-masking --fast-f32` | 1.0× (baseline) |
+| **High-accuracy h2/rg** (within ~0.001 of per-SNP exact) | **`--sketch 1600 --snp-level-masking`** | **~17×** |
+| Same combo, faster but Height shifts 0.003 h² | `--sketch 1000 --snp-level-masking` | ~19× |
 | Match Python LDSC chunked h2 | `--sketch 1000` | ~20× |
 | LD scores only (QC, visualization, fastest) | `--sketch 200` | ~24× |
 
