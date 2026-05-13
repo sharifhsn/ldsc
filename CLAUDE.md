@@ -262,3 +262,17 @@ Reference timings (Ryzen 5 5600X, 2026-03-14):
 cargo release patch            # dry run
 cargo release patch --execute  # tag + publish
 ```
+
+**Gotcha**: cargo-release refuses to run with uncommitted changes, including
+a dirty `ldsc_py3` submodule (which is common — devs often edit upstream
+Python for debugging). If `git status` shows ` m ldsc_py3`, stash inside
+the submodule first:
+
+```bash
+git -C ldsc_py3 stash      # stash submodule changes
+cargo release minor --execute --no-publish --no-push
+git -C ldsc_py3 stash pop  # restore after
+```
+
+Use `minor` instead of `patch` when the release removes or renames CLI
+flags (technically a breaking change in this 0.x project).

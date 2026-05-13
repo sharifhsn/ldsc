@@ -52,14 +52,11 @@ run_and_upload() {
     echo ""
 }
 
-# V1 sketch + per-SNP masking (4 d values)
+# Sketch + per-SNP masking sweep over d
 run_and_upload "v1m_d200"  "--sketch 200  --snp-level-masking"
 run_and_upload "v1m_d500"  "--sketch 500  --snp-level-masking"
 run_and_upload "v1m_d1000" "--sketch 1000 --snp-level-masking"
 run_and_upload "v1m_d1600" "--sketch 1600 --snp-level-masking"
-
-# V3 hybrid-fused + per-SNP masking (best d only — d=1000 was converged earlier)
-run_and_upload "v3m_d1000" "--sketch 1000 --sketch-hybrid --sketch-hybrid-fused --snp-level-masking"
 
 echo ""
 echo "=== Done. All outputs at: $S3_OUT ==="

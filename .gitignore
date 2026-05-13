@@ -16,3 +16,4 @@ perf/
 target-asm/
 target-musl/
 target-v3/
+__pycache__/

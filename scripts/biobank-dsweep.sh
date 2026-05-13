@@ -1,10 +1,10 @@
 #!/bin/bash
 #
-# Biobank d-sweep: produce LD scores at multiple sketch d values for V1
-# (sketch only) and V3 (sketch-hybrid-fused), plus exact references.
-# Each variant's outputs are bundled into a single tarball and uploaded to
-# S3 (instead of 23 separate per-chr files) — fast enough to survive short
-# spot sessions. Designed for AWS Batch with biobank_50k.
+# Biobank d-sweep: produce LD scores at multiple sketch d values for
+# `--sketch d`, plus chunk-exact + per-SNP exact references. Each variant's
+# outputs are bundled into a single tarball and uploaded to S3 (instead of
+# 23 separate per-chr files) — fast enough to survive short spot sessions.
+# Designed for AWS Batch with biobank_50k.
 #
 set -euo pipefail
 
@@ -54,16 +54,11 @@ run_and_upload() {
     echo ""
 }
 
-# V1: sketch-only at varying d
+# Sketch-only at varying d
 run_and_upload "v1_d200"  "--sketch 200"
 run_and_upload "v1_d500"  "--sketch 500"
 run_and_upload "v1_d1000" "--sketch 1000"
 run_and_upload "v1_d1600" "--sketch 1600"
-
-# V3: hybrid-fused (exact B×B, sketched A×B) at varying d
-run_and_upload "v3_d200"  "--sketch 200 --sketch-hybrid --sketch-hybrid-fused"
-run_and_upload "v3_d500"  "--sketch 500 --sketch-hybrid --sketch-hybrid-fused"
-run_and_upload "v3_d1000" "--sketch 1000 --sketch-hybrid --sketch-hybrid-fused"
 
 # Truth references at N=50K. --global-pass required for exact paths
 # (per-chr parallel exact OOMs at biobank scale per biobank-bench.sh).
