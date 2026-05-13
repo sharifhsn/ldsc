@@ -41,21 +41,27 @@ downstream h².
    [`docs/countsketch-math-analysis.md`](docs/countsketch-math-analysis.md).
    At biobank N=50K, sketch is 17–24× faster than `--fast-f32` exact.
 
-3. **`--sketch 1600 --snp-level-masking` is more accurate than Python LDSC
-   at biobank scale.** Discovered in v0.5.0: combining sketch (fast GEMM)
-   with per-SNP exact windowing (the LDSC paper's mathematical definition
-   of ℓ\_j) reaches the paper-canonical h² within **0.001** on three real
-   GWAS (BMI 2010, BMI 2018, Height 2018) at biobank scale. **Python LDSC's
-   chunked-window approximation produces h² estimates 10–14% below the
-   paper definition** on these traits (verified: at biobank, Python's
-   h² = Rust chunk-exact h², which has Δ = −0.015 / −0.020 / −0.047 vs
-   per-SNP exact). Sketch+masking takes 21 s vs Python's 6,541 s — **311×
-   faster and ~12% more accurate**. The dominant residual bias in plain
-   `--sketch d` turned out not to be sketch noise (vanishes at d≥1000) but
-   the same chunked-window approximation; per-SNP masking fixes it
-   post-GEMM at zero meaningful cost. Cross-validated against GCTA, Python
-   LDSC, chunk-exact, and per-SNP exact — full validation in
-   [`docs/perf-log.md`](docs/perf-log.md) 2026-05-12 entry.
+3. **`--sketch 1600` reproduces both truth clusters at biobank speed.** At
+   d=1600 the masking flag becomes a switch between the two h² definitions
+   used in the field, both within 0.001 h² on three real GWAS at biobank:
+   - `--sketch 1600` (plain) → matches **Python LDSC** h² (chunked-window
+     algorithm, the canonical implementation everyone has used since 2014).
+   - `--sketch 1600 --snp-level-masking` → matches **per-SNP exact** h² (the
+     LDSC paper's mathematical definition of ℓ\_j = Σ\_k r²\_jk).
+
+   Both run in 21 s — that's **311× faster than Python LDSC at biobank** (21 s
+   vs measured 6,541 s on r6a.8xlarge) and matches whichever truth you need.
+
+   And with `--snp-level-masking` on, sketch+mask is **~12% more accurate
+   than Python LDSC** at biobank: Python's chunked-window approximation has
+   systematic 10–14% h² bias vs the paper's per-SNP exact definition (verified:
+   Python h² = Rust chunk-exact h² to 4 decimals, both with Δ −0.015 / −0.020
+   / −0.047 vs per-SNP exact). Sketch+mask gets to the paper definition that
+   Python's algorithm structurally can't.
+
+   Cross-validated against GCTA, Python LDSC, chunk-exact, and per-SNP exact
+   — full validation in [`docs/perf-log.md`](docs/perf-log.md) 2026-05-12 /
+   2026-05-13 entries.
 
 ## Where this sits in the LD-score-regression tool landscape
 
@@ -153,17 +159,24 @@ Speedups below are biobank wall-clock (N=50,000, 1.66M SNPs, AWS c6a.4xlarge
 unless noted). The Python LDSC baseline is **6,541 s (109 min)** measured on
 r6a.8xlarge (32 vCPU, 240 GiB) at `--chunk-size 200 --ld-wind-kb 1000`.
 
-| Goal | Use | Time | vs Python | vs per-SNP exact-f32 |
-|---|---|---:|---:|---:|
-| Match Python LDSC bit-for-bit (replication) | `--python-compat` | — | 1.0× | n/a |
-| Exact LD scores, paper-canonical math | `--snp-level-masking --fast-f32` | 361 s | **18×** | 1.0× (the baseline) |
-| **High-accuracy h²/rg at biobank** (within 0.001 of paper-exact) | **`--sketch 1600 --snp-level-masking --mmap`** | **21 s** | **311×** | **17×** |
-| Same combo, faster but ~0.003 h² shift on Height | `--sketch 1000 --snp-level-masking --mmap` | 19 s | 344× | 19× |
-| Match Python LDSC chunked h² at biobank speed | `--sketch 1000 --mmap` | 18 s | 363× | 20× |
-| Fastest LD scores (QC, visualization, screening) | `--sketch 200 --mmap` | 15 s | 436× | 24× |
+**At d=1600, one flag toggles which "truth" the sketch reproduces** (verified
+on 3 real GWAS at biobank, all matches within 0.001 h²):
+- `--sketch 1600` (plain) → matches Python LDSC h² (chunked-window algorithm)
+- `--sketch 1600 --snp-level-masking` → matches per-SNP exact h² (LDSC paper definition)
+
+Both run in ~21 s — masking is a post-GEMM cutoff scan with negligible cost.
+
+| Goal | Use | Time | vs Python | h² match (3 real GWAS) |
+|---|---|---:|---:|---|
+| Match Python LDSC bit-for-bit (1000G replication) | `--python-compat` | — | 1.0× (1000G) | bit-identical |
+| Exact LD scores, paper-canonical math | `--snp-level-masking --fast-f32` | 361 s | **18×** | per-SNP exact (truth) |
+| **Reproduce Python LDSC's h² at biobank** (within 0.001) | **`--sketch 1600 --mmap`** | **21 s** | **311×** | Python within 0.001 |
+| **Reach paper-canonical h² at biobank** (within 0.001) | **`--sketch 1600 --snp-level-masking --mmap`** | **21 s** | **311×** | per-SNP exact within 0.001 |
+| Faster, ~0.003 h² shift on Height | `--sketch 1000 --snp-level-masking --mmap` | 19 s | 344× | per-SNP exact within 0.003 |
+| Fastest LD scores (QC, visualization, screening) | `--sketch 200 --mmap` | 15 s | 436× | per-SNP exact within 0.013 |
 
 See [Performance](#performance) for measured timings; full cross-method h²
-validation tables are in `docs/perf-log.md` 2026-05-12 entry.
+validation tables are in `docs/perf-log.md` 2026-05-12 / 2026-05-13 entries.
 
 ---
 
@@ -485,23 +498,36 @@ cross-method h² breakdown.
 
 ### `--sketch d --snp-level-masking` — the recommended biobank mode
 
-Combining sketch (fast GEMM) with per-SNP masking (correct windowing) at
-d=1600 matches per-SNP-exact h² within **0.001** on three real GWAS
-(BMI 2010, BMI 2018, Height 2018) at biobank scale, at ~17× the speed of
-`--snp-level-masking --fast-f32` (21 s vs 361 s). At d=1000 the combo is
-slightly faster (19 s, ~19×) but Height shifts ~0.003 h², still within
-the regression SE of ~0.008. Cross-validated against per-SNP exact, GCTA,
-chunk-exact, and Python LDSC. At 1000G scale (N=503), the d=480 combo
-reaches GCTA-quality LD scores (Pearson r=0.994 vs per-SNP exact, lowest
-max-error of any method).
+At d=1600, the masking flag toggles which truth cluster the sketch
+reproduces — both within 0.001 h² across BMI 2010 / BMI 2018 / Height
+2018 at biobank scale:
 
 ```bash
-# Biobank: ~21s, h² within 0.001 of per-SNP exact across BMI/Height
-ldsc l2 --bfile … --out … --ld-wind-kb 1000 --sketch 1600 --snp-level-masking --mmap
+# Match Python LDSC chunked h² (the canonical implementation), 311× faster
+ldsc l2 --bfile … --out … --ld-wind-kb 1000 --sketch 1600 --mmap            # ~21s
+
+# Match per-SNP exact h² (the LDSC paper's mathematical definition)
+ldsc l2 --bfile … --out … --ld-wind-kb 1000 --sketch 1600 --snp-level-masking --mmap  # ~21s
 
 # 1000G: smaller speed advantage; exact (~4× slower) is usually preferred
 ldsc l2 --bfile … --out … --ld-wind-kb 1000 --snp-level-masking --fast-f32
 ```
+
+The two flag combinations run at the same speed (masking is a post-GEMM
+cutoff scan with negligible cost). Pick which truth you want to reproduce:
+
+- **Python LDSC h²** if you're replicating published results that used Python LDSC's
+  chunked-window approximation. `--sketch 1600` matches within 0.001.
+- **Per-SNP exact h²** (LDSC paper's mathematical definition) if you want the most
+  defensible h² estimate. `--sketch 1600 --snp-level-masking` matches within 0.001,
+  and is ~12% MORE ACCURATE than Python LDSC at biobank scale (Python's chunked-
+  window approximation has 10–14% h² bias vs the paper definition).
+
+Cross-validated against per-SNP exact, GCTA, chunk-exact, and Python LDSC at biobank
+N=50K and at 1000G N=503. At d=1000 the combo is slightly faster (~19 s, ~19×) but
+Height shifts ~0.003 h², still within the regression SE of ~0.008. At 1000G scale
+(N=503), the d=480 combo reaches GCTA-quality LD scores (Pearson r=0.994 vs per-SNP
+exact, lowest max-error of any method).
 
 ### `--mmap` — memory-mapped BED I/O
 
@@ -571,15 +597,15 @@ matches, only the language differs). Both diverge from per-SNP exact —
 the LDSC paper's mathematical definition — by 10–14% h² because of
 chunked-window bias.
 
-| Mode | Wall time | vs Python | h² \|Δ\| vs per-SNP exact (BMI 2010 / BMI 2018 / Height 2018) |
-|------|----------:|--------:|---|
-| Python LDSC | 6,541 s (109 min) | 1.0× | 0.015 / 0.020 / 0.047 (chunked-window bias) |
-| `--fast-f32` (chunked-exact, ≡ Python h²) | 358 s | 18× | 0.015 / 0.020 / 0.047 (≡ Python) |
-| `--snp-level-masking --fast-f32` (per-SNP exact, "math truth") | 361 s | **18×** | 0 (truth) |
-| **`--sketch 1600 --snp-level-masking`** | **21 s** | **311×** | **0.0002 / 0.0003 / 0.0005** |
-| `--sketch 1000 --snp-level-masking` | 19 s | 344× | 0.0007 / 0.0000 / 0.0027 |
-| `--sketch 1000` (chunked) | 18 s | 363× | 0.015 / 0.020 / 0.044 |
-| `--sketch 200` (default, fastest) | 15 s | 436× | 0.013 / 0.013 / 0.009 |
+| Mode | Wall time | vs Python | h² \|Δ\| vs per-SNP exact (BMI 2010 / BMI 2018 / Height 2018) | h² \|Δ\| vs Python LDSC |
+|------|----------:|--------:|---|---|
+| Python LDSC | 6,541 s (109 min) | 1.0× | 0.015 / 0.020 / 0.047 (chunked-window bias) | 0 (reference) |
+| `--fast-f32` (chunked-exact, ≡ Python h²) | 358 s | 18× | 0.015 / 0.020 / 0.047 | **0 / 0 / 0** (bit-identical to Python) |
+| `--snp-level-masking --fast-f32` (per-SNP exact, "math truth") | 361 s | **18×** | 0 (truth) | 0.015 / 0.020 / 0.047 |
+| **`--sketch 1600`** (matches Python h² within 0.001) | **21 s** | **311×** | 0.015 / 0.020 / 0.047 | **0.0001 / 0.0001 / 0.0008** |
+| **`--sketch 1600 --snp-level-masking`** (matches per-SNP exact within 0.001) | **21 s** | **311×** | **0.0002 / 0.0003 / 0.0005** | 0.015 / 0.020 / 0.047 |
+| `--sketch 1000` (chunked) | 18 s | 363× | 0.015 / 0.020 / 0.044 | 0.0004 / 0.0005 / 0.0031 |
+| `--sketch 200` (default, fastest) | 15 s | 436× | 0.013 / 0.013 / 0.009 | 0.002 / 0.008 / 0.038 |
 
 Cross-method h² validated on BMI 2010, BMI 2018, Height 2018 against
 per-SNP exact, GCTA, Python LDSC, and chunk-exact references. Full tables

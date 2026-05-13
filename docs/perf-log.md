@@ -2748,3 +2748,23 @@ This is the cleanest cross-method validation we have:
 - Rust chunk-exact h² = Python's bias level (~12% off paper definition).
 - Rust sketch+mask h² = per-SNP exact h² (within 0.001), reaching the
   paper definition that Python's algorithm can't.
+
+### `--sketch 1600` reproduces both truth clusters
+
+A side benefit of d=1600 being well within the "sketch noise vanished"
+regime: plain `--sketch 1600` (no masking) matches Python LDSC's chunked
+h² within 0.001, and `--sketch 1600 --snp-level-masking` matches per-SNP
+exact within 0.001. **One d, two truths, one flag toggles between them.**
+
+| Mode | h² (BMI 2010 / BMI 2018 / Height) | Matches |
+|---|---|---|
+| Python LDSC (canonical chunked) | 0.1081 / 0.1611 / 0.4374 | baseline |
+| `--sketch 1600` (plain) | 0.1082 / 0.1612 / 0.4382 | **Python within 0.001** (max +0.0008 Height) |
+| per-SNP exact (paper canonical) | 0.1231 / 0.1815 / 0.4848 | baseline |
+| `--sketch 1600 --snp-level-masking` | 0.1229 / 0.1812 / 0.4853 | **per-SNP exact within 0.001** (max −0.0003) |
+
+Both run at ~21s on biobank N=50K. The masking flag adds a post-GEMM
+cutoff scan (O(window+chunk) monotonic, negligible cost). So users can
+reproduce **either** Python LDSC's published-tradition h² or the LDSC
+paper's mathematical definition by flipping one flag — at the same speed
+in both cases, 311× faster than Python.

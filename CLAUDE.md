@@ -197,13 +197,19 @@ Three opt-in modes trade precision for speed in the `l2` subcommand:
 Per the 2026-05-12 d-sweep on biobank (`docs/perf-log.md`); h² |Δ| ranges
 across BMI 2010 / BMI 2018 / Height 2018:
 
-| Mode | Time | vs per-SNP exact | h² \|Δ\| vs per-SNP exact |
-|------|------|-------------|---|
-| `--snp-level-masking --fast-f32` (per-SNP exact) | 361s | 1.0× | 0 (truth) |
-| **`--sketch 1600 --snp-level-masking`** | **21s** | **~17×** | **≤ 0.001** |
-| `--sketch 1000 --snp-level-masking` | 19s | ~19× | ≤ 0.003 (Height) |
-| `--sketch 1000` (chunked) | 18s | ~20× | 0.015 – 0.044 |
-| `--sketch 200` (default) | 15s | ~24× | 0.009 – 0.013 |
+| Mode | Time | vs per-SNP exact | h² \|Δ\| vs per-SNP exact | h² \|Δ\| vs Python LDSC |
+|------|------|-------------|---|---|
+| Python LDSC (measured 2026-05-13) | 6541s | 0.06× | 0.015 – 0.047 (chunked bias) | 0 (ref) |
+| `--snp-level-masking --fast-f32` (per-SNP exact) | 361s | 1.0× | 0 (truth) | 0.015 – 0.047 |
+| `--fast-f32` (chunked-exact, ≡ Python h²) | 358s | 1.0× | 0.015 – 0.047 | **0 (bit-identical)** |
+| **`--sketch 1600 --snp-level-masking`** | **21s** | **~17×** | **≤ 0.001** | 0.015 – 0.047 |
+| **`--sketch 1600`** (no masking, ≡ Python) | **21s** | **~17×** | 0.015 – 0.047 | **≤ 0.001** |
+| `--sketch 1000 --snp-level-masking` | 19s | ~19× | ≤ 0.003 (Height) | 0.014 – 0.046 |
+| `--sketch 200` (default) | 15s | ~24× | 0.009 – 0.013 | 0.002 – 0.038 |
+
+At d=1600, plain `--sketch 1600` matches Python LDSC h² within 0.001;
+`--sketch 1600 --snp-level-masking` matches per-SNP exact within 0.001.
+Same d, same time — masking flag toggles which truth cluster is reproduced.
 
 Key insight: Fused CountSketch eliminates the N×c intermediate buffer entirely — it reads packed BED bytes and scatter-adds directly into the d×c sketch buffer. Cost is O(N×c) independent of d, so d=200 is "free" accuracy vs d=50. Combine with `--snp-level-masking` to get per-SNP exact h² at sketch speed.
 
