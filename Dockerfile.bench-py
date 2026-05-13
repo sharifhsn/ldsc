@@ -1,0 +1,28 @@
+# Benchmark image for Python LDSC (long-running biobank measurement).
+# Build:  docker buildx build --platform linux/amd64 -f Dockerfile.bench-py -t ldsc-bench-py .
+# Push:   docker tag ldsc-bench-py:latest <ECR>/ldsc-bench-py:latest && docker push ...
+
+FROM python:3.9-slim AS runtime
+
+# Pin Python LDSC dependency versions to match ldsc_py3/environment3.yml.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl unzip git bc && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install --no-cache-dir \
+        bitarray==2.* \
+        numpy==1.21.5 \
+        pandas==1.3.3 \
+        scipy==1.7.3
+
+# Install AWS CLI v2 for S3 data download/upload
+RUN curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip && \
+    cd /tmp && unzip -q awscli.zip && ./aws/install && \
+    rm -rf /tmp/aws /tmp/awscli.zip
+
+# Clone Python LDSC (CBIIT fork — same code as upstream bulik/ldsc but py3-compatible)
+RUN git clone --depth 1 https://github.com/CBIIT/ldsc.git /opt/ldsc_py3
+
+COPY scripts/python-biobank-bench.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

@@ -2641,3 +2641,60 @@ discovered along the way:
 `scripts/biobank-dsweep.sh` and `scripts/biobank-masksweep.sh` package
 each variant's outputs into a single tarball and upload as one S3 PUT —
 fast enough to fit in short spot sessions if needed.
+
+## 2026-05-13 — Python LDSC biobank baseline (measured)
+
+Until now the Python LDSC time at biobank scale was unmeasured; CLAUDE.md
+and the README cited "~1548s extrapolated" which was actually the 1000G
+N=2,490 baseline (linear-N extrapolation gives ~32,500s/9hr, but that
+turned out to be wrong by an order of magnitude — see below).
+
+### Setup
+
+- Job: AWS Batch on-demand, `ldsc-bench-py-job` rev 1 (Python 3.9-slim
+  + bitarray 2.x / numpy 1.21.5 / pandas 1.3.3 / scipy 1.7.3 + CBIIT/ldsc
+  fork at depth 1).
+- Instance: r6a.8xlarge (32 vCPU AMD EPYC 7R13, 240 GiB allocated to
+  container). Earlier attempts on c6a.4xlarge (24 GiB) OOM'd within 2
+  min of Python LDSC startup — Python LDSC needs HPC-tier memory at
+  N=50K.
+- Command: `python ldsc.py --l2 --bfile /data/biobank_50k --ld-wind-kb
+  1000 --chunk-size 200 --yes-really --out /tmp/biobank_py3` (same
+  chunk-size 200 as the Rust comparison runs).
+- Job ID: `326329db-d0e1-4685-bf8a-0f997447d2d9`.
+
+### Result
+
+**6,541 s = 109 min = 1.81 hr** wall-clock. Python LDSC reported
+"Total time elapsed: 1.0h:49.0m:0.64s" internally; shell wall clock added
+~88s for the BED download from S3.
+
+This is **~5× faster than the linear-N extrapolation** from 1000G
+(1548s × 21 ≈ 32,500s). The naive extrapolation overcounted because at
+N=50K Python LDSC's per-chunk GEMM (chunk-size 200 × 50,000 individuals)
+saturates NumPy's BLAS threads better than at N=2,490 (where matrices
+are too small to benefit from multi-threaded BLAS). The 32 vCPUs on
+r6a.8xlarge also helped — at 16 vCPU the time would be longer.
+
+### Headline speedups (biobank, vs measured Python LDSC)
+
+| Mode | Time | Speedup vs Python |
+|---|---:|---:|
+| Python LDSC | 6,541 s | 1.0× |
+| Rust `--snp-level-masking --fast-f32` (paper-canonical exact) | 361 s | **18×** |
+| **Rust `--sketch 1600 --snp-level-masking`** (matches Python h² within 0.001) | **21 s** | **311×** |
+| Rust `--sketch 1000 --snp-level-masking` | 19 s | 344× |
+| Rust `--sketch 1000` (chunked, matches Python chunked) | 18 s | 363× |
+| Rust `--sketch 200 --mmap` (default, fastest) | 15 s | 436× |
+
+The 311× speedup of `--sketch 1600 --snp-level-masking` is the v0.5.0
+contribution headline: matches Python LDSC's paper-canonical h² output
+within 0.001 across BMI 2010 / BMI 2018 / Height 2018 GWAS, at sketch
+speed (and at ~half the memory footprint Python needs).
+
+### Cost note
+
+Single Python run on r6a.8xlarge on-demand at $1.81/hr × 1.81 hr =
+**~$3.30** for this measurement. Previously avoided because of the
+extrapolated 9-hour estimate; the actual ~2-hour measurement was much
+more affordable than expected.

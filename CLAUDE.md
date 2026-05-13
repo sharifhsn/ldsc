@@ -183,7 +183,7 @@ Three opt-in modes trade precision for speed in the `l2` subcommand:
 | --sketch 50 | 15.3s | 101× |
 | --sketch 200 | 25.4s | 61× |
 
-**Biobank scale (N=50,000)** — Python baseline: ~1548s (extrapolated)
+**Biobank scale (N=50,000)** — Python baseline: **6,541s (109 min)** measured on r6a.8xlarge (32 vCPU, 240 GiB, chunk-size 200, ld-wind-kb 1000). Rust columns below are vs `exact-f64` for backward-compat; vs Python baseline divide Rust time by 6541.
 
 | Mode | Time | vs exact-f64 |
 |------|------|-------------|
