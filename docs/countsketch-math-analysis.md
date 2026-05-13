@@ -614,6 +614,17 @@ The right way to get higher LD-score accuracy is to increase
 full empirical analysis and the MC scripts on the `experiment/median-of-k`
 branch.
 
+**Tier 5 (shipped 2026-05-12, v0.5.0)**: combine `--sketch d` with
+`--snp-level-masking`. At biobank scale (N=50K), this reaches per-SNP
+exact h² within 0.001 at ~17× the speed of `--snp-level-masking
+--fast-f32`. The combo was always supported but never tested at biobank
+scale; the dominant remaining error after sketch noise is removed (large
+d) is the chunked-windowing approximation, not the sketch itself.
+`--snp-level-masking` corrects that post-GEMM at zero meaningful cost.
+**This supersedes the "use larger d" recommendation for downstream h²
+accuracy.** Full §15 below; full validation in `docs/perf-log.md`
+2026-05-12 entry.
+
 ## 13. Empirical comparison: quadratic vs linear correction (chr22 EUR, historical)
 
 Before removing the linear correction (2026-05-11), ran both modes on

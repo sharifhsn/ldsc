@@ -119,8 +119,11 @@ individuals dwarfs the d²-scaling GEMM. At UKB scale (N=500K), d up to ~5000 wo
 
 **The best d depends on your downstream use case** — see
 [Downstream regression impact](#downstream-regression-impact) below. For LD scores alone
-(visualization, QC), d=500 is sufficient. For downstream h2/rg regression, d ≥ 5000 is
-recommended to avoid attenuation bias.
+(visualization, QC), d=500 is sufficient. For downstream h2/rg regression at biobank scale,
+**combine `--sketch d` with `--snp-level-masking`** (d ≥ 1000 matches per-SNP exact h²
+within 0.001 — see the 2026-05-12 entry in `perf-log.md`). Plain `--sketch d` without
+masking carries attenuation bias from the chunked-window approximation, not just sketch
+noise; large d alone does not fix it.
 
 Accuracy depends only on d, not on N: the variance of CountSketch inner products is
 Var[⟨x̃,ỹ⟩] ≈ (N² + ⟨x,y⟩²) / d for unit-normalized columns. This ratio is independent of N
@@ -198,13 +201,25 @@ Key observations:
 
 ### Recommendation by use case
 
-| Use case | Recommended mode | Speedup vs exact-f64 |
+The 2026-05-12 sketch+masking sweep (see `perf-log.md`) supersedes the
+"go to large d for h²" recommendation that previously appeared here.
+At biobank scale, `--sketch d --snp-level-masking` matches per-SNP-exact
+h² within 0.001 — combining masking with sketch is far more effective
+than chasing larger d alone.
+
+| Use case | Recommended mode | Biobank speedup vs exact-f64 |
 |----------|-----------------|---------------------|
-| Exact h2/rg needed | `--fast-f32` | 1.84× |
-| h2 within ~2% | `--sketch 5000` | ~5× |
-| h2 within ~4% | `--sketch 1000` | ~9× |
-| LD scores only (QC, visualization) | `--sketch 200` | ~20× |
-| Quick screening | `--sketch 50` | ~20× |
+| Exact per-SNP h2 (math truth) | `--snp-level-masking --fast-f32` | 1.84× |
+| **High-accuracy h2/rg** (within ~0.001 of per-SNP exact) | **`--sketch 1000 --snp-level-masking`** | **~17×** |
+| Match Python LDSC chunked h2 | `--sketch 1000` | ~20× |
+| LD scores only (QC, visualization, fastest) | `--sketch 200` | ~24× |
+
+The h² regression numbers above were validated on three real GWAS
+(BMI 2010, BMI 2018, Height 2018) cross-checked against GCTA, Python
+LDSC, chunk-exact, and per-SNP exact references. The earlier recommendation
+of `--sketch 5000` (predicting ~2% h² bias) was based on synthetic
+single-trait data and is superseded by the masking combo, which reaches
+~0.1% h² agreement at lower d.
 
 ## Scaling to denser SNP panels
 

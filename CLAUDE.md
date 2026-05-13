@@ -194,7 +194,16 @@ Three opt-in modes trade precision for speed in the `l2` subcommand:
 | --sketch 500 | 36.2s | 18.4× |
 | --sketch 1000 | 39.7s | 16.8× |
 
-Key insight: Fused CountSketch eliminates the N×c intermediate buffer entirely — it reads packed BED bytes and scatter-adds directly into the d×c sketch buffer. Cost is O(N×c) independent of d, so d=200 is "free" accuracy vs d=50.
+Per the 2026-05-12 d-sweep on biobank (`docs/perf-log.md`):
+
+| Mode | Time | vs exact-f32 | h² Δ vs per-SNP exact |
+|------|------|-------------|---|
+| `--snp-level-masking --fast-f32` (per-SNP exact) | 361s | 1.0× | 0 (truth) |
+| **`--sketch 1000 --snp-level-masking`** | **19s** | **~19×** | **≤ 0.001** |
+| `--sketch 1000` (chunked) | 18s | ~20× | ~0.020 (chunked-window bias) |
+| `--sketch 200` (default) | 15s | ~24× | ~0.013 |
+
+Key insight: Fused CountSketch eliminates the N×c intermediate buffer entirely — it reads packed BED bytes and scatter-adds directly into the d×c sketch buffer. Cost is O(N×c) independent of d, so d=200 is "free" accuracy vs d=50. Combine with `--snp-level-masking` to get per-SNP exact h² at sketch speed.
 
 ## GPU
 
