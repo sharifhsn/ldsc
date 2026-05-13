@@ -5,13 +5,74 @@
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![MSRV: 1.85](https://img.shields.io/badge/rustc-1.85%2B-orange.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
 
-A compiled, statically-typed rewrite of [Bulik-Sullivan et al.'s LDSC](https://github.com/bulik/ldsc) in Rust.
-Implements six subcommands — `munge-sumstats`, `l2`, `h2`, `rg`, `make-annot`, `cts-annot` — with
-numerically identical output and a **~38× speedup** on LD score computation
-(exact mode, 1000G N=2,490; up to **101×** with `--sketch`). The opt-in `--sketch d`
-mode (CountSketch) trades per-SNP precision for additional throughput.
-Compatible with Python LDSC's CLI flags (`--l2`, `--h2`, `--rg`) for drop-in replacement in
-platforms like [NCI LDlink](https://ldlink.nih.gov/).
+**ldsc-rs** is a from-scratch Rust reimplementation of [Bulik-Sullivan et al.'s
+LDSC](https://github.com/bulik/ldsc) — the standard tool for SNP-heritability
+(h²) and genetic-correlation (rg) estimation from GWAS summary statistics. All
+six original subcommands (`munge-sumstats`, `l2`, `h2`, `rg`, `make-annot`,
+`cts-annot`) with numerically identical default output and a **~38× speedup**
+on LD-score computation (1000 Genomes reference, N=2,490). CLI is compatible
+with Python LDSC's `--l2`/`--h2`/`--rg` syntax for drop-in replacement in
+pipelines like [NCI LDlink](https://ldlink.nih.gov/).
+
+LDSC computes per-SNP **LD scores** ℓ\_j = Σ\_k r²\_{jk} (the sum of squared
+correlations between SNP j and other SNPs in a window), then regresses GWAS
+chi-squares on those LD scores. The slope is proportional to SNP heritability;
+two GWAS regressed jointly recover their genetic correlation. The compute
+bottleneck is the LD-score step at biobank scale: a custom 50K-individual
+reference panel takes 11+ minutes in Python LDSC and the standard CountSketch
+shortcut introduces systematic bias into downstream h².
+
+## What's different from Python LDSC
+
+1. **Drop-in replacement at the default.** With no special flags, output is
+   numerically identical to Python LDSC (`max_abs_diff = 0` across 1.66M SNPs
+   on 1000G EUR with `--python-compat`). The h² regression is bit-identical to
+   Python on identical LD-score inputs. ~38× faster on LD-score computation;
+   ~10× on h²/rg.
+
+2. **Principled CountSketch (`--sketch d`).** The fused
+   BED-decode → normalize → scatter-add kernel eliminates the N×c intermediate
+   matrix entirely. Bias is corrected by inverting the renormalized-cosine
+   bias `(1−r²)(1−2r²)/d` exactly (residual O(1/d²)) — derivation and
+   Monte-Carlo validation in
+   [`docs/countsketch-math-analysis.md`](docs/countsketch-math-analysis.md).
+   At biobank N=50K, sketch is 17–24× faster than `--fast-f32` exact.
+
+3. **`--sketch d --snp-level-masking` reaches per-SNP-exact h² at sketch
+   speed.** Discovered in v0.5.0: combining sketch (fast GEMM) with per-SNP
+   exact windowing (the LDSC paper's mathematical definition of ℓ\_j) matches
+   per-SNP-exact h² within **0.001** on three real GWAS at biobank scale —
+   that's ~17× faster than exact mode. The dominant residual bias in plain
+   `--sketch d` turned out not to be sketch noise (vanishes at d≥1000) but
+   the chunked-window approximation that Python LDSC also uses; per-SNP
+   masking fixes it post-GEMM at zero meaningful cost. Cross-validated against
+   GCTA, Python LDSC, chunk-exact, and per-SNP exact — full validation in
+   [`docs/perf-log.md`](docs/perf-log.md) 2026-05-12 entry.
+
+## Where this sits in the LD-score-regression tool landscape
+
+Three implementations exist for computing LD scores from a reference panel —
+producing slightly different LD-score values that all agree on h² to ~1%
+on standard EUR-on-EUR setups:
+
+| Tool | Windowing | Bias correction | Speed (1000G N=2,490) |
+|---|---|---|---|
+| **GCTA** `--ld-meanrsq` | Block-with-overlap (two-pass averaging) | `--ld-score-adj` | C++ baseline |
+| **Python LDSC** | 50-SNP chunked (undocumented approximation) | unbiased r² | 25 min 49 s |
+| **ldsc-rs** | 200-SNP chunked (default) → per-SNP exact (`--snp-level-masking`) | unbiased r² + quadratic CountSketch correction | 41 s exact, ~25 s `--sketch 200` |
+
+GCTA was the tool the original LDSC paper used to compute the published 1000G
+reference scores; Python LDSC is the canonical implementation everyone has
+replicated since 2014; ldsc-rs adds biobank-scale CountSketch + the
+`--sketch d --snp-level-masking` combo that reaches the LDSC paper's exact
+mathematical definition at sketch speed. For h² and rg regression itself,
+ldsc-rs is bit-identical to Python LDSC given identical LD-score inputs.
+
+For h² estimation specifically (rather than LD-score generation), other
+tools occupy adjacent niches: BOLT-LMM and REGENIE estimate h² directly from
+individual-level genotypes via mixed models (more powerful, more compute);
+ldsc-rs and Python LDSC operate on summary statistics only (no genotypes
+needed at h² time).
 
 ---
 
@@ -25,61 +86,143 @@ docker run --rm ghcr.io/sharifhsn/ldsc:latest --help
 
 Local install options:
 
-- Prebuilt binaries from GitHub Releases (see “Prebuilt Binaries” below).
-- Cargo install (requires Rust): `cargo install ldsc`
+- Prebuilt binaries from GitHub Releases (see [Prebuilt Binaries](#prebuilt-binaries) below).
+- Cargo install (requires Rust ≥ 1.85): `cargo install ldsc`
 
 ## Quick Start
 
-The typical LDSC workflow — preprocess summary statistics, then estimate heritability or genetic
-correlation — mirrors the [upstream wiki tutorial](https://github.com/bulik/ldsc/wiki/Heritability-and-Genetic-Correlation).
+Two common workflows. Both produce numerically identical h²/rg output to
+Python LDSC.
 
-**Step 1: Download pre-computed European LD scores** (skip `l2` for European GWAS)
+### A) Replicating a published EUR analysis (uses pre-computed LD scores)
+
+Skip LD-score computation by downloading the standard 1000G EUR reference:
 
 ```bash
 wget https://data.broadinstitute.org/alkesgroup/LDSCORE/eur_w_ld_chr.tar.bz2
 wget https://data.broadinstitute.org/alkesgroup/LDSCORE/w_hm3.snplist.bz2
-tar -jxvf eur_w_ld_chr.tar.bz2   # inner .l2.ldscore.gz files are already gzip-compressed
+tar -jxvf eur_w_ld_chr.tar.bz2
 bunzip2 w_hm3.snplist.bz2
+
+# Munge sumstats → standardized format
+ldsc munge-sumstats --sumstats my_gwas.txt --N 50000 \
+                    --merge-alleles w_hm3.snplist --out my_trait
+
+# h² (single trait) or rg (pair)
+ldsc h2 --h2 my_trait.sumstats.gz --ref-ld-chr eur_w_ld_chr/ \
+        --w-ld-chr eur_w_ld_chr/ --out my_trait_h2
+
+ldsc rg --rg trait1.sumstats.gz,trait2.sumstats.gz \
+        --ref-ld-chr eur_w_ld_chr/ --w-ld-chr eur_w_ld_chr/ \
+        --out trait1_vs_trait2
 ```
 
-**Step 2: Pre-process summary statistics**
+### B) Computing your own LD scores at biobank scale
+
+For a biobank-scale reference panel (N up to 50K+), the recommended high-
+accuracy fast mode is `--sketch d --snp-level-masking`. This matches per-SNP
+exact h² within 0.001 at ~17× the speed of exact:
 
 ```bash
-ldsc munge-sumstats \
-  --sumstats my_gwas.txt \
-  --N 50000 \
-  --merge-alleles w_hm3.snplist \
-  --out my_trait
+# High-accuracy biobank LD scores: ~19s on N=50K, full 1.66M SNPs
+ldsc l2 --bfile my_biobank_panel \
+        --ld-wind-kb 1000 --sketch 1000 --snp-level-masking --mmap \
+        --out my_ld_scores
+
+# Then h² with your custom LD scores
+ldsc h2 --h2 my_trait.sumstats.gz \
+        --ref-ld-chr my_ld_scores --w-ld-chr my_ld_scores \
+        --out my_trait_h2
 ```
 
-**Step 3a: Estimate heritability**
+For 1000G-scale references (N≈500-2,500), the speed difference between sketch
+and exact is small enough that exact is preferable: `ldsc l2 --bfile … --out …
+--ld-wind-kb 1000 --snp-level-masking --fast-f32`.
 
-```bash
-ldsc h2 \
-  --h2 my_trait.sumstats.gz \
-  --ref-ld-chr eur_w_ld_chr/ \
-  --w-ld-chr eur_w_ld_chr/ \
-  --out my_trait_h2
-```
+## Choosing your `l2` mode
 
-**Step 3b: Estimate genetic correlation**
+| Goal | Use | Biobank speedup vs exact-f64 |
+|---|---|---:|
+| Match Python LDSC bit-for-bit (replication) | `--python-compat` | ~38× |
+| Exact LD scores, paper-canonical math | `--snp-level-masking --fast-f32` | 1.84× |
+| **High-accuracy h²/rg at biobank scale** (within 0.001 of paper-exact) | **`--sketch 1000 --snp-level-masking --mmap`** | **~17×** |
+| Match Python LDSC chunked h² at biobank speed | `--sketch 1000 --mmap` | ~20× |
+| Fastest LD scores (QC, visualization, screening) | `--sketch 200 --mmap` | ~24× |
 
-```bash
-ldsc rg \
-  --rg trait1.sumstats.gz,trait2.sumstats.gz \
-  --ref-ld-chr eur_w_ld_chr/ \
-  --w-ld-chr eur_w_ld_chr/ \
-  --out trait1_vs_trait2
-```
+See [Performance](#performance) for measured timings; full cross-method h²
+validation tables are in `docs/perf-log.md` 2026-05-12 entry.
 
 ---
 
-## Usage
+## Differences from Python
+
+For evaluation: what changes if you switch from Python LDSC to ldsc-rs?
+
+### Output
+
+- **At the default**: identical to Python LDSC for h²/rg with bit-identical
+  LD scores when you pass `--python-compat` to `l2`.
+- **Without `--python-compat`**: ldsc-rs `l2` defaults to `--chunk-size 200`
+  (vs Python's 50) for ~4× faster GEMM. Chunked windowing changes per-SNP LD
+  scores by ~0.2 mean / ~6 max on chr22 EUR (Pearson r=0.9997). Downstream
+  h² impact is <1% on EUR-on-EUR setups, but grows to 10–14% on biobank-scale
+  multi-population references — see the [`--snp-level-masking`
+  section](#--snp-level-masking--paper-canonical-per-snp-windows).
+- **`--sketch d`** adds the CountSketch approximation; combinable with
+  `--snp-level-masking` to recover paper-exact h². See
+  [Choosing your `l2` mode](#choosing-your-l2-mode).
+
+### Command structure
+
+Python LDSC consists of three separate scripts; ldsc-rs consolidates them
+into subcommands of a single `ldsc` binary, while still accepting the
+original Python flag syntax:
+
+| Python | Rust |
+|--------|------|
+| `python munge_sumstats.py --sumstats … --out …` | `ldsc munge-sumstats --sumstats … --out …` |
+| `python ldsc.py --l2 --bfile … --out …` | `ldsc l2 --bfile … --out …` (or `ldsc --l2 …`) |
+| `python ldsc.py --h2 … --ref-ld-chr …` | `ldsc h2 --h2 … --ref-ld-chr …` (or `ldsc --h2 …`) |
+| `python ldsc.py --rg … --ref-ld-chr …` | `ldsc rg --rg … --ref-ld-chr …` (or `ldsc --rg …`) |
+| `python make_annot.py --bimfile … --bed-file …` | `ldsc make-annot --bimfile … --bed-file …` |
+| `python ldsc.py --cts-bin …` | `ldsc cts-annot …` |
+
+### Behavioural differences
+
+- **`--maf` in l2**: default matches Python (MAF prefilter before LD computation).
+- **`--n-min` default**: when `--n-min` is 0, matches Python (90th percentile / 1.5).
+- **`--yes-really`**: Rust warns when the LD window spans a whole chromosome and
+  `--yes-really` is not set (Python errors).
+- **`--chunksize` in munge**: Polars LazyFrame streaming ignores chunk size for munge.
+- **`--cts-bin` workflow**: supported directly by `ldsc l2` and via the separate
+  `ldsc cts-annot` preprocessor.
+- **`--return-silly-things` / `--invert-anyway`**: accepted for CLI parity but no-ops;
+  ldsc-rs never clips results and always uses a least-squares solver (warning emitted).
+- **`--no-print-annot`**: only affects `--cts-bin` output (suppresses `.annot.gz`).
+
+### Drop-in via argv[0] symlinks
+
+If the binary is invoked via a symlink whose filename contains "munge"
+(e.g. `munge_sumstats.py`), it auto-routes to the `munge-sumstats`
+subcommand. Same for `--l2` / `--h2` / `--rg` flag-style invocation:
+
+```bash
+ln -s /usr/local/bin/ldsc /usr/local/bin/munge_sumstats.py
+munge_sumstats.py --sumstats file.txt --out munged  # works
+```
+
+stdout output matches the Python format for downstream parsing (the
+"Total Observed scale h2: ...", Lambda GC, Mean Chi^2, Intercept, Ratio
+lines that pipelines like [NCI LDlink](https://ldlink.nih.gov/) parse).
+
+---
+
+## Subcommand reference
 
 ### munge-sumstats
 
 Pre-processes GWAS summary statistics into the `.sumstats.gz` format consumed by `h2` and `rg`.
-Input summary statistics may be plain, `.gz`, or `.bz2`, and can be tab- or whitespace-delimited.
+Input may be plain, `.gz`, or `.bz2`, and tab- or whitespace-delimited.
 
 ```bash
 ldsc munge-sumstats \
@@ -134,6 +277,9 @@ per annotation and corresponding `.l2.M` / `.l2.M_5_50` files.
 `--per-allele` is equivalent to `--pq-exp 1` (weights each r² by p·(1−p)). Use `--pq-exp S` to
 apply (p·(1−p))^S weighting; output columns and `.M` files receive a `_S{S}` suffix.
 `--no-print-annot` suppresses the `.annot.gz` output produced by `--cts-bin`.
+
+See [Speed/accuracy modes](#speedaccuracy-modes-for-l2) below for `--sketch`, `--snp-level-masking`,
+`--fast-f32`, `--mmap`, and `--gpu`.
 
 ### h2
 
@@ -223,226 +369,102 @@ ldsc cts-annot \
 
 ---
 
-## Python CLI Compatibility
+## Speed/accuracy modes for `l2`
 
-The Rust binary accepts both its native subcommand syntax (`ldsc l2 ...`) and the original
-Python LDSC flag syntax (`ldsc --l2 ...`, `ldsc --h2 ...`, `ldsc --rg ...`). This enables
-drop-in replacement in pipelines and platforms built around the Python tool.
+Five flags affect the speed/accuracy tradeoff in `l2`. They compose freely.
 
-**Supported implicit subcommand flags:**
+### `--fast-f32` — exact, ~1.85× faster
 
-| Python invocation | Rust equivalent | Status |
-|---|---|---|
-| `ldsc.py --l2 --bfile X --ld-wind-cm 1 --out X` | `ldsc l2 --bfile X --ld-wind-cm 1 --out X` | auto-detected |
-| `ldsc.py --h2 F --ref-ld-chr D --w-ld-chr D --out B` | `ldsc h2 --h2 F --ref-ld-chr D --w-ld-chr D --out B` | auto-detected |
-| `ldsc.py --rg F1,F2 --ref-ld-chr D --w-ld-chr D --out B` | `ldsc rg --rg F1,F2 --ref-ld-chr D --w-ld-chr D --out B` | auto-detected |
-| `munge_sumstats.py --sumstats F --out B` | `ldsc munge-sumstats --sumstats F --out B` | auto-detected via argv[0] |
+Run core matmuls in f32 with f64 accumulation. Halves GEMM bandwidth.
 
-**argv[0] detection for munge:** If the binary is invoked via a symlink or renamed executable
-whose filename contains "munge" (e.g. `munge_sumstats.py`), it automatically routes to the
-`munge-sumstats` subcommand. Create a symlink to enable zero-change integration:
-
-```bash
-ln -s /usr/local/bin/ldsc /usr/local/bin/munge_sumstats.py
-munge_sumstats.py --sumstats file.txt --out munged  # works
-```
-
-**Output format compatibility:** stdout output matches the Python format for downstream parsing:
-- `l2`: prints "Summary of LD Scores in ..." with descriptive statistics and correlation matrix
-- `h2`: prints "Total Observed scale h2: ...", Lambda GC, Mean Chi^2, Intercept, Ratio
-- `rg`: prints per-phenotype heritability sections, genetic covariance, genetic correlation
-  (with z-score and p-value), and "Summary of Genetic Correlation Results" table
-
-This compatibility is designed for integration with [NCI LDlink](https://ldlink.nih.gov/),
-which invokes LDSC via `subprocess.run()` and parses stdout.
-
----
-
-## Installation Details
-
-Native builds require Rust ≥ 1.85. The Rust implementation uses `faer` for dense linear algebra.
-
-### Fast f32 mode
-
-Pass `--fast-f32` to `ldsc l2` to run core matmuls in f32 while accumulating
-in f64. This halves the memory bandwidth for GEMM and can be significantly faster on CPUs
-with 256-bit SIMD.
-
-Observed speedup varies with panel size (hyperfine-validated, AWS EPYC 7R13):
-- **N=2,490 (1000G):** ~1.3× faster vs f64 exact
-- **N=50,000 (biobank):** ~1.85× faster vs f64 exact (bandwidth-limited, f32 halves per-chunk BED footprint)
+- N=2,490 (1000G): ~1.3× faster vs f64 exact
+- N=50,000 (biobank): ~1.85× faster vs f64 exact
 - Per-SNP LD score deltas vs f64: `max_abs_diff ≈ 0.008`
-- **Downstream h2/rg regression: identical to f64** — h2 estimate, SE, intercept, and ratio
-  all match to displayed precision. The per-SNP noise is far below the regression's sensitivity
-  threshold. **This is the recommended mode for biobank-scale data when exact h2/rg is needed.**
+- **Downstream h2/rg: identical to f64** to displayed precision
 
-**Note:** `--sketch` automatically enables f32 (see below), so `--fast-f32` is only needed
-for exact mode.
+`--sketch` automatically enables f32; `--fast-f32` is only needed for exact mode.
 
-```bash
-# f32 matmul (runtime flag, no rebuild needed)
-ldsc l2 --bfile … --out … --fast-f32
+### `--sketch d` — CountSketch random projection
 
-# default f64 (parity-safe)
-ldsc l2 --bfile … --out …
-```
+Compress the individual dimension from N to d via a CountSketch
+projection (a hash-based ±1 random matrix) before all GEMM operations.
+Fused decode-normalize-scatter-add kernel; cost is **O(N×c) regardless
+of d** until d ≈ √N. After projection, columns are renormalized (ratio
+estimator) so ‖x̃‖² = N exactly. Bias `(1−r²)(1−2r²)/d` is corrected by
+quadratic inversion (residual O(1/d²)). See
+[`docs/countsketch-math-analysis.md`](docs/countsketch-math-analysis.md)
+for derivation and Monte-Carlo validation.
 
+| d | LD-score Pearson r vs exact (1000G N=2,490) |
+|---:|:---:|
+| 100 | ~0.85 |
+| **200** (default) | **~0.93** |
+| 500 | ~0.97 |
+| 1000 | ~0.99 |
 
-### Random projection sketch (`--sketch`)
+`--sketch` automatically enables f32 (CountSketch ±1 entries are exactly
+representable in f32). Deterministic (seed=42). Requires d ≥ 3; ldsc-rs
+warns if d ≤ 50 (Taylor truncation + sqrt amplification breaks the bias
+correction). Incompatible with `--gpu`. Works with partitioned annotations.
 
-Pass `--sketch d` to `ldsc l2` to compress the individual dimension from N to d via
-a random projection (CountSketch) before all GEMM operations. This reduces the inner dimension of
-every matrix multiply, trading per-SNP precision for speed. After projection, each column is
-re-normalized (ratio estimator) to reduce per-pair variance by ~2×.
+**Plain `--sketch d` carries downstream h² attenuation bias** even with the
+quadratic correction — the residual error comes not from the sketch itself
+but from the chunked-window approximation that the sketch path inherits.
+Combine with `--snp-level-masking` to fix this.
 
-**`--sketch` automatically enables f32.** CountSketch ±1 entries are exactly representable
-in f32, so f64 sketch is strictly dominated (same accuracy, ~1.3× faster). You do not need
-to pass `--fast-f32`.
+### `--snp-level-masking` — paper-canonical per-SNP windows
 
-**Bias is quadratically corrected.** The renormalized-cosine bias `(1−r²)(1−2r²)/d` is
-inverted exactly (residual O(1/d²)). See [`docs/countsketch-math-analysis.md`](docs/countsketch-math-analysis.md)
-for derivation and Monte Carlo validation. Requires d ≥ 3; deterministic seed (42).
+The LDSC paper defines ℓ\_j = Σ\_k r²\_{jk} over an exact per-SNP window.
+Python LDSC and ldsc-rs both default to a chunked approximation that uses
+one common window for all SNPs in a chunk (faster GEMM, slightly inflated
+LD scores at chunk edges).
 
-**Combine with `--snp-level-masking` for the highest-accuracy fast mode.**
-At biobank scale (N=50K), `--sketch 1000 --snp-level-masking` matches per-SNP-exact
-h² to within 0.001 across BMI/Height GWAS at ~17× the speed of exact mode. At 1000G
-scale (N=503), the combo reaches GCTA-quality LD scores. See the
-[Downstream regression impact](#downstream-regression-impact) table.
+`--snp-level-masking` zeroes r² entries outside each SNP's true per-SNP
+window after the GEMM. Negligible cost (O(window + chunk) monotonic scan).
 
-| d (dim) | Speedup (1.66M SNPs, N=2,490) | Pearson r vs exact | Median \|rel\| error | Recommended for |
-|---------|-------------------------------|-------------------|---------------------|-----------------|
-| 25      | 2.88× (14.3s)                 | ~0.73             | ~97%                | quick screening |
-| 50      | **~101×** (15.3s)             | ~0.81             | ~52%                | rough estimates, biobank speed |
-| 100     | ~82× (~19s est.)              | ~0.85             | ~13%                | moderate accuracy |
-| 200     | ~61× (25.4s)                  | ~0.93             | ~6%                 | recommended default |
-| 500     | ~49× (31.5s)                  | ~0.97             | ~3%                 | high accuracy   |
-
-Accuracy measured at N=2,490 (1000G). At biobank scale (N=50K), `--sketch` is dramatically
-faster — see the [biobank benchmarks](#biobank-scale-n--50000) below.
-
-**Important: downstream h2/rg regression accuracy.** Sketch LD scores introduce measurement
-error that causes attenuation bias in h2 regression. The accuracy fix is to combine sketch
-with `--snp-level-masking` — at biobank scale, `--sketch 1000 --snp-level-masking` matches
-per-SNP-exact h² to within 0.001 (within the regression SE). See
-[Downstream regression impact](#downstream-regression-impact) for the cross-method validation
-against GCTA, Python LDSC, chunk-exact, and per-SNP exact references.
-
-```bash
-# Sketch (fast, Python-LDSC-equivalent — d=200 default, biobank ~17× speedup)
-ldsc l2 --bfile … --out … --sketch 200
-
-# High-accuracy sketch for downstream h2/rg
-# Matches per-SNP exact h² within 0.001 at biobank scale; ~17× speedup
-ldsc l2 --bfile … --out … --sketch 1000 --snp-level-masking
-
-# Exact (default, numerically identical to Python LDSC)
-ldsc l2 --bfile … --out …
-```
-
-#### Sketch limitations
-
-- **CountSketch:** d up to √N is free (scatter-add is O(N×c), independent of d). Above √N,
-  the downstream d×d matmul begins to matter. At biobank N=50K, doubling d from 200→1600
-  costs only ~1.3× wall clock (~14s → ~21s).
-- **Downstream h2/rg bias:** plain `--sketch d` LD scores cause errors-in-variables
-  attenuation. The fix is `--sketch d --snp-level-masking` (no extra cost — masking is a
-  post-GEMM cutoff scan). See [Downstream regression impact](#downstream-regression-impact).
-- Incompatible with `--gpu`.
-- Results are deterministic (fixed PRNG seed 42).
-- Works with partitioned annotations.
-
-### Downstream regression impact
-
-Plain `--sketch d` LD scores cause **errors-in-variables attenuation bias** in h2
-regression: estimates are systematically low and the intercept is inflated. The fix
-is `--sketch d --snp-level-masking`, which applies the LDSC paper's mathematical
-definition of `ℓ_j = Σ_k r²_jk` (per-SNP exact windows) at sketch speed.
-
-Validated on biobank N=50K against per-SNP exact (the math truth), GCTA, Python LDSC,
-and chunk-exact references on three real GWAS (BMI 2010, BMI 2018, Height 2018) — see
-[`docs/perf-log.md`](docs/perf-log.md) 2026-05-12 entry for the full cross-method tables.
-
-| Use case | Recommended mode | Biobank speedup vs exact |
-|----------|-----------------|---------------------|
-| Exact per-SNP h2 (math truth) | `--snp-level-masking --fast-f32` | 1.0× |
-| **Match per-SNP exact h²** (within ~0.001) | **`--sketch 1000 --snp-level-masking`** | **~17×** |
-| Match Python LDSC chunked h² | `--sketch 1000` | ~20× |
-| LD scores only (QC, visualization, fastest) | `--sketch 200` | ~24× |
-
-### Exact per-SNP window boundaries (`--snp-level-masking`)
-
-By default, this tool reproduces Python LDSC's output exactly — including a known approximation
-in how window boundaries are applied during LD score computation.
-
-**The approximation:** Python LDSC processes SNPs in chunks and evicts window entries once per
-chunk using the left boundary of the first SNP in each chunk (`block_left[chunk_start]`). This
-means later SNPs in the same chunk can include r² contributions from SNPs that fall outside
-their true window. The Python codebase comments on this explicitly, calling it a vectorization
-approximation. The [Bulik-Sullivan et al. 2015 paper](https://www.nature.com/articles/ng.3211)
-defines LD scores with exact per-SNP window boundaries — chunking is not mentioned.
-
-**The fix:** `--snp-level-masking` applies the paper's definition exactly. After each GEMM,
-r² entries for SNP pairs outside each SNP's true window are zeroed before accumulation into
-LD scores. The implementation uses a monotonic scan (O(window + chunk)), so the overhead is
-negligible — the GEMM itself is 74% of runtime and is unchanged.
-
-**Impact depends strongly on (LD-reference N, population match).** The earlier 11-15%
-h² numbers we reported were measured on the multi-population biobank synthetic LD
-reference (N=50K, all 1000G phase 3 populations). On the population-matched setup
-that's actually used in practice (1000G EUR, N=503), the windowing gap shrinks to
-1-2% h². At biobank scale on EUR-matched data the gap re-grows to 10-14% — the
-chunked approximation is much worse at high N because tighter r² estimates make the
-"spurious" chunk-boundary pairs carry real LD signal rather than noise.
+The h² impact depends strongly on (LD-reference N, population match):
 
 | Setup | Windowing gap (chunked vs per-SNP exact) |
 |-------|-----------------------------------------:|
-| 1000G EUR (N=503) | 1-2% h² |
-| Biobank synthetic, multi-pop (N=50K) | 10-14% h² |
+| 1000G EUR, N=503 (typical h² use case) | 1–2% h² |
+| Biobank synthetic, multi-pop, N=50,000 | 10–14% h² |
 
-See [`docs/perf-log.md`](docs/perf-log.md) 2026-05-12 entry for the full cross-method
-breakdown across BMI/Height GWAS, GCTA, Python LDSC, and per-SNP exact references.
+The gap grows with N because higher-N r² estimates are tighter, so the
+"spurious" pairs at chunk boundaries carry real LD signal not noise. See
+[`docs/perf-log.md`](docs/perf-log.md) 2026-05-12 entry for the full
+cross-method h² breakdown.
 
-The h² shift direction is positive (per-SNP exact gives lower LD scores → steeper
-regression slope → higher h² estimate). For high-fidelity h² at biobank scale,
-combine the masking with `--sketch d` per the
-[Downstream regression impact](#downstream-regression-impact) table.
+### `--sketch d --snp-level-masking` — the recommended biobank mode
+
+Combining sketch (fast GEMM) with per-SNP masking (correct windowing)
+matches per-SNP-exact h² within **0.001** at biobank scale at ~17× the
+speed of `--snp-level-masking --fast-f32`. Cross-validated on three real
+GWAS (BMI 2010, BMI 2018, Height 2018) against per-SNP exact, GCTA, and
+Python LDSC. At 1000G scale (N=503), the combo reaches GCTA-quality LD
+scores (Pearson r=0.994 vs per-SNP exact, lowest max-error of any method).
 
 ```bash
-# Paper-correct LD scores (exact per-SNP window boundaries)
-ldsc l2 --bfile data/1000G_phase3_common_norel --out ld_scores/snp_exact \
-    --ld-wind-kb 1000 --snp-level-masking
+# Biobank: ~19s, h² within 0.001 of per-SNP exact
+ldsc l2 --bfile … --out … --ld-wind-kb 1000 --sketch 1000 --snp-level-masking --mmap
 
-# Default (Python-identical, for reproducibility with published results)
-ldsc l2 --bfile data/1000G_phase3_common_norel --out ld_scores/python_compat \
-    --ld-wind-kb 1000
+# 1000G: smaller speed advantage; exact (4× slower) is usually preferred
+ldsc l2 --bfile … --out … --ld-wind-kb 1000 --snp-level-masking --fast-f32
 ```
 
-**Note:** The default (no flag) is Python-identical and should be used when comparing against
-published LD score files or replicating results from the Python tool. Use `--snp-level-masking`
-when computing new reference panels where theoretical correctness is preferred.
+### `--mmap` — memory-mapped BED I/O
 
-### Memory-mapped BED I/O (`--mmap`)
-
-For HPC deployments with GPFS, Lustre, or other networked filesystems, `--mmap` uses
-memory-mapped I/O instead of buffered reads. This provides:
+For HPC deployments with GPFS, Lustre, or other networked filesystems,
+`--mmap` uses memory-mapped I/O instead of buffered reads:
 
 - **Zero-copy access** for the fused CountSketch path (eliminates ~20GB of memcpy at biobank scale)
 - **OS-managed readahead** via `MADV_SEQUENTIAL` — GPFS can prefetch across storage nodes in parallel
 - **Async prefetch** via `MADV_WILLNEED` on the next chunk — no reader thread contention
 - **No seek invalidation** — unlike `BufReader`, mmap'd pages stay resident once faulted
 
-```bash
-# Recommended for GPFS/Lustre HPC
-ldsc l2 --bfile … --out … --mmap
-
-# Can combine with any mode
-ldsc l2 --bfile … --out … --mmap --sketch 200
-```
-
-**Note:** On local SSD with warm cache, `--mmap` regresses ~15% due to page fault overhead.
+On local SSD with warm cache, `--mmap` regresses ~15% due to page fault overhead.
 Use the default (no flag) for local storage. `--mmap` is designed for networked filesystems.
 
-### Optional GPU acceleration (experimental)
+### `--gpu` (experimental, behind feature flag)
 
 Build with `--features gpu` to enable CUDA-accelerated matrix multiplication via
 [CubeCL](https://github.com/tracel-ai/cubecl). Requires a CUDA toolkit at build time.
@@ -461,14 +483,100 @@ Precision options:
 - `--gpu-tile-cols N`: Split large window matrices into VRAM-fitting tiles
 
 At 1000G scale (n=2,490), GPU is transfer-bound and slower than CPU. GPU acceleration
-targets biobank-scale cohorts (n >= 50k) where each chunk's GEMM is large enough for
-compute to dominate PCIe transfer.
+targets biobank-scale cohorts (n ≥ 50K) where each chunk's GEMM is large enough for
+compute to dominate PCIe transfer. Incompatible with `--sketch`.
 
-Default build (CPU only):
+---
 
-```bash
-cargo build --release
-```
+## Performance
+
+Benchmarks on AWS c6a.4xlarge (AMD EPYC 7R13, 16 vCPU) using 1000 Genomes Phase 3
+(1,664,852 SNPs, n = 2,490 individuals). Measured with `hyperfine` (1 warmup + 3 timed runs).
+Static musl binary with mimalloc, AVX2+FMA target features.
+
+### LD-score computation (`l2`)
+
+#### 1000G reference panel (N = 2,490)
+
+| Mode | Wall time | vs Python | Accuracy |
+|------|----------:|----------:|----------|
+| Python LDSC | 25 min 49 s | 1.0× | reference |
+| **Rust f64** (default) | **41.1 s** | **~38×** | exact (`max_abs_diff = 0` with `--python-compat`) |
+| Rust f32 (`--fast-f32`) | ~32 s | ~48× | `max_abs_diff ≈ 0.008` |
+| Rust sketch (`--sketch 200`) | 25.4 s | ~61× | Pearson r ≈ 0.93 |
+| Rust sketch (`--sketch 50`) | 15.3 s | ~101× | Pearson r ≈ 0.81 *(QC only)* |
+
+#### Biobank scale (N = 50,000, h² accuracy on real GWAS)
+
+| Mode | Wall time | vs exact-f32 | h² Δ vs per-SNP exact (BMI/Height) |
+|------|----------:|--------:|---|
+| `--snp-level-masking --fast-f32` (per-SNP exact, "math truth") | 361 s | 1.0× | 0 (truth) |
+| `--fast-f32` (chunked-exact) | 358 s | 1.0× | 0.020–0.047 (chunked-window bias) |
+| **`--sketch 1000 --snp-level-masking`** | **19 s** | **~19×** | **≤ 0.001** |
+| `--sketch 1000` (chunked) | 18 s | ~20× | 0.020–0.045 |
+| `--sketch 200` (default, fastest) | 15 s | ~24× | 0.013 |
+
+Cross-method h² validated on BMI 2010, BMI 2018, Height 2018 against
+per-SNP exact, GCTA, Python LDSC, and chunk-exact references. Full tables
+in [`docs/perf-log.md`](docs/perf-log.md) 2026-05-12 entry.
+
+Fused CountSketch reads packed BED bytes and scatter-adds directly into
+the d×c sketch buffer, eliminating the N×c intermediate entirely. Cost is
+O(N×c) independent of d — d=200 has the same scatter time as d=1000;
+larger d only matters when d² × c starts contributing meaningfully (≈ d=2000+
+at biobank). A 28 GB container is recommended for N=50K.
+
+### Window-size sensitivity (200k-SNP extract)
+
+| Window | Python | Rust f64 | Speedup |
+|--------|--------|----------|---------|
+| `--ld-wind-kb 100` | 44.2 s | 5.1 s | **8.7×** |
+| `--ld-wind-kb 500` | 48.4 s | 6.2 s | **7.8×** |
+| `--ld-wind-kb 1000` | 53.7 s | 8.6 s | **6.2×** |
+| `--ld-wind-kb 2000` | 61.8 s | 12.9 s | **4.8×** |
+
+### Scaling
+
+The ring-buffer algorithm keeps memory bounded by the LD window size, not
+total SNP count.
+
+**Scaling with M (fixed N=2,490, exact-f64):**
+
+| M (SNPs) | Est. wall time (AWS EPYC 16v) | BED size | Peak memory |
+|----------|-------------------------------|----------|-------------|
+| 1.66M | 41 s *(measured)* | 1 GB | ~100 MB |
+| 5M | ~124 s | 3 GB | ~100 MB |
+| 10M | ~247 s | 6 GB | ~100 MB |
+| 50M | ~1,235 s (~21 min) | 30 GB | ~100 MB |
+
+**Scaling with N (fixed M=1.66M, full-genome):**
+
+| N (individuals) | Mode | Wall time |
+|-----------------|------|-----------|
+| 2,490 (1000G) | exact-f64 | 41.1 s *(measured)* |
+| 2,490 (1000G) | `--sketch 200` | 25.4 s *(measured)* |
+| 50,000 (biobank) | exact-f32 (`--fast-f32`) | 361.9 s *(measured)* |
+| 50,000 (biobank) | `--sketch 1000 --snp-level-masking` | 19 s *(measured)* |
+| 50,000 (biobank) | `--sketch 200` | 33.8 s *(measured)* |
+
+At biobank N, GEMM cost is O(N × w × c) per chunk; CountSketch reduces this
+to O(N×c) scatter-add, independent of d. BED I/O is sequential and
+throughput-bound; `--fast-f32` halves BED read bytes per chunk.
+
+### Other subcommands (UKBB I/O, Apple M4 / 10-core)
+
+| Workflow | Rust | Python | Speedup |
+|---------|------|--------|---------|
+| munge-sumstats | 3.74 s | 62.65 s | **16.75×** |
+| h2 | 0.90 s | 7.81 s | **8.68×** |
+| rg (two traits) | 2.93 s | 28.09 s | **9.59×** |
+
+(Dataset: 497 MB Pan-UKBB sumstats input; UKBB.EUR LD scores, 381,831 SNPs
+after merge.)
+
+---
+
+## Build and install details
 
 ### Prebuilt Binaries
 
@@ -490,7 +598,6 @@ tar -xzf ldsc_macos-aarch64.tar.gz
 # Windows (x86_64)
 # Download the zip from the release page and extract:
 # https://github.com/sharifhsn/ldsc/releases/latest/download/ldsc_windows-x86_64.zip
-
 ```
 
 ### Docker
@@ -548,178 +655,29 @@ Without `--features mimalloc`, a musl build works but is ~12% slower due to allo
 
 ### Runtime tuning (optional)
 
-The following flags are available for performance tuning:
-
 - `--rayon-threads N`: Rayon thread count for jackknife in `h2`/`rg`.
 - `--polars-threads N`: Polars thread count for CSV streaming in `munge-sumstats`.
-- `--mmap`: Memory-mapped BED I/O for `l2`. Recommended for GPFS/Lustre HPC. See [mmap](#memory-mapped-bed-io---mmap) for details.
-
----
-
-## Performance
-
-### LD score computation (`l2`)
-
-Benchmarks on AWS c6a.4xlarge (AMD EPYC 7R13, 16 vCPU) using 1000 Genomes Phase 3
-(1,664,852 SNPs, n = 2,490 individuals). Measured with `hyperfine` (1 warmup + 3 timed runs).
-Static musl binary with mimalloc, AVX2+FMA target features.
-
-#### 1000G reference panel (N = 2,490)
-
-| Mode | Full genome wall time | vs Python | Accuracy |
-|------|----------------------|-----------|----------|
-| Python | 25 min 49 s | 1.0× | reference |
-| **Rust f64** (default) | **41.1 s** | **~38×** | exact (`max_abs_diff = 0`) |
-| **Rust f32** (`--fast-f32`) | **~32 s** | **~48×** | `max_abs_diff ≈ 0.008` |
-| **Rust sketch** (`--sketch 200`) | **25.4 s** | **~61×** | Pearson r ≈ 0.93 vs exact |
-| **Rust sketch** (`--sketch 50`) | **15.3 s** | **~101×** | Pearson r ≈ 0.81 vs exact |
-
-`--ld-wind-kb 1000`, `--chunk-size 200`. `--sketch` automatically enables f32 (bit-identical
-to f64 for sketch, ~1.3× faster). The `--fast-f32` and `--sketch` paths trade exact parity for speed; the default f64 path is numerically identical to Python across
-all 1,664,852 SNPs.
-
-#### Biobank scale (N = 50,000)
-
-At biobank-scale N, GEMM dominates and larger panels expose more parallelism. Python runtime is
-extrapolated assuming linear O(N) scaling; Rust runtimes are hyperfine-measured (AWS EPYC 7R13,
-same hardware as above).
-
-| Mode | Wall time | vs exact-f64 | Notes |
-|------|-----------|--------------|-------|
-| exact-f64 | 665.9 s | 1.0× | numerically exact |
-| exact-f32 (`--fast-f32`) | 361.9 s | **1.84×** | halved BED bandwidth |
-| **`--sketch 50`** | **33.1 s** | **20.1×** | r ≈ 0.81 |
-| **`--sketch 200`** | **33.8 s** | **19.7×** | r ≈ 0.93 |
-| `--sketch 500` | 36.2 s | 18.4× | r ≈ 0.97 |
-| `--sketch 1000` | 39.7 s | 16.8× | r ≈ 0.99 |
-| `--sketch 5000` | ~55 s\* | ~12×\* | r ≈ 0.998, h2 ~2% low |
-| `--sketch 10000` | ~75 s\* | ~9×\* | r ≈ 0.999, h2 exact |
-
-\*d=5000 and d=10000 timings estimated from local scaling (1.7× and 2.3× vs d=200); AWS
-times will differ but the relative ordering is stable. Even at d=10000 (20% of N), CountSketch
-is still **~5× faster than exact-f32** and **~9× faster than exact-f64**.
-
-Fused CountSketch reads packed BED bytes and scatter-adds directly into the d×c sketch buffer,
-eliminating the N×c intermediate entirely. Cost is O(N×c) independent of d, so d=200 has the
-same speed as d=50 but much better accuracy. A 28 GB container is recommended for N=50K.
-
-Speedup varies with window size (200k-SNP extract, same machine):
-
-| Window | Python | Rust f64 | Speedup |
-|--------|--------|----------|---------|
-| `--ld-wind-kb 100` | 44.2 s | 5.1 s | **8.7×** |
-| `--ld-wind-kb 500` | 48.4 s | 6.2 s | **7.8×** |
-| `--ld-wind-kb 1000` | 53.7 s | 8.6 s | **6.2×** |
-| `--ld-wind-kb 2000` | 61.8 s | 12.9 s | **4.8×** |
-
-#### Scaling to larger reference panels
-
-Runtime scales with both M (SNP count) and N (individual count). The ring-buffer algorithm
-keeps memory bounded by the LD window size, not the total SNP count.
-
-**Scaling with M (fixed N=2,490, exact-f64):**
-
-| M (SNPs) | Est. wall time (AWS EPYC 16v) | BED size | Peak memory |
-|----------|-------------------------------|----------|-------------|
-| 1.66M | 41 s *(measured)* | 1 GB | ~100 MB |
-| 5M | ~124 s | 3 GB | ~100 MB |
-| 10M | ~247 s | 6 GB | ~100 MB |
-| 50M | ~1,235 s (~21 min) | 30 GB | ~100 MB |
-
-**Scaling with N (fixed M=1.66M, full-genome):**
-
-| N (individuals) | Mode | Wall time | vs Python |
-|-----------------|------|-----------|-----------|
-| 2,490 (1000G) | exact-f64 | 41.1 s *(measured)* | ~38× |
-| 2,490 (1000G) | `--sketch 50` | 15.3 s *(measured)* | ~101× |
-| 50,000 (biobank) | exact-f64 | 665.9 s *(measured)* | — |
-| 50,000 (biobank) | `--sketch 200` | 33.8 s *(measured)* | — |
-| 50,000 (biobank) | `--sketch 5000` | ~55 s *(estimated)* | — |
-| 50,000 (biobank) | `--sketch 10000` | ~75 s *(estimated)* | — |
-
-At biobank N, GEMM cost is O(N × w × c) per chunk; CountSketch reduces this to O(N×c) scatter-add,
-independent of d. BED I/O is sequential and throughput-bound; `--fast-f32` halves BED read bytes per chunk.
-
-Additional UKBB I/O benchmarks on this machine (Apple M4, 10 CPU cores, 24 GB RAM, macOS 26.3
-build 25D125). These highlight I/O-heavy workflows and the impact of the Rust pipeline’s faster
-parsing and joins.
-
-Dataset: `/Users/sharif/Code/ldsc/data/biomarkers-30600-both_sexes-irnt.sample8m.tsv`
-(~497 MB) for `munge-sumstats`; and `/Users/sharif/Code/ldsc/data/UKBB.ALL.ldscore/UKBB.EUR.l2.ldscore.gz`
-for `h2`/`rg` (381,831 SNPs after merge).
-Quick local checks for `l2` default to a 50k SNP extract via `scripts/bench_l2_py3_vs_rust.sh`.
-
-| Workflow | Rust | Python | Speedup |
-|---------|------|--------|---------|
-| munge-sumstats | 3.74 s | 62.65 s | **16.75×** |
-| h2 | 0.90 s | 7.81 s | **8.68×** |
-| rg (two traits) | 2.93 s | 28.09 s | **9.59×** |
-
-Reference HPC hardware (Penn PMACS) for scaling tests:
-- 19 Dell C6420 quad node systems (76 compute nodes, 6,080 cores total, CentOS 7.8, 80 CPU cores per node with hyper-threading, 256 GB or 512 GB RAM per node, 56 GB/s EDR or 100 GB/s FDR InfiniBand to the filesystem, 10 Gb/s Ethernet).
-- 1 Dell R940 big memory system (1.5 TB RAM, 96 CPU cores, 10 Gb/s Ethernet, 100 GB/s FDR InfiniBand).
-- 2 GPU nodes (1× Nvidia Tesla P100, 512 GB RAM, 88 CPU cores, 10 Gb/s Ethernet, 100 GB/s FDR InfiniBand).
-- 4.2 PB IBM Spectrum Scale (GPFS) disk storage (2 tiers, no backup).
-- 1.3 PB mirrored archive tape storage.
-- LSF job scheduling system.
-
----
-
-## Differences from Python
-
-### Command structure
-
-Python LDSC consists of three separate scripts; this crate consolidates them into subcommands of a
-single `ldsc` binary:
-
-| Python | Rust |
-|--------|------|
-| `python munge_sumstats.py --sumstats … --out …` | `ldsc munge-sumstats --sumstats … --out …` |
-| `python ldsc.py --l2 --bfile … --out …` | `ldsc l2 --bfile … --out …` |
-| `python ldsc.py --h2 … --ref-ld-chr …` | `ldsc h2 --h2 … --ref-ld-chr …` |
-| `python ldsc.py --rg … --ref-ld-chr …` | `ldsc rg --rg … --ref-ld-chr …` |
-| `python make_annot.py --bimfile … --bed-file …` | `ldsc make-annot --bimfile … --bed-file …` |
-| `python ldsc.py --cts-bin …` | `ldsc cts-annot …` |
-
-Python's `--l2` flag (LD score estimation mode) becomes the `l2` subcommand. The `--h2` and
-`--rg` flags (regression modes) become `h2` and `rg` subcommands.
-
-### Flag compatibility
-
-Python flag names are supported directly.
-
-### Behavioural differences
-
-- **`--maf` in l2**: default now matches Python (MAF prefilter before LD computation).
-- **`--n-min` default**: when `--n-min` is 0, Rust now matches Python (90th percentile / 1.5).
-- **`--yes-really`**: Rust warns when the LD window spans a whole chromosome and
-  `--yes-really` is not set (Python errors).
-- **`--chunksize`**: Python requires explicit chunking for large files; Rust uses Polars LazyFrame
-  streaming and ignores chunk size for munge.
-- **`--return-silly-things` / `--invert-anyway`**: accepted flags for CLI parity; Rust never clips
-  results and always uses a least-squares solver (warnings emitted).
-- **`--no-print-annot`**: only affects `--cts-bin` output; suppresses the `.annot.gz` file.
-- **`--cts-bin` workflow**: supported directly by `ldsc l2` (also available as a separate
-  preprocessor via `ldsc cts-annot`).
-
----
-
-## No-op Flags (Warned)
-
-The following Python flags are accepted for CLI parity but do not change behavior in Rust:
-
-- `h2/rg --return-silly-things`
-- `h2/rg --invert-anyway`
+- `--mmap`: Memory-mapped BED I/O for `l2`. Recommended for GPFS/Lustre HPC.
 
 ---
 
 ## Further Reading
 
-- **[Performance deep-dive](docs/performance-deep-dive.md)** — algorithmic complexity for each
-  mode, scaling analysis for dense SNP panels (O(M² × N) with distance-based windows),
-  downstream h2/rg regression accuracy by sketch dimension, and why Python is slow.
-- **[Architecture & source map](docs/architecture.md)** — module-level code map, key data-flow
-  invariants, and dependency rationale.
+- **[CountSketch math analysis](docs/countsketch-math-analysis.md)** —
+  rigorous derivation of the CountSketch bias on the renormalized cosine,
+  Monte Carlo validation, and the §15 sketch+masking finding.
+- **[Performance deep-dive](docs/performance-deep-dive.md)** — algorithmic
+  complexity for each mode, scaling analysis for dense SNP panels
+  (O(M² × N) with distance-based windows), downstream h2/rg regression
+  accuracy by sketch dimension, and why Python is slow.
+- **[Performance log](docs/perf-log.md)** — append-only log of every perf
+  experiment; the 2026-05-12 entry has the cross-method h² validation
+  (GCTA + Python LDSC + chunk-exact + per-SNP exact + sketch+masking).
+- **[Architecture & source map](docs/architecture.md)** — module-level code
+  map, key data-flow invariants, and dependency rationale.
+- **[GCTA source audit](docs/gcta-source-audit.md)** — what GCTA's
+  `--ld-meanrsq` actually does, since GCTA is the tool the original LDSC
+  paper used to compute the published 1000G reference scores.
 
 ---
 
