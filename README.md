@@ -404,7 +404,10 @@ quadratic inversion (residual O(1/d²)). See
 [`docs/countsketch-math-analysis.md`](docs/countsketch-math-analysis.md)
 for derivation and Monte-Carlo validation.
 
-| d | LD-score Pearson r vs chunk-exact (200k extract, N=2,490) |
+LD-score level accuracy as a function of d (measured on a 200k-SNP extract,
+N=2,490):
+
+| d | LD-score Pearson r vs chunk-exact |
 |---:|:---:|
 | 100 | 0.87 |
 | **200** (default) | **0.92** |
@@ -412,14 +415,47 @@ for derivation and Monte-Carlo validation.
 | 1000 | 0.99 |
 
 `--sketch` automatically enables f32 (CountSketch ±1 entries are exactly
-representable in f32). Deterministic (seed=42). Requires d ≥ 3; ldsc-rs
-warns if d ≤ 50 (Taylor truncation + sqrt amplification breaks the bias
-correction). Incompatible with `--gpu`. Works with partitioned annotations.
+representable in f32). Deterministic (seed=42). Requires `3 ≤ d < N`
+(ldsc-rs errors if out of bounds); warns if `d ≤ 50` (Taylor truncation
++ sqrt amplification breaks the bias correction). Incompatible with
+`--gpu`. Works with partitioned annotations.
 
 **Plain `--sketch d` carries downstream h² attenuation bias** even with the
 quadratic correction — the residual error comes not from the sketch itself
 but from the chunked-window approximation that the sketch path inherits.
 Combine with `--snp-level-masking` to fix this.
+
+#### Choosing d for your reference panel
+
+The optimal d depends on N. Two facts to understand:
+
+1. **Cost scales with d slowly until the GEMM crossover** `d* ≈ √N`.
+   `T(d) ≈ T_scatter + T_GEMM × d`. Below `d*` doubling d costs almost
+   nothing; above `d*` cost grows linearly. Empirically: `d* ≈ 260` at
+   1000G N=2,490; `d* ≈ 2,545` at biobank N=50K. So you have a wide
+   "free range" of d at biobank scale and a narrow one at 1000G scale.
+
+2. **Sketch attenuation bias on h² grows with N at fixed d.** Sketch
+   per-pair noise variance is ~2/d regardless of N, but at larger N
+   the true LD-score signal is tighter, so the relative noise impact
+   on the regression is larger. Larger N → need larger d for the same
+   h² accuracy.
+
+Recommendations (combine with `--snp-level-masking` for the h² rows):
+
+| N (reference panel) | Use | Speedup vs exact-f32 |
+|---:|---|---:|
+| ~500 – 2,500 (1000G-scale) | `--snp-level-masking --fast-f32` (no sketch) | 1.0× (exact is already fast at this N) |
+| ~10,000 | `--sketch 1000 --snp-level-masking` | ~5× (extrapolated) |
+| **~50,000 (biobank)** | **`--sketch 1600 --snp-level-masking`** | **~17× (measured)** |
+| ~500,000 (UKBB-scale) | `--sketch 5000 --snp-level-masking` (untested) | ~30-50× (extrapolated) |
+
+The biobank row is the well-tested one (full validation in
+[`docs/perf-log.md`](docs/perf-log.md) 2026-05-12 entry). UKBB-scale d
+follows roughly `d ≈ √N`. For LD-score-only workflows (visualization,
+QC — no h² downstream), `--sketch 200` is fine at any N: LD-score
+Pearson r ≥ 0.92 regardless of N (per the small-N table above; the per-
+pair variance bound `2/d` is N-independent for normalized columns).
 
 ### `--snp-level-masking` — paper-canonical per-SNP windows
 
