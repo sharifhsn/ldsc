@@ -5,7 +5,7 @@ use crate::bed::{Bed, ChunkReader, IidPos, MmapBed, ReadOptions};
 use crate::gpu::{GpuConfig, GpuContext};
 use crate::la::{
     MatF, MatF32, mat_add_in_place, mat_copy_from, mat_slice, mat_slice_f32, mat_slice_mut,
-    mat_slice_mut_f32, matmul_tn_to, matmul_tn_to_f32, matmul_to,
+    mat_slice_mut_f32, matmul_tn_to, matmul_tn_to_f32, matmul_to, par_default,
 };
 use crate::parse::BimRecord;
 use anyhow::{Context, Result};
@@ -1701,7 +1701,7 @@ pub(super) fn compute_ldscore_global(
                             b_slice,
                             1.0f32,
                             Accum::Replace,
-                            Par::rayon(0),
+                            par_default(),
                         );
                     }
                     if sketch_dim.is_some() {
@@ -1802,7 +1802,7 @@ pub(super) fn compute_ldscore_global(
                             b_slice,
                             1.0f64,
                             Accum::Replace,
-                            Par::rayon(0),
+                            par_default(),
                         );
                     }
                     if sketch_dim.is_some() {
@@ -2010,7 +2010,7 @@ pub(super) fn compute_ldscore_global(
                                 b_sl,
                                 1.0f32,
                                 Accum::Replace,
-                                Par::rayon(0),
+                                par_default(),
                             );
                         }
                         let ab_view = mat_slice_f32(ab_buf.as_ref(), 0..w, 0..c);
@@ -2171,7 +2171,7 @@ pub(super) fn compute_ldscore_global(
                                 b_sl,
                                 1.0f64,
                                 Accum::Replace,
-                                Par::rayon(0),
+                                par_default(),
                             );
                         }
                         let ab_view = mat_slice(ab_buf.as_ref(), 0..w, 0..c);

@@ -53,9 +53,18 @@ exclude       = [
 # builds — polars' `decompress` (zlib-ng), `psm`, and `home` crates do not
 # compile to WASM; sumstats / LD-score files don't need lazy planning.
 
-faer = "0.24.0"
+# faer: explicit feature list because the default `rand` feature pulls in
+# rand 0.9 → getrandom 0.3.4, which doesn't compile to wasm32 without the
+# `wasm_js` backend cfg. We don't use faer's random-matrix samplers, so
+# dropping `rand` here is free. The `rayon` feature is added back below
+# under the `cfg(not(target_arch = "wasm32"))` target table because spindle
+# / atomic-wait don't compile to wasm32 either.
+faer = { version = "0.24.0", default-features = false, features = ["std", "linalg"] }
 
-# Data-parallelism — parallelises block jackknife (replaces sequential for-loop + GIL)
+# Data-parallelism — parallelises block jackknife (replaces sequential for-loop + GIL).
+# On wasm32 this builds in single-threaded mode (rayon's built-in sequential
+# fallback); a future wasm-bindgen-rayon thread-pool init in ldsc-web will
+# upgrade it to Web Worker parallelism.
 rayon = "1"
 
 # Statistical distributions — replaces scipy.stats.chi2 for p-value derivation.
@@ -88,7 +97,23 @@ mimalloc = { version = "0.1", optional = true }
 fastrand = "2.3.0"
 
 # Memory-mapped I/O for BED files — zero-copy reads, better for GPFS/HPC.
+# Only used by `--mmap` on native; the wasm32 build never reaches that path.
 memmap2 = "0.9"
+
+# ── Native-only deps / features ──────────────────────────────────────────────
+# Cargo unions feature sets across [dependencies] and [target.*.dependencies]
+# tables, so this adds `rayon` to the base `["std","linalg"]` set above —
+# but only when building for a non-wasm target.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+faer = { version = "0.24.0", default-features = false, features = ["rayon"] }
+
+# ── WASM-only deps ───────────────────────────────────────────────────────────
+# statrs 0.18 → nalgebra 0.33 → rand 0.8 → rand_core 0.6 → getrandom 0.2.17.
+# The `js` feature gives getrandom 0.2 a real entropy source backed by the
+# Web Crypto API on wasm32; without it the build fails with the canonical
+# "wasm*-unknown-unknown targets are not supported by default" error.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
 
 [profile.release]
 opt-level     = 3

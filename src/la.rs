@@ -5,6 +5,26 @@ pub type MatF = Mat<f64>;
 pub type MatF32 = Mat<f32>;
 pub type ColF = Mat<f64>; // column vector as n x 1 matrix
 
+/// Default `Par` setting for compute-heavy faer kernels.
+///
+/// On native targets this returns `Par::rayon(0)` (use the global rayon
+/// pool with all cores). On `wasm32-unknown-unknown` this returns
+/// `Par::Seq` — the WASM build disables faer's `rayon` feature
+/// (`spindle` / `atomic-wait` don't compile to wasm), so any
+/// `Par::rayon(_)` value would panic at runtime. The caller-facing API
+/// is identical so the GEMM sites don't need their own cfg gates.
+#[inline]
+pub fn par_default() -> Par {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Par::rayon(0)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Par::Seq
+    }
+}
+
 #[inline]
 pub fn mat_zeros(nrows: usize, ncols: usize) -> MatF {
     Mat::zeros(nrows, ncols)

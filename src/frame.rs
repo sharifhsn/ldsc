@@ -554,7 +554,7 @@ pub fn concat_rows(frames: Vec<Frame>) -> Result<Frame> {
             acc.width(),
             f.width()
         );
-        for ((an, ac), (bn, bc)) in acc.cols.iter_mut().zip(f.cols.into_iter()) {
+        for ((an, ac), (bn, bc)) in acc.cols.iter_mut().zip(f.cols) {
             anyhow::ensure!(
                 *an == bn,
                 "concat_rows: column name mismatch '{}' vs '{}'",

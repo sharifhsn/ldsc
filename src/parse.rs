@@ -1,9 +1,9 @@
 use crate::frame::{self, Frame};
-use crate::la::{MatF, mat_add_in_place, matmul_tn_to};
+use crate::la::{MatF, mat_add_in_place, matmul_tn_to, par_default};
 /// File parsing utilities for `.sumstats`, `.ldscore`, `.annot`, `.frq`, `.bim`,
 /// `.l2.M[_5_50]`, etc. Pure-Rust readers (csv-style) — no polars.
 use anyhow::{Context, Result};
-use faer::{Accum, Par};
+use faer::Accum;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -370,7 +370,7 @@ pub fn read_overlap_matrix(
                     filtered.as_ref(),
                     1.0,
                     Accum::Replace,
-                    Par::rayon(0),
+                    par_default(),
                 );
                 (matrix, keep)
             } else {
@@ -381,7 +381,7 @@ pub fn read_overlap_matrix(
                     stacked.as_ref(),
                     1.0,
                     Accum::Replace,
-                    Par::rayon(0),
+                    par_default(),
                 );
                 (matrix, n_rows)
             };
@@ -460,7 +460,7 @@ pub fn read_overlap_matrix(
                 filtered.as_ref(),
                 1.0,
                 Accum::Replace,
-                Par::rayon(0),
+                par_default(),
             );
             (matrix, keep)
         } else {
@@ -471,7 +471,7 @@ pub fn read_overlap_matrix(
                 stacked.as_ref(),
                 1.0,
                 Accum::Replace,
-                Par::rayon(0),
+                par_default(),
             );
             (matrix, n_rows)
         };

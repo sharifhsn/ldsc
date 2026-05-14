@@ -1,6 +1,6 @@
-use faer::{Accum, Par};
+use faer::Accum;
 
-use crate::la::{ColF, MatF, col_zeros, matmul_tn_to};
+use crate::la::{ColF, MatF, col_zeros, matmul_tn_to, par_default};
 
 /// Jackknife SE and covariance from pseudovalue expansion.
 ///
@@ -41,7 +41,7 @@ pub fn jackknife_se_cov(est: &ColF, delete_values: &MatF, n_blocks: usize) -> (C
         centered.as_ref(),
         1.0,
         Accum::Replace,
-        Par::rayon(0),
+        par_default(),
     );
     let denom = (n_b as f64 - 1.0) * n_b as f64;
     for i in 0..p {
