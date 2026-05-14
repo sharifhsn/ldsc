@@ -12,13 +12,13 @@
 //! 1000G-sized inputs (single-second runs); biobank-scale will need
 //! the wasm-bindgen-rayon Web Worker pool from Workstream C.3.
 
-use ldsc::l2::{L2Config, L2Output, WindowMode, compute_l2_from_bytes};
 use leptos::ev::MouseEvent;
 use leptos::prelude::*;
-use leptos::task::spawn_local;
 
 use super::charts::{percentile, render_l2_histogram, render_l2_vs_maf};
 use super::file_upload::{FileUploadRow, LoadedFile, ReadAs};
+use super::worker_client::{WorkerComputeResult, spawn_compute_l2};
+use crate::worker::{WireL2Config, WireWindowMode};
 
 /// Mode preset radio (mirrors the "Mode" section of the CLI README's
 /// recommendations table). Selecting one auto-toggles the underlying
@@ -80,7 +80,7 @@ struct RunStats {
 }
 
 impl RunStats {
-    fn from_output(out: &L2Output) -> Self {
+    fn from_output(out: &WorkerComputeResult) -> Self {
         let n_snps = out.l2.len();
         let mean_l2 = mean(&out.l2);
         let median_l2 = percentile(&out.l2, 0.5).unwrap_or(0.0);
@@ -110,12 +110,17 @@ pub fn L2Panel() -> impl IntoView {
     let preset = RwSignal::new(ModePreset::Sketch);
     let sketch_d = RwSignal::new(1600u32);
     let snp_level_masking = RwSignal::new(true); // canonical per the README headline
-    let fast_f32 = RwSignal::new(false);
+    // f32 is on by default — ~1.85× faster than f64 with negligible
+    // accuracy hit at chr22 demo scale. Sketch modes implicitly use
+    // f32 anyway (CountSketch ±1 is exactly representable), so this
+    // toggle is only meaningful for the chunked-exact / Python-compat
+    // / per-SNP-exact paths.
+    let fast_f32 = RwSignal::new(true);
     let ld_wind_kb = RwSignal::new(1000.0f64);
 
     // ── Run state ──────────────────────────────────────────────────────
     let is_running = RwSignal::new(false);
-    let result: RwSignal<Option<L2Output>> = RwSignal::new(None);
+    let result: RwSignal<Option<WorkerComputeResult>> = RwSignal::new(None);
     let error: RwSignal<Option<String>> = RwSignal::new(None);
 
     // Re-render charts whenever a new result lands.
@@ -134,7 +139,7 @@ pub fn L2Panel() -> impl IntoView {
     });
 
     let all_loaded = move || {
-        bed.with(|f| f.bytes.is_some())
+        bed.with(|f| f.file_handle.is_some())
             && bim.with(|f| f.text.is_some())
             && fam.with(|f| f.text.is_some())
     };
@@ -160,41 +165,51 @@ pub fn L2Panel() -> impl IntoView {
         let f32_now = fast_f32.get();
         let kb_now = ld_wind_kb.get();
 
-        // Take ownership of the loaded buffers so we can move them
-        // into the spawned task. The signals retain "loaded" status
-        // because we leave name/size in place and only steal the
-        // payload; the parent can still see "loaded" via .is_loaded()
-        // since we put the bytes back at the end.
-        let bed_bytes = bed.with(|f| f.bytes.clone()).expect("bed loaded");
+        // BED stays as a `web_sys::File` handle the whole way —
+        // never read into wasm memory on the main thread. Worker
+        // streams chunks via FileReaderSync. BIM + FAM are small
+        // enough to be already in memory as Strings on the main
+        // thread; we just clone-move them into the worker call.
+        let bed_file = bed
+            .with(|f| f.file_handle.clone())
+            .expect("bed loaded")
+            .take();
         let bim_text = bim.with(|f| f.text.clone()).expect("bim loaded");
         let fam_text = fam.with(|f| f.text.clone()).expect("fam loaded");
 
         let cfg = build_config(preset_now, sketch_d_now, snp_mask_now, f32_now, kb_now);
-
-        spawn_local(async move {
-            // The actual compute is synchronous and CPU-bound — this
-            // blocks the UI thread for ~1-15 s on chr22-sized inputs.
-            // A future Workstream C.3 layer will offload this to a
-            // wasm-bindgen-rayon worker pool.
-            tracing::info!(
-                "Starting L2 compute: {} SNPs (BIM bytes), {} ind (FAM bytes), BED {} bytes",
-                bim_text.len(),
-                fam_text.len(),
-                bed_bytes.len()
-            );
-            let outcome = compute_l2_from_bytes(bed_bytes, &bim_text, &fam_text, cfg);
-            match outcome {
-                Ok(out) => {
-                    tracing::info!("L2 done: {} SNPs in {:.2}s", out.l2.len(), out.wall_seconds);
-                    result.set(Some(out));
-                }
-                Err(e) => {
-                    tracing::error!("L2 failed: {e:?}");
-                    error.set(Some(format!("{e:#}")));
-                }
+        let cfg_json = match serde_json::to_string(&cfg) {
+            Ok(s) => s,
+            Err(e) => {
+                error.set(Some(format!("config JSON serialize: {e}")));
+                is_running.set(false);
+                return;
             }
+        };
+
+        tracing::info!(
+            "Spawning L2 worker: BED size={} bim={} fam={}",
+            bed_file.size(),
+            bim_text.len(),
+            fam_text.len()
+        );
+
+        let on_done = move |out: WorkerComputeResult| {
+            tracing::info!("L2 done: {} SNPs in {:.2}s", out.n_snps, out.wall_seconds);
+            result.set(Some(out));
             is_running.set(false);
-        });
+        };
+        let on_err = move |msg: String| {
+            tracing::error!("L2 worker failed: {msg}");
+            error.set(Some(msg));
+            is_running.set(false);
+        };
+
+        if let Err(e) = spawn_compute_l2(bed_file, bim_text, fam_text, cfg_json, on_done, on_err) {
+            tracing::error!("spawn_compute_l2 failed: {e:?}");
+            error.set(Some(format!("worker spawn: {e:?}")));
+            is_running.set(false);
+        }
     };
 
     view! {
@@ -205,7 +220,7 @@ pub fn L2Panel() -> impl IntoView {
                 <span class="subtitle">"Upload your PLINK genotype trio"</span>
             </div>
             <div class="card-body">
-                <FileUploadRow ext=".bed" read_as=ReadAs::Bytes file=bed />
+                <FileUploadRow ext=".bed" read_as=ReadAs::BlobHandle file=bed />
                 <FileUploadRow ext=".bim" read_as=ReadAs::Text file=bim />
                 <FileUploadRow ext=".fam" read_as=ReadAs::Text file=fam />
                 <p class="text-muted mt-2 mb-0" style="font-size: 0.825rem;">
@@ -255,7 +270,7 @@ pub fn L2Panel() -> impl IntoView {
                             <label class="form-check-label" for="opt-fast-f32">
                                 <code>"--fast-f32"</code>
                                 <span class="text-muted ms-2" style="font-size: 0.825rem;">
-                                    "(f32 GEMM, ~1.85× faster)"
+                                    "(default — f32 GEMM, ~1.85× faster than f64; sketch modes implicitly use f32)"
                                 </span>
                             </label>
                         </div>
@@ -403,17 +418,18 @@ fn SketchSlider(sketch_d: RwSignal<u32>) -> impl IntoView {
     }
 }
 
-/// Translate the UI mode + flags into a concrete `L2Config`.
+/// Translate the UI mode + flags into a JSON-serialisable wire
+/// config. We send this across the worker postMessage boundary, so
+/// it has to be `Serialize` (= `WireL2Config` from `worker::*`).
 fn build_config(
     preset: ModePreset,
     sketch_d: u32,
     snp_mask: bool,
     fast_f32: bool,
     ld_wind_kb: f64,
-) -> L2Config {
-    let mut cfg = L2Config {
-        mode: WindowMode::Kb(ld_wind_kb),
-        // sane defaults; preset overrides below
+) -> WireL2Config {
+    let mut cfg = WireL2Config {
+        mode: WireWindowMode::Kb(ld_wind_kb),
         chunk_size: 200,
         use_f32: fast_f32,
         sketch: None,

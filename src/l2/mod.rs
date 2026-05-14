@@ -982,6 +982,27 @@ pub fn compute_l2_from_bytes(
     let bed = Bed::from_bytes(bed_bytes, n_indiv, snps.len())
         .context("validating BED bytes in compute_l2_from_bytes")?;
 
+    compute_l2_from_bed(bed, snps, n_indiv, config)
+}
+
+/// Compute LD scores from a pre-opened [`Bed`] + parsed BIM + FAM
+/// individual count.
+///
+/// This is the API ldsc-web's Web Worker calls — the Worker
+/// constructs a [`Bed`] backed by a [`crate::bed::BedSource`] that
+/// streams chunks out of a JS `Blob` via `FileReaderSync`, so the
+/// browser never has to load the whole multi-GB BED into wasm
+/// linear memory. Native callers can use the same API with any
+/// `Bed` (e.g. `Bed::builder(path).build()`).
+pub fn compute_l2_from_bed(
+    bed: Bed,
+    snps: Vec<BimRecord>,
+    n_indiv: usize,
+    config: L2Config,
+) -> Result<L2Output> {
+    anyhow::ensure!(!snps.is_empty(), "compute_l2_from_bed: BIM has zero SNPs");
+    anyhow::ensure!(n_indiv > 0, "compute_l2_from_bed: FAM has zero individuals");
+
     let t0 = web_time::Instant::now();
     let (l2_mat, maf) = compute_ldscore_global(
         &snps,
@@ -1004,7 +1025,7 @@ pub fn compute_l2_from_bytes(
         config.sketch_maf_aware,
         config.snp_level_masking,
     )
-    .context("computing LD scores in compute_l2_from_bytes")?;
+    .context("computing LD scores in compute_l2_from_bed")?;
 
     // K = 1: collapse the (n × 1) matrix into a flat Vec<f64>.
     debug_assert_eq!(l2_mat.ncols(), 1);

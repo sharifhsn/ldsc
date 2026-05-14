@@ -47,21 +47,50 @@ impl Bed {
 
     /// Construct a `Bed` from raw `.bed` bytes already in memory.
     ///
-    /// The browser-side counterpart of [`Bed::builder`]: there are no
-    /// `.fam` / `.bim` files on disk to count lines from, so the caller
-    /// must supply `iid_count` (from the parsed `.fam`) and `sid_count`
-    /// (from the parsed `.bim`). The function validates the BED magic
-    /// bytes, SNP-major mode, and that `bytes.len()` matches the
-    /// dimensions implied by `iid_count × sid_count`.
+    /// Browser-side counterpart of [`Bed::builder`]. Equivalent to
+    /// `Bed::from_source(Cursor::new(bytes), …)`; kept as a separate
+    /// constructor because the unit tests use it directly.
     pub fn from_bytes(bytes: Vec<u8>, iid_count: usize, sid_count: usize) -> Result<Self> {
-        anyhow::ensure!(bytes.len() >= 3, "BED bytes too short ({}B)", bytes.len());
+        let len = bytes.len() as u64;
+        Self::from_source(Cursor::new(bytes), iid_count, sid_count, len)
+    }
+
+    /// Construct a `Bed` from any `Read + Seek` byte source — including
+    /// browser `Blob`-backed readers that pull chunks via
+    /// `FileReaderSync` or `FileSystemSyncAccessHandle`. The caller is
+    /// responsible for supplying the dimensions (`iid_count` from
+    /// `.fam` line count, `sid_count` from `.bim` line count) and the
+    /// total `.bed` byte length (cheap from `File.size()` / file
+    /// metadata; required because we can't always seek to the end on a
+    /// Blob-backed source without I/O cost).
+    ///
+    /// Validates BED magic bytes + SNP-major mode + that `file_len`
+    /// matches the dimensions implied by `iid_count × sid_count`. The
+    /// source is consumed (boxed into the resulting `Bed`).
+    pub fn from_source<S: BedSource + 'static>(
+        mut source: S,
+        iid_count: usize,
+        sid_count: usize,
+        file_len: u64,
+    ) -> Result<Self> {
+        anyhow::ensure!(file_len >= 3, "BED too short ({}B)", file_len);
+
+        // Read + validate the 3-byte header in place. Seek back to 0
+        // afterwards so the wrapped BufReader sees a fresh cursor.
+        source
+            .seek(SeekFrom::Start(0))
+            .context("seeking to BED start")?;
+        let mut header = [0u8; 3];
+        source
+            .read_exact(&mut header)
+            .context("reading BED magic header")?;
         anyhow::ensure!(
-            bytes[0] == BED_MAGIC_1 && bytes[1] == BED_MAGIC_2,
-            "BED bytes have invalid magic bytes"
+            header[0] == BED_MAGIC_1 && header[1] == BED_MAGIC_2,
+            "BED has invalid magic bytes"
         );
         anyhow::ensure!(
-            bytes[2] == BED_MODE_SNP_MAJOR,
-            "BED bytes are not SNP-major (mode=1 required)"
+            header[2] == BED_MODE_SNP_MAJOR,
+            "BED is not SNP-major (mode=1 required)"
         );
 
         let bytes_per_snp_u64 = (iid_count as u64)
@@ -72,22 +101,21 @@ impl Bed {
             .checked_mul(sid_count as u64)
             .and_then(|v| v.checked_add(BED_HEADER_LEN))
             .context("BED length overflow")?;
-        let file_len = bytes.len() as u64;
         anyhow::ensure!(
             file_len == expected_len,
-            "BED bytes have invalid length (expected {}, got {})",
+            "BED has invalid length (expected {}, got {})",
             expected_len,
             file_len
         );
         let bytes_per_snp =
             usize::try_from(bytes_per_snp_u64).context("bytes_per_snp does not fit in usize")?;
 
-        let cursor: Box<dyn BedSource> = Box::new(Cursor::new(bytes));
-        // For an in-memory Cursor the BufReader buffer is mostly redundant
-        // (no syscalls to amortize), but keeping it preserves the same
-        // read/seek semantics as the file path so the rest of the code
-        // does not need to branch on the source kind.
-        let reader = BufReader::with_capacity(DEFAULT_STREAM_BUFFER_BYTES, cursor);
+        // For in-memory cursors the BufReader is mostly redundant; for
+        // Blob-backed sources it cuts the per-chunk JS interop cost
+        // significantly (one big slice read amortizes ~32 SNPs of
+        // downstream `read_snp_bytes` calls).
+        let boxed: Box<dyn BedSource> = Box::new(source);
+        let reader = BufReader::with_capacity(DEFAULT_STREAM_BUFFER_BYTES, boxed);
 
         Ok(Bed {
             reader,

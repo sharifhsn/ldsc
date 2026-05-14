@@ -11,6 +11,7 @@ mod file_upload;
 mod footer;
 mod l2_panel;
 mod navbar;
+mod worker_client;
 
 pub use banner::Banner;
 pub use footer::Footer;

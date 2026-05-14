@@ -42,13 +42,42 @@ web-sys = { version = "0.3", features = [
     "FileReader",
     "ProgressEvent",
     "Blob",
+    "BlobPropertyBag",
     "Url",
     "HtmlAnchorElement",
+    # Web Worker bits — main thread spawns the worker, worker uses
+    # FileReaderSync to chunk-read the uploaded BED.
+    "Worker",
+    "WorkerOptions",
+    "WorkerType",
+    "WorkerGlobalScope",
+    "DedicatedWorkerGlobalScope",
+    "MessageEvent",
+    "FileReaderSync",
+    "HtmlCollection",
+    "HtmlHeadElement",
+    "Location",
+    "ErrorEvent",
 ] }
+
+# Bridge from the worker's wasm-bindgen exports to JS via
+# typed serde. We use this to round-trip the L2Output struct
+# (l2 / maf / wall_seconds) back to the main thread.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-wasm-bindgen = "0.6"
 
 # Convenience wrappers for File / FileReader (Promise-friendly).
 gloo-file   = { version = "0.3", features = ["futures"] }
 gloo-events = "0.2"
+
+# `web_sys::File` is `!Send`, but Leptos signals (which we use to
+# stash the picked File between the upload row and the L2 panel)
+# require `Send`. SendWrapper makes any `T` `Send` by panicking if
+# you ever try to access it from a different thread — fine on
+# wasm32 where there's only one (main) thread that can touch web-sys
+# values anyway.
+send_wrapper = "0.6"
 
 # Browser console panic hook for legible errors during dev.
 console_error_panic_hook = "0.1"

@@ -16,10 +16,19 @@ use web_sys::{HtmlInputElement, MouseEvent};
 /// What kind of payload to read out of the picked file.
 #[derive(Clone, Copy)]
 pub enum ReadAs {
-    /// Read as raw bytes — for `.bed`.
+    /// Read as raw bytes — small files where it's cheap. Currently
+    /// unused; the BED uses `BlobHandle` instead so that multi-GB
+    /// files don't have to live in wasm linear memory.
+    #[allow(dead_code)]
     Bytes,
-    /// Read as UTF-8 text — for `.bim` and `.fam`.
+    /// Read as UTF-8 text — for `.bim` (~44 MB at full-genome 1000G)
+    /// and `.fam` (~9 KB-1.3 MB at biobank).
     Text,
+    /// Don't read at all — just hold the `web_sys::File` handle so
+    /// the eventual consumer (Web Worker) can stream chunks itself
+    /// via `FileReaderSync`. This is what the `.bed` row uses; it
+    /// makes the upload essentially free regardless of file size.
+    BlobHandle,
 }
 
 /// One uploaded file's loaded state. The size is tracked separately
@@ -30,11 +39,16 @@ pub struct LoadedFile {
     pub size_bytes: usize,
     pub bytes: Option<Vec<u8>>,
     pub text: Option<String>,
+    /// Raw `web_sys::File` handle for streaming — set by
+    /// [`ReadAs::BlobHandle`]. Wrapped in `SendWrapper` because
+    /// `web_sys::File` is `!Send` but Leptos's `RwSignal` storage
+    /// internally tracks Send-ness.
+    pub file_handle: Option<send_wrapper::SendWrapper<web_sys::File>>,
 }
 
 impl LoadedFile {
     pub fn is_loaded(&self) -> bool {
-        self.bytes.is_some() || self.text.is_some()
+        self.bytes.is_some() || self.text.is_some() || self.file_handle.is_some()
     }
 }
 
@@ -65,10 +79,10 @@ pub fn FileUploadRow(
 
         let name = picked.name();
         let size_bytes = picked.size() as usize;
-        let blob: Blob = picked.into();
 
         match read_as {
             ReadAs::Bytes => {
+                let blob: Blob = picked.into();
                 spawn_local(async move {
                     match read_as_bytes(&blob).await {
                         Ok(bytes) => file.set(LoadedFile {
@@ -76,12 +90,14 @@ pub fn FileUploadRow(
                             size_bytes,
                             bytes: Some(bytes),
                             text: None,
+                            file_handle: None,
                         }),
                         Err(e) => tracing::error!("read_as_bytes failed: {e:?}"),
                     }
                 });
             }
             ReadAs::Text => {
+                let blob: Blob = picked.into();
                 spawn_local(async move {
                     match read_as_text(&blob).await {
                         Ok(text) => file.set(LoadedFile {
@@ -89,9 +105,22 @@ pub fn FileUploadRow(
                             size_bytes,
                             bytes: None,
                             text: Some(text),
+                            file_handle: None,
                         }),
                         Err(e) => tracing::error!("read_as_text failed: {e:?}"),
                     }
+                });
+            }
+            ReadAs::BlobHandle => {
+                // Just keep the File handle. No bytes touched here —
+                // the consumer (Web Worker) will stream chunks via
+                // FileReaderSync as compute progresses.
+                file.set(LoadedFile {
+                    name,
+                    size_bytes,
+                    bytes: None,
+                    text: None,
+                    file_handle: Some(send_wrapper::SendWrapper::new(picked)),
                 });
             }
         }

@@ -21,6 +21,7 @@
 //! the chr22-sized demo case the README headlines.
 
 mod components;
+mod worker;
 
 use leptos::mount::mount_to;
 use leptos::prelude::document;
@@ -90,6 +91,17 @@ fn main() {
     // Lightweight tracing → console.log. Trust level configurable via
     // `?log=debug` later; default to info.
     tracing_wasm::set_as_global_default();
+
+    // The same wasm bundle loads in two contexts: the main document
+    // (where we mount Leptos) and the Web Worker spawned for L2
+    // compute (where we just want the exported `worker_compute_l2`
+    // available — no Leptos mount, no DOM access). Detect by
+    // checking for `window` (only defined on the main thread; in a
+    // dedicated Worker `web_sys::window()` returns `None`).
+    if web_sys::window().is_none() {
+        tracing::info!("ldsc-web bundle loaded in Web Worker context; skipping Leptos mount");
+        return;
+    }
 
     let mount_target = document()
         .get_element_by_id("app-root")

@@ -30,6 +30,14 @@
          also need to copy it into dist/. -->
     <link data-trunk rel="copy-file" href="assets/coi-serviceworker.min.js" />
 
+    <!-- Web Worker shim that runs the same wasm bundle inside a
+         Worker context, where FileReaderSync is available for
+         streaming chunked reads off a Blob-backed BED. The main
+         thread spawns this with `new Worker('worker.js', { type:
+         'module' })` and posts the wasm bundle URLs to it (hash-
+         suffixed by trunk so a hard-coded path would 404). -->
+    <link data-trunk rel="copy-file" href="assets/worker.js" />
+
     <!-- Compile + bundle the ldsc-web crate. data-bin selects this
          binary in case the workspace ever has more than one. -->
     <link data-trunk rel="rust" data-bin="ldsc-web" data-wasm-opt="z" />
