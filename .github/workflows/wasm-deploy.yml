@@ -35,6 +35,13 @@ env:
   # Pin so a trunk minor release can't silently change build behavior.
   # Bump deliberately when we want a newer trunk feature.
   TRUNK_VERSION: v0.21.7
+  # Ubuntu's apt binaryen is stuck on a pre-SIMD-finalisation
+  # version that fails on current rustc wasm32 output with
+  # `invalid code after SIMD prefix`. Pull the upstream release
+  # instead. version_129 matches what's in the homebrew bottle the
+  # local dev environment uses, so CI and laptop wasm-opt are
+  # bit-for-bit the same.
+  BINARYEN_VERSION: version_129
 
 jobs:
   build:
@@ -66,13 +73,18 @@ jobs:
 
       # Binaryen ships wasm-opt; trunk shells out to it for the
       # `data-wasm-opt="z"` directive in index.html (~80 KB strip
-      # on the current single-threaded bundle). There is no
-      # cargo-installable wasm-opt — the binaryen apt package is
-      # the standard route.
+      # on the current single-threaded bundle).
+      #
+      # We can NOT use Ubuntu's apt binaryen — it's pinned to a
+      # pre-SIMD-finalisation snapshot and dies on current rustc
+      # wasm output with `invalid code after SIMD prefix`. Install
+      # the upstream release directly (same source the homebrew
+      # bottle pulls from).
       - name: Install binaryen (provides wasm-opt)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y binaryen
+          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz" \
+            | sudo tar -xz -C /usr/local --strip-components=1
+          wasm-opt --version
 
       # Prebuilt trunk binary release — much faster than `cargo
       # install trunk` (saves ~5-8 min). trunk auto-fetches a
