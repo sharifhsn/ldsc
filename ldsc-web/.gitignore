@@ -1,0 +1,8 @@
+# Trunk build output — not committed; rebuilt by the GH Actions
+# workflow (Workstream E) into dist/ during deploy.
+dist/
+
+# Cargo per-target build artifacts (covered by root .gitignore but
+# duplicated here to be explicit since `ldsc-web/` is a distinct
+# workspace member).
+target/

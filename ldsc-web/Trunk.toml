@@ -1,0 +1,25 @@
+# Trunk build config for ldsc-web.
+#
+# `trunk serve` runs a local dev server (default :8080). `trunk build
+# --release --public-url /ldsc/` produces the static bundle that
+# GitHub Pages serves under https://sharifhsn.github.io/ldsc/.
+
+[build]
+target     = "index.html"
+dist       = "dist"
+public_url = "/ldsc/"
+
+[serve]
+address = "127.0.0.1"
+port    = 8080
+# Force the local dev server to send the COOP/COEP headers that
+# SharedArrayBuffer / Web Workers need under multi-threaded WASM.
+# GH Pages can't send these — `coi-serviceworker` polyfills them in
+# production — but the local dev server should hand them out
+# natively so we don't need to round-trip through the SW.
+headers = { "Cross-Origin-Opener-Policy" = "same-origin", "Cross-Origin-Embedder-Policy" = "require-corp" }
+
+[[hooks]]
+stage   = "post_build"
+command = "sh"
+command_arguments = ["-c", "echo '✓ trunk build complete'"]

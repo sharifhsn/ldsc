@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ldsc-rs — LD Score Regression in the browser</title>
+    <meta name="description" content="Run the ldsc-rs heritability + LD-score pipeline in your browser. Pure-Rust WASM port of Bulik-Sullivan et al.">
+
+    <!-- COOP / COEP polyfill so SharedArrayBuffer (and thus
+         multi-threaded WASM via wasm-bindgen-rayon) works on GitHub
+         Pages. First page load installs the service worker and
+         reloads; subsequent loads have crossOriginIsolated === true.
+         The local dev server already sends these headers natively
+         (see Trunk.toml). -->
+    <script src="coi-serviceworker.min.js"></script>
+
+    <!-- Bootstrap 5.3.x: the LDLink-look base. We don't load
+         Bootstrap's JS — Leptos owns reactivity. -->
+    <link data-trunk rel="copy-file" href="assets/bootstrap.min.css" />
+    <link rel="stylesheet" href="bootstrap.min.css">
+
+    <!-- LDLink-derived palette overrides (~80 LOC). Loaded AFTER
+         Bootstrap so these rules win. -->
+    <link data-trunk rel="copy-file" href="assets/palette.css" />
+    <link rel="stylesheet" href="palette.css">
+
+    <!-- coi-serviceworker is referenced via the script tag above; we
+         also need to copy it into dist/. -->
+    <link data-trunk rel="copy-file" href="assets/coi-serviceworker.min.js" />
+
+    <!-- Compile + bundle the ldsc-web crate. data-bin selects this
+         binary in case the workspace ever has more than one. -->
+    <link data-trunk rel="rust" data-bin="ldsc-web" data-wasm-opt="z" />
+</head>
+<body>
+    <!-- Leptos mounts the entire UI here at startup. Until the wasm
+         bundle finishes downloading + initializing (~1-3 MB on first
+         visit, cached afterwards), the placeholder below renders. -->
+    <div id="app-root">
+        <div class="bootstrapping">Loading ldsc-rs…</div>
+    </div>
+</body>
+</html>

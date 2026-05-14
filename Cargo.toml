@@ -1,3 +1,12 @@
+# The root Cargo.toml is *both* the `ldsc` package manifest AND the
+# workspace root. The workspace adds the `ldsc-web/` Leptos frontend
+# as a sibling member (path-deps on `ldsc`). `cargo publish` from the
+# root only publishes `ldsc`, ignoring `ldsc-web` (it's `publish =
+# false`).
+[workspace]
+members = [".", "ldsc-web"]
+resolver = "2"
+
 [package]
 name          = "ldsc"
 version       = "0.5.0"
@@ -99,6 +108,12 @@ fastrand = "2.3.0"
 # Memory-mapped I/O for BED files — zero-copy reads, better for GPFS/HPC.
 # Only used by `--mmap` on native; the wasm32 build never reaches that path.
 memmap2 = "0.9"
+
+# Cross-target Instant: `std::time::Instant::now()` panics on
+# `wasm32-unknown-unknown` ("time not implemented on this platform").
+# `web-time` is a drop-in replacement that delegates to
+# `performance.now()` on wasm and `std::time::Instant` everywhere else.
+web-time = "1"
 
 # ── Native-only deps / features ──────────────────────────────────────────────
 # Cargo unions feature sets across [dependencies] and [target.*.dependencies]

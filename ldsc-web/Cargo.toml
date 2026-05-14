@@ -1,0 +1,66 @@
+# ldsc-web — Leptos CSR frontend that runs `ldsc` in the browser.
+#
+# Deploys to https://sharifhsn.github.io/ldsc/ as a GitHub Pages
+# project page. Built with `trunk build --release --public-url /ldsc/`.
+#
+# Single-threaded for v1; wasm-bindgen-rayon thread-pool init lands
+# in Workstream C.3 once `coi-serviceworker` is wired up for the
+# COOP/COEP polyfill that SharedArrayBuffer needs under GH Pages.
+
+[package]
+name        = "ldsc-web"
+version     = "0.1.0"
+edition     = "2024"
+description = "Leptos CSR frontend for ldsc"
+license     = "GPL-3.0-only"
+publish     = false
+
+[dependencies]
+# Path-dep on the workspace root crate. ldsc is built for the same
+# wasm32-unknown-unknown target (the root Cargo.toml's
+# `[target.'cfg(target_arch = "wasm32")'.dependencies]` block handles
+# getrandom; faer's rayon feature is auto-off on wasm).
+ldsc = { path = ".." }
+
+# Leptos client-side rendering. `csr` feature picks up the hydration-free
+# build appropriate for a static GH Pages deploy.
+leptos = { version = "0.8", features = ["csr"] }
+
+# wasm-bindgen / web-sys for File / FileReader / Blob.
+wasm-bindgen        = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys              = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlInputElement",
+    "Event",
+    "File",
+    "FileList",
+    "FileReader",
+    "ProgressEvent",
+    "Blob",
+    "Url",
+    "HtmlAnchorElement",
+] }
+
+# Convenience wrappers for File / FileReader (Promise-friendly).
+gloo-file   = { version = "0.3", features = ["futures"] }
+gloo-events = "0.2"
+
+# Browser console panic hook for legible errors during dev.
+console_error_panic_hook = "0.1"
+
+# Logging through the JS console — useful for trace! / debug! during dev.
+tracing            = "0.1"
+tracing-wasm       = "0.2"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+# Plotters histograms / scatter rendered into a <canvas>.
+plotters        = { version = "0.3", default-features = false, features = ["bitmap_backend", "line_series", "histogram", "all_series"] }
+plotters-canvas = "0.3"
+
+# Error helper consistent with the lib crate.
+anyhow = "1"

@@ -1,0 +1,236 @@
+/*
+ * ldsc-web palette — LDLink-inspired (NCI institutional, gov chrome
+ * removed). Loaded AFTER bootstrap.min.css so these rules win.
+ *
+ * Reference: CBIIT/nci-webtools-dceg-linkage on GitHub —
+ * client/src/app/styles/main.scss + bootstrap-variables.scss.
+ */
+
+:root {
+    /* Override Bootstrap 5 CSS variables. These cascade automatically
+     * to .btn-primary, .text-primary, .bg-primary, focus rings, etc. */
+    --bs-primary:        #2a71a5;
+    --bs-primary-rgb:    42, 113, 165;
+    --bs-link-color:     #2a71a5;
+    --bs-link-hover-color: #21628d;
+    --bs-body-font-family: Arial, Helvetica, system-ui, sans-serif;
+    --bs-body-color:     #444444;
+    --bs-secondary-color: #566473;
+    --bs-border-color:   #e5e7eb;
+
+    /* Custom tokens (LDLink palette literal). */
+    --ldlink-nav-bg:        #4a4a4a;
+    --ldlink-nav-hover-bg:  #595959;
+    --ldlink-accent-gold:   #f5ab35;
+    --ldlink-card-header:   #133a55;
+    --ldlink-purple:        #8168b3;
+    --ldlink-banner-bg:     #f0f0f0;
+    --ldlink-footer-bg:     #2a71a5;
+}
+
+/* ── Layout & body ─────────────────────────────────────────────── */
+body {
+    /* Sticky-footer: body fills viewport, main grows, footer pins. */
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+main {
+    flex: 1 0 auto;
+    width: 100%;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 1.5rem 1.25rem 3rem;
+}
+
+/* ── Project banner (replaces the gov banner LDLink ships) ─────── */
+.project-banner {
+    background: var(--ldlink-banner-bg);
+    border-bottom: 1px solid #d4d4d4;
+    color: #444;
+    font-size: 0.825rem;
+    padding: 0.4rem 1rem;
+}
+.project-banner a {
+    color: #2a71a5;
+    text-decoration: none;
+}
+.project-banner a:hover { text-decoration: underline; }
+
+/* ── Top nav (LDLink's dark module bar) ────────────────────────── */
+.app-nav {
+    background: var(--ldlink-nav-bg);
+    color: #fff;
+}
+.app-nav .wordmark {
+    color: #fff;
+    font-weight: 700;
+    font-size: 1.25rem;
+    letter-spacing: -0.01em;
+    text-decoration: none;
+    padding: 0.6rem 0;
+}
+.app-nav .wordmark .v { color: #d4d4d4; font-weight: 400; font-size: 0.85rem; }
+.app-nav .nav-tab {
+    color: #fff;
+    text-decoration: none;
+    padding: 0.85rem 1.25rem;
+    font-weight: 500;
+    border-bottom: 4px solid transparent;
+    transition: background 0.15s, border-color 0.15s;
+    display: inline-block;
+}
+.app-nav .nav-tab:hover {
+    background: var(--ldlink-nav-hover-bg);
+    border-bottom-color: var(--ldlink-accent-gold);
+}
+.app-nav .nav-tab.active {
+    background: var(--ldlink-nav-hover-bg);
+    border-bottom-color: var(--ldlink-accent-gold);
+}
+.app-nav .nav-tab.disabled {
+    color: #b0b0b0;
+    cursor: not-allowed;
+}
+.app-nav .nav-tab.disabled:hover {
+    background: transparent;
+    border-bottom-color: transparent;
+}
+
+/* ── Cards (LDLink's #133a55 header bar) ───────────────────────── */
+.card {
+    border: 1px solid #e0e0e0;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+    margin-bottom: 1.25rem;
+}
+.card-header {
+    background: var(--ldlink-card-header);
+    color: #fff;
+    font-weight: 600;
+    border-bottom: 0;
+}
+.card-header .subtitle {
+    font-weight: 400;
+    color: #d6e3ed;
+    font-size: 0.875rem;
+    margin-left: 0.75rem;
+}
+
+/* ── Footer (LDLink-derived blue, project links only) ──────────── */
+.app-footer {
+    background: var(--ldlink-footer-bg);
+    color: #fff;
+    padding: 1.5rem 1rem;
+    margin-top: 2rem;
+    font-size: 0.875rem;
+    font-weight: 300;
+}
+.app-footer a { color: #fff; text-decoration: underline; }
+.app-footer a:hover { color: var(--ldlink-accent-gold); }
+.app-footer .footer-grid {
+    max-width: 1200px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1.25rem;
+}
+.app-footer h6 {
+    color: #fff;
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+/* ── File upload row ───────────────────────────────────────────── */
+.file-row {
+    display: grid;
+    grid-template-columns: 4rem 1fr auto auto;
+    gap: 0.75rem;
+    align-items: center;
+    padding: 0.55rem 0.85rem;
+    border: 1px solid var(--bs-border-color);
+    border-radius: 6px;
+    margin-bottom: 0.45rem;
+    background: #fff;
+}
+.file-row .ext { font-weight: 600; color: #566473; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.file-row .filename { color: #444; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; }
+.file-row .filename.placeholder { color: #999; font-style: italic; }
+.file-row .size { color: #566473; font-size: 0.85rem; white-space: nowrap; }
+.file-row.loaded { border-color: #b6d4eb; background: #f7fbfd; }
+.file-row.loaded .check { color: #2a71a5; font-weight: 700; }
+
+/* ── Misc small bits ───────────────────────────────────────────── */
+.stat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 0.75rem;
+    margin: 1rem 0 0.75rem;
+}
+.stat-grid .stat {
+    padding: 0.75rem 0.9rem;
+    border: 1px solid var(--bs-border-color);
+    border-radius: 6px;
+    background: #fff;
+}
+.stat-grid .stat .label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #566473;
+}
+.stat-grid .stat .value {
+    font-size: 1.15rem;
+    font-weight: 600;
+    margin-top: 0.2rem;
+    color: #133a55;
+}
+
+canvas.chart {
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    border: 1px solid var(--bs-border-color);
+    border-radius: 6px;
+    background: #fff;
+    margin-top: 0.75rem;
+}
+
+.error-box {
+    color: #842029;
+    background: #f8d7da;
+    border: 1px solid #f1aeb5;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin-top: 1rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85rem;
+    white-space: pre-wrap;
+}
+
+.bootstrapping {
+    text-align: center;
+    color: #566473;
+    margin-top: 30vh;
+    font-size: 1.1rem;
+}
+
+/* Dark-mode comfort: invert backgrounds without losing brand cues. */
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bs-body-bg: #18181b;
+        --bs-body-color: #e5e7eb;
+        --bs-border-color: #2f2f33;
+    }
+    body { background: var(--bs-body-bg); color: var(--bs-body-color); }
+    .file-row, .stat-grid .stat, canvas.chart { background: #1f1f23; }
+    .file-row .filename { color: #d4d4d4; }
+    .stat-grid .stat .value { color: #7eaee0; }
+    .card { background: #1f1f23; border-color: #2f2f33; }
+    .card-body { color: #e5e7eb; }
+    .project-banner { background: #1f1f23; color: #d4d4d4; border-bottom-color: #2f2f33; }
+    .project-banner a { color: #7eaee0; }
+    .file-row.loaded { background: #143046; border-color: #2a71a5; }
+}

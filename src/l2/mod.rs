@@ -240,7 +240,7 @@ pub fn run(args: L2Args) -> Result<()> {
     // Skip when --maf and --pq-exp are both absent: the filter removes essentially no SNPs
     // from well-filtered data (1000G), and costs an extra full BED pass (~4s).
     let verbose_timing = args.verbose_timing;
-    let t_run_start = std::time::Instant::now();
+    let t_run_start = web_time::Instant::now();
     let mut maf_prefilter: Option<Vec<f64>> = None;
     if maf_pre && (args.maf.is_some() || pq_exp.is_some()) {
         let mut bed = Bed::builder(bed_path.as_str())
@@ -405,7 +405,7 @@ pub fn run(args: L2Args) -> Result<()> {
         f64: args.gpu_f64,
     };
 
-    let t_compute_start = std::time::Instant::now();
+    let t_compute_start = web_time::Instant::now();
     let (l2, maf_per_snp) = if args.global_pass || force_global_pass {
         // Legacy single-pass across all chromosomes.
         let bed = Bed::builder(bed_path.as_str())
@@ -537,7 +537,7 @@ pub fn run(args: L2Args) -> Result<()> {
         );
     }
 
-    let t_write_start = std::time::Instant::now();
+    let t_write_start = web_time::Instant::now();
     // bed_idx (original BIM row) != position in all_snps when --extract is active.
     let bed_idx_to_pos: std::collections::HashMap<usize, usize> = all_snps
         .iter()
@@ -982,7 +982,7 @@ pub fn compute_l2_from_bytes(
     let bed = Bed::from_bytes(bed_bytes, n_indiv, snps.len())
         .context("validating BED bytes in compute_l2_from_bytes")?;
 
-    let t0 = std::time::Instant::now();
+    let t0 = web_time::Instant::now();
     let (l2_mat, maf) = compute_ldscore_global(
         &snps,
         bed,

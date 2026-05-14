@@ -1243,7 +1243,7 @@ pub(super) fn compute_ldscore_global(
     let mut contrib_left = MatF::zeros(max_window_size.max(1), n_annot);
     let mut contrib_right = MatF::zeros(chunk_c, n_annot);
 
-    use std::time::Instant;
+    use web_time::Instant;
     let mut t_bed_read = std::time::Duration::ZERO;
     let mut t_norm = std::time::Duration::ZERO;
     let mut t_sketch = std::time::Duration::ZERO;

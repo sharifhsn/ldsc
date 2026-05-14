@@ -499,7 +499,7 @@ pub fn run_h2(args: H2Args) -> Result<()> {
     }
 
     let verbose_timing = args.verbose_timing;
-    let t_start = std::time::Instant::now();
+    let t_start = web_time::Instant::now();
 
     let h2_path = args
         .h2
@@ -2112,7 +2112,7 @@ fn print_gencov_summary(gencov: &GencovFit, fixed_intercept: Option<f64>) {
 
 pub fn run_rg(args: RgArgs) -> Result<()> {
     let verbose_timing = args.verbose_timing;
-    let t_start = std::time::Instant::now();
+    let t_start = web_time::Instant::now();
 
     anyhow::ensure!(
         args.rg.len() >= 2,
