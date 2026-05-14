@@ -20,9 +20,9 @@ chi-squares on those LD scores. The slope is proportional to SNP heritability;
 two GWAS regressed jointly recover their genetic correlation. The compute
 bottleneck is the LD-score step at biobank scale: a custom 50K-individual
 reference panel takes 109 minutes in Python LDSC (measured on r6a.8xlarge,
-32 vCPU, 240 GiB) and 11 minutes in Rust `--fast-f32` exact mode; the standard
-CountSketch shortcut cuts the time further but introduces systematic bias into
-downstream h².
+32 vCPU, 240 GiB) and ~6 minutes in Rust `--fast-f32` exact mode (measured
+358 s on c6a.4xlarge); the standard CountSketch shortcut cuts the time further
+but introduces systematic bias into downstream h².
 
 ## What's different from Python LDSC
 
