@@ -1,3 +1,4 @@
+use crate::frame::{Column, Frame};
 use crate::la::{
     ColF, MatF, col_from_vec, col_len, col_mean, col_zeros, mat_zeros, matmul_nt_to, matmul_tn_to,
     matmul_to,
@@ -5,9 +6,9 @@ use crate::la::{
 /// Heritability and genetic correlation estimation (h2 / rg).
 use anyhow::{Context, Result};
 use faer::{Accum, Par};
-use polars::prelude::*;
 use statrs::distribution::StudentsT;
 use statrs::distribution::{ChiSquared, Continuous, ContinuousCDF, Normal};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
@@ -23,29 +24,73 @@ const MIN_SNPS_WARN: usize = 200_000;
 
 /// Load a scalar (single L2 column) LD score file, aliasing the L2 column.
 /// Used for weight LD scores (always scalar). Comma-separated lists are not allowed.
-fn load_ld(single: Option<&str>, chr_prefix: Option<&str>, alias: &str) -> Result<LazyFrame> {
+fn load_ld(single: Option<&str>, chr_prefix: Option<&str>, alias: &str) -> Result<Frame> {
     if single.map(|s| s.contains(',')).unwrap_or(false)
         || chr_prefix.map(|s| s.contains(',')).unwrap_or(false)
     {
         anyhow::bail!("--w-ld/--w-ld-chr must point to a single fileset (no commas allowed)");
     }
-    match (single, chr_prefix) {
-        (Some(path), _) => {
-            Ok(parse::scan_ldscore(path)?.select([col("SNP"), col("L2").alias(alias)]))
-        }
-        (None, Some(prefix)) => Ok(parse::concat_chrs_any(
+    let f = match (single, chr_prefix) {
+        (Some(path), _) => parse::scan_ldscore(path)?,
+        (None, Some(prefix)) => parse::concat_chrs_any(
             prefix,
             &[".l2.ldscore.gz", ".l2.ldscore.bz2", ".l2.ldscore"],
-        )?
-        .select([col("SNP"), col("L2").alias(alias)])),
+        )?,
         (None, None) => anyhow::bail!(
             "Must specify exactly one of --ref-ld / --ref-ld-chr (or --w-ld / --w-ld-chr)"
         ),
-    }
+    };
+    let mut out = f.select(&["SNP", "L2"])?;
+    out.rename("L2", alias)?;
+    Ok(out)
 }
 
 /// Load reference LD scores, keeping all annotation columns (drops CHR/BP/CM).
 use crate::parse::split_paths;
+
+/// Cast every non-`SNP` column to f64 in place.
+fn cast_non_snp_to_f64(f: &mut Frame) -> Result<()> {
+    let names: Vec<String> = f
+        .column_names_owned()
+        .into_iter()
+        .filter(|n| n != "SNP")
+        .collect();
+    for n in names {
+        let casted = f.column(&n)?.cast_to_f64()?;
+        f.replace_column(&n, casted)?;
+    }
+    Ok(())
+}
+
+/// Load a sumstats file and return a Frame with columns SNP, N (f64), CHI2 (= Z²).
+fn build_sumstats_chi2(path: &str) -> Result<Frame> {
+    let f = parse::scan_sumstats(path)?;
+    let snp = f.column("SNP")?.clone();
+    let n_col = f.column("N")?.cast_to_f64()?;
+    let z_col = f.column("Z")?.cast_to_f64()?;
+    let z = z_col.as_f64()?;
+    let chi2: Vec<f64> = z.iter().map(|x| x * x).collect();
+    let mut out = Frame::new();
+    out.add_column("SNP".into(), snp)?;
+    out.add_column("N".into(), n_col)?;
+    out.add_column("CHI2".into(), Column::F64(chi2))?;
+    Ok(out)
+}
+
+/// Load a sumstats file selecting + aliasing specific columns.
+/// `cols`: list of (input_name, output_name). All non-SNP outputs are cast to f64
+/// unless the input column is Str.
+fn load_sumstats_select(path: &str, cols: &[(&str, &str, bool)]) -> Result<Frame> {
+    // (in_name, out_name, cast_to_f64)
+    let f = parse::scan_sumstats(path)?;
+    let mut out = Frame::new();
+    for (in_name, out_name, cast) in cols {
+        let c = f.column(in_name)?.clone();
+        let c = if *cast { c.cast_to_f64()? } else { c };
+        out.add_column((*out_name).to_string(), c)?;
+    }
+    Ok(out)
+}
 
 fn warn_small_snp_count(n_snps: usize) {
     if n_snps < MIN_SNPS_WARN {
@@ -53,67 +98,43 @@ fn warn_small_snp_count(n_snps: usize) {
     }
 }
 
-fn smart_merge_on_snp(mut left: DataFrame, mut right: DataFrame) -> Result<DataFrame> {
-    let same_order = if left.height() == right.height() {
-        let left_snp = left.column("SNP")?;
-        let right_snp = right.column("SNP")?;
-        let left_snp = if matches!(left_snp.dtype(), DataType::String) {
-            left_snp.clone()
-        } else {
-            left_snp.cast(&DataType::String)?
-        };
-        let right_snp = if matches!(right_snp.dtype(), DataType::String) {
-            right_snp.clone()
-        } else {
-            right_snp.cast(&DataType::String)?
-        };
-        left_snp.equals_missing(&right_snp)
+fn smart_merge_on_snp(left: Frame, right: Frame) -> Result<Frame> {
+    if left.height() == right.height() && left.key_columns_equal(&right, "SNP")? {
+        // Fast path: SNPs are equal-and-ordered → just hstack right's non-SNP columns.
+        let mut out = left;
+        let mut right = right;
+        right.drop_column("SNP")?;
+        out.hstack(right)?;
+        Ok(out)
     } else {
-        false
-    };
-
-    if same_order {
-        right.drop_in_place("SNP")?;
-        let right_cols = right.columns().to_vec();
-        left.hstack_mut(&right_cols)?;
-        Ok(left)
-    } else {
-        let mut args = JoinArgs::new(JoinType::Inner);
-        args.maintain_order = MaintainOrderJoin::Left;
-        Ok(left.join(&right, ["SNP"], ["SNP"], args, None)?)
+        left.join_inner_on(&right, "SNP")
     }
 }
 
-fn load_ld_ref_single_path(path: &str) -> Result<LazyFrame> {
-    let lf = parse::scan_ldscore(path)?;
-    drop_ld_meta(lf)
+fn load_ld_ref_single_path(path: &str) -> Result<Frame> {
+    let f = parse::scan_ldscore(path)?;
+    drop_ld_meta(f)
 }
 
-fn load_ld_ref_single_chr(prefix: &str) -> Result<LazyFrame> {
-    let lf = parse::concat_chrs_any(
+fn load_ld_ref_single_chr(prefix: &str) -> Result<Frame> {
+    let f = parse::concat_chrs_any(
         prefix,
         &[".l2.ldscore.gz", ".l2.ldscore.bz2", ".l2.ldscore"],
     )?;
-    drop_ld_meta(lf)
+    drop_ld_meta(f)
 }
 
-fn drop_ld_meta(lf: LazyFrame) -> Result<LazyFrame> {
-    let peek = lf
-        .clone()
-        .limit(0)
-        .collect()
-        .context("peeking ref LD schema")?;
+fn drop_ld_meta(f: Frame) -> Result<Frame> {
     let meta = ["CHR", "BP", "CM"];
-    let keep: Vec<Expr> = peek
-        .get_column_names()
+    let names: Vec<&str> = f
+        .column_names()
         .into_iter()
-        .filter(|n| !meta.contains(&n.as_str()))
-        .map(|n| col(n.as_str()))
+        .filter(|n| !meta.contains(n))
         .collect();
-    Ok(lf.select(keep))
+    f.select(&names)
 }
 
-fn load_ld_ref(single: Option<&str>, chr_prefix: Option<&str>) -> Result<LazyFrame> {
+fn load_ld_ref(single: Option<&str>, chr_prefix: Option<&str>) -> Result<Frame> {
     match (single, chr_prefix) {
         (Some(path), None) => {
             let paths = split_paths(path);
@@ -136,67 +157,45 @@ fn load_ld_ref(single: Option<&str>, chr_prefix: Option<&str>) -> Result<LazyFra
     }
 }
 
-fn load_ld_ref_multi_paths(paths: &[String], chr_split: bool) -> Result<LazyFrame> {
+fn load_ld_ref_multi_paths(paths: &[String], chr_split: bool) -> Result<Frame> {
     anyhow::ensure!(!paths.is_empty(), "Empty LD score list");
-    let mut dfs: Vec<DataFrame> = Vec::new();
+    let mut frames: Vec<Frame> = Vec::new();
     for p in paths {
-        let lf = if chr_split {
+        let f = if chr_split {
             load_ld_ref_single_chr(p)?
         } else {
             load_ld_ref_single_path(p)?
         };
-        dfs.push(
-            lf.collect()
-                .with_context(|| format!("loading LD scores '{}'", p))?,
-        );
+        frames.push(f);
     }
-    let mut base = dfs.remove(0);
+    let mut base = frames.remove(0);
     // Match Python: suffix columns from the first file with _0.
     let base_cols: Vec<String> = base
-        .get_column_names()
-        .iter()
-        .filter(|c| c.as_str() != "SNP")
-        .map(|c| c.to_string())
-        .collect();
-    for c in base_cols {
-        let new_name = format!("{}{}", c, "_0");
-        base.rename(c.as_str(), new_name.into())?;
-    }
-    let base_snps: Vec<Option<String>> = base
-        .column("SNP")?
-        .as_materialized_series()
-        .str()?
+        .column_names_owned()
         .into_iter()
-        .map(|opt| opt.map(|s| s.to_string()))
+        .filter(|c| c != "SNP")
         .collect();
-    for (idx, df) in dfs.into_iter().enumerate() {
-        let snps: Vec<Option<String>> = df
-            .column("SNP")?
-            .as_materialized_series()
-            .str()?
-            .into_iter()
-            .map(|opt| opt.map(|s| s.to_string()))
-            .collect();
+    for c in &base_cols {
+        let new_name = format!("{}_0", c);
+        base.rename(c, &new_name)?;
+    }
+    for (idx, f) in frames.into_iter().enumerate() {
         anyhow::ensure!(
-            snps == base_snps,
+            base.key_columns_equal(&f, "SNP")?,
             "LD Scores for concatenation must have identical SNP columns"
         );
-        let mut df = df.clone();
-        df.drop_in_place("SNP")?;
-        // Match Python: add _i suffix to each column from the i-th file.
+        let mut f = f;
+        f.drop_column("SNP")?;
+        // Match Python: add _(i+1) suffix to each column from the (i+1)-th file.
         let suffix = format!("_{}", idx + 1);
-        let cols: Vec<String> = df
-            .get_column_names()
-            .iter()
-            .map(|c| c.to_string())
-            .collect();
-        for c in cols {
+        let cols: Vec<String> = f.column_names_owned();
+        for c in &cols {
             let new_name = format!("{}{}", c, suffix);
-            df.rename(c.as_str(), new_name.into())?;
+            f.rename(c, &new_name)?;
         }
-        base.hstack_mut(df.columns())?;
+        base.hstack(f)?;
     }
-    Ok(base.lazy())
+    Ok(base)
 }
 
 fn resolve_m(
@@ -326,22 +325,22 @@ fn column_is_zero_variance(values: &ColF) -> bool {
     true
 }
 
-fn drop_zero_variance_ld(ref_ld: &DataFrame) -> Result<(DataFrame, Vec<usize>, usize)> {
+fn drop_zero_variance_ld(ref_ld: &Frame) -> Result<(Frame, Vec<usize>, usize)> {
     let mut keep_cols: Vec<String> = Vec::new();
     let mut keep_idx: Vec<usize> = Vec::new();
     let mut any_zero = false;
     let mut total = 0usize;
 
-    for name in ref_ld.get_column_names() {
+    for name in ref_ld.column_names_owned() {
         if name == "SNP" {
-            keep_cols.push(name.to_string());
+            keep_cols.push(name);
             continue;
         }
-        let values = extract_f64(ref_ld, name)?;
+        let values = extract_f64(ref_ld, &name)?;
         if column_is_zero_variance(&values) {
             any_zero = true;
         } else {
-            keep_cols.push(name.to_string());
+            keep_cols.push(name);
             keep_idx.push(total);
         }
         total += 1;
@@ -358,8 +357,9 @@ fn drop_zero_variance_ld(ref_ld: &DataFrame) -> Result<(DataFrame, Vec<usize>, u
         println!("  Removing partitioned L2 columns with zero variance.");
     }
 
-    let df = ref_ld.select(&keep_cols)?;
-    Ok((df, keep_idx, total))
+    let names_ref: Vec<&str> = keep_cols.iter().map(|s| s.as_str()).collect();
+    let f = ref_ld.select(&names_ref)?;
+    Ok((f, keep_idx, total))
 }
 
 fn filter_by_mask(v: &ColF, mask: &[bool]) -> ColF {
@@ -381,15 +381,9 @@ fn filter_strings_by_mask(v: &[String], mask: &[bool]) -> Vec<String> {
 }
 
 fn ensure_sumstats_have_alleles(path: &str) -> Result<()> {
-    let lf = parse::scan_sumstats(path)?;
-    let header = lf
-        .limit(0)
-        .collect()
-        .with_context(|| format!("peeking sumstats header '{}'", path))?;
-    let cols = header.get_column_names();
-    let has = |n: &str| cols.iter().any(|c| *c == n);
+    let f = parse::scan_sumstats(path)?;
     anyhow::ensure!(
-        has("A1") && has("A2"),
+        f.has_column("A1") && f.has_column("A2"),
         "Sumstats file '{}' is missing A1/A2 columns (required unless --no-check-alleles)",
         path
     );
@@ -432,21 +426,21 @@ fn match_and_flip(a1: char, a2: char, b1: char, b2: char) -> Option<bool> {
     None
 }
 
-fn align_rg_alleles(merged: &DataFrame, z2: &ColF) -> Result<(Vec<bool>, Vec<f64>, usize)> {
-    let a1_1 = merged.column("A1_1")?.as_materialized_series().str()?;
-    let a2_1 = merged.column("A2_1")?.as_materialized_series().str()?;
-    let a1_2 = merged.column("A1_2")?.as_materialized_series().str()?;
-    let a2_2 = merged.column("A2_2")?.as_materialized_series().str()?;
+fn align_rg_alleles(merged: &Frame, z2: &ColF) -> Result<(Vec<bool>, Vec<f64>, usize)> {
+    let a1_1 = merged.column("A1_1")?.as_str()?;
+    let a2_1 = merged.column("A2_1")?.as_str()?;
+    let a1_2 = merged.column("A1_2")?.as_str()?;
+    let a2_2 = merged.column("A2_2")?.as_str()?;
 
     let mut mask: Vec<bool> = Vec::with_capacity(merged.height());
     let mut z2_aligned: Vec<f64> = Vec::new();
     let mut removed = 0usize;
 
     for i in 0..merged.height() {
-        let a1 = a1_1.get(i).unwrap_or("").to_ascii_uppercase();
-        let a2 = a2_1.get(i).unwrap_or("").to_ascii_uppercase();
-        let b1 = a1_2.get(i).unwrap_or("").to_ascii_uppercase();
-        let b2 = a2_2.get(i).unwrap_or("").to_ascii_uppercase();
+        let a1 = a1_1[i].as_deref().unwrap_or("").to_ascii_uppercase();
+        let a2 = a2_1[i].as_deref().unwrap_or("").to_ascii_uppercase();
+        let b1 = a1_2[i].as_deref().unwrap_or("").to_ascii_uppercase();
+        let b2 = a2_2[i].as_deref().unwrap_or("").to_ascii_uppercase();
 
         if !is_valid_snp(&a1, &a2) || !is_valid_snp(&b1, &b2) {
             mask.push(false);
@@ -511,28 +505,16 @@ pub fn run_h2(args: H2Args) -> Result<()> {
         .h2
         .as_ref()
         .context("--h2 is required unless --h2-cts is set")?;
-    let z = col("Z").cast(DataType::Float64);
-    let sumstats_lf = parse::scan_sumstats(h2_path)?
-        .with_columns([
-            col("N").cast(DataType::Float64).alias("N"),
-            (z.clone() * z).alias("CHI2"),
-        ])
-        .select([col("SNP"), col("N"), col("CHI2")]);
-    // Reference LD keeps all annotation columns (scalar or partitioned).
-    let ref_ld =
-        load_ld_ref(args.ref_ld.as_deref(), args.ref_ld_chr.as_deref())?.with_columns([all()
-            .exclude_cols(["SNP"])
-            .as_expr()
-            .cast(DataType::Float64)]);
-    let w_ld = load_ld(args.w_ld.as_deref(), args.w_ld_chr.as_deref(), "w_l2")?
-        .with_columns([col("w_l2").cast(DataType::Float64).alias("w_l2")]);
-
-    let sumstats_df = sumstats_lf.collect().context("loading sumstats")?;
-    let ref_ld_df = ref_ld.collect().context("loading ref LD scores")?;
+    let sumstats_df = build_sumstats_chi2(h2_path).context("loading sumstats")?;
+    let mut ref_ld_df = load_ld_ref(args.ref_ld.as_deref(), args.ref_ld_chr.as_deref())
+        .context("loading ref LD scores")?;
+    cast_non_snp_to_f64(&mut ref_ld_df)?;
     let (ref_ld_df, keep_idx, k_full) = drop_zero_variance_ld(&ref_ld_df)?;
     let merged = smart_merge_on_snp(sumstats_df, ref_ld_df)
         .context("merging sumstats with reference LD scores")?;
-    let w_ld_df = w_ld.collect().context("loading weight LD scores")?;
+    let mut w_ld_df = load_ld(args.w_ld.as_deref(), args.w_ld_chr.as_deref(), "w_l2")
+        .context("loading weight LD scores")?;
+    cast_non_snp_to_f64(&mut w_ld_df)?;
     let merged = smart_merge_on_snp(merged, w_ld_df).context("merging with weight LD scores")?;
 
     if verbose_timing {
@@ -557,10 +539,9 @@ pub fn run_h2(args: H2Args) -> Result<()> {
     let non_l2_set: std::collections::HashSet<&str> =
         ["SNP", "CHI2", "N", "w_l2"].iter().copied().collect();
     let l2_cols: Vec<String> = merged
-        .get_column_names()
+        .column_names_owned()
         .into_iter()
         .filter(|n| !non_l2_set.contains(n.as_str()))
-        .map(|s| s.to_string())
         .collect();
     let k = l2_cols.len();
     anyhow::ensure!(k > 0, "No L2 annotation columns found in merged dataset");
@@ -811,27 +792,16 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
         "--h2-cts requires --w-ld-chr (not --w-ld)"
     );
 
-    let z = col("Z").cast(DataType::Float64);
-    let sumstats_lf = parse::scan_sumstats(sumstats_path)?
-        .with_columns([
-            col("N").cast(DataType::Float64).alias("N"),
-            (z.clone() * z).alias("CHI2"),
-        ])
-        .select([col("SNP"), col("N"), col("CHI2")]);
-    let ref_ld =
-        load_ld_ref(args.ref_ld.as_deref(), args.ref_ld_chr.as_deref())?.with_columns([all()
-            .exclude_cols(["SNP"])
-            .as_expr()
-            .cast(DataType::Float64)]);
-    let w_ld = load_ld(args.w_ld.as_deref(), args.w_ld_chr.as_deref(), "w_l2")?
-        .with_columns([col("w_l2").cast(DataType::Float64).alias("w_l2")]);
-
-    let sumstats_df = sumstats_lf.collect().context("loading sumstats")?;
-    let ref_ld_df = ref_ld.collect().context("loading ref LD scores")?;
+    let sumstats_df = build_sumstats_chi2(sumstats_path).context("loading sumstats")?;
+    let mut ref_ld_df = load_ld_ref(args.ref_ld.as_deref(), args.ref_ld_chr.as_deref())
+        .context("loading ref LD scores")?;
+    cast_non_snp_to_f64(&mut ref_ld_df)?;
     let (ref_ld_df, keep_idx, k_full) = drop_zero_variance_ld(&ref_ld_df)?;
     let merged = smart_merge_on_snp(sumstats_df, ref_ld_df)
         .context("merging sumstats with reference LD scores")?;
-    let w_ld_df = w_ld.collect().context("loading weight LD scores")?;
+    let mut w_ld_df = load_ld(args.w_ld.as_deref(), args.w_ld_chr.as_deref(), "w_l2")
+        .context("loading weight LD scores")?;
+    cast_non_snp_to_f64(&mut w_ld_df)?;
     let merged = smart_merge_on_snp(merged, w_ld_df).context("merging with weight LD scores")?;
 
     let n_total = merged.height();
@@ -847,10 +817,9 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
     let non_l2_set: std::collections::HashSet<&str> =
         ["SNP", "CHI2", "N", "w_l2"].iter().copied().collect();
     let l2_cols: Vec<String> = merged
-        .get_column_names()
+        .column_names_owned()
         .into_iter()
         .filter(|n| !non_l2_set.contains(n.as_str()))
-        .map(|s| s.to_string())
         .collect();
     let k_base = l2_cols.len();
     anyhow::ensure!(
@@ -868,10 +837,9 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
 
     let snp_raw: Vec<String> = merged
         .column("SNP")?
-        .as_materialized_series()
-        .str()?
-        .into_iter()
-        .map(|opt| opt.unwrap_or("").to_string())
+        .as_str()?
+        .iter()
+        .map(|opt| opt.as_deref().unwrap_or("").to_string())
         .collect();
 
     let n_raw = col_len(&chi2_raw);
@@ -965,51 +933,45 @@ fn run_h2_cts(args: &H2Args) -> Result<()> {
         let m_cts = parse::read_m_vec_list(&ct_prefixes, suffix)
             .with_context(|| format!("reading M files for '{}'", ct_ld_chr))?;
 
-        let cts_ld = load_ld_ref(None, Some(ct_ld_chr.as_str()))
-            .context("loading CTS LD scores")?
-            .collect()
-            .context("collecting CTS LD scores")?;
+        let cts_ld =
+            load_ld_ref(None, Some(ct_ld_chr.as_str())).context("loading CTS LD scores")?;
         let cts_cols: Vec<String> = cts_ld
-            .get_column_names()
-            .iter()
-            .filter(|c| c.as_str() != "SNP")
-            .map(|c| c.to_string())
+            .column_names_owned()
+            .into_iter()
+            .filter(|c| c != "SNP")
             .collect();
 
-        let keep_df = DataFrame::new_infer_height(vec![
-            Series::new("SNP".into(), keep_snps.clone()).into(),
-            Series::new(
-                "idx".into(),
-                (0..keep_snps.len()).map(|i| i as u32).collect::<Vec<u32>>(),
-            )
-            .into(),
-        ])?;
-        let mut joined = keep_df.join(
-            &cts_ld,
-            ["SNP"],
-            ["SNP"],
-            JoinArgs::new(JoinType::Left),
-            None,
-        )?;
-        joined = joined.sort(["idx"], SortMultipleOptions::default())?;
-
-        let mut cts_arrays: Vec<ColF> = Vec::new();
-        for col in &cts_cols {
-            let s = joined
-                .column(col)
-                .with_context(|| format!("CTS column '{}'", col))?
-                .cast(&DataType::Float64)
-                .with_context(|| format!("casting CTS column '{}'", col))?;
-            let ca = s
-                .f64()
-                .with_context(|| format!("CTS column '{}' as f64", col))?;
-            let mut v = Vec::with_capacity(n_obs);
-            for val in ca.into_iter() {
-                let val = val.ok_or_else(|| {
+        // Build a map SNP → row in cts_ld.
+        let cts_snps = cts_ld.column("SNP")?.as_str()?;
+        let mut cts_idx: HashMap<&str, usize> = HashMap::with_capacity(cts_snps.len());
+        for (i, s) in cts_snps.iter().enumerate() {
+            if let Some(s) = s {
+                cts_idx.entry(s.as_str()).or_insert(i);
+            }
+        }
+        // For each SNP in keep_snps (already in regression order), pull
+        // the row from cts_ld; missing rows are an error (matches Python).
+        let mut cts_arrays: Vec<ColF> = Vec::with_capacity(cts_cols.len());
+        for col_name in &cts_cols {
+            let casted = cts_ld
+                .column(col_name)
+                .with_context(|| format!("CTS column '{}'", col_name))?
+                .cast_to_f64()
+                .with_context(|| format!("casting CTS column '{}'", col_name))?;
+            let src = casted.as_f64()?;
+            let mut v = Vec::with_capacity(keep_snps.len());
+            for snp in &keep_snps {
+                let row = cts_idx.get(snp.as_str()).copied().ok_or_else(|| {
                     anyhow::anyhow!(
                         "Missing some LD scores from cts files. Are you sure all SNPs in ref-ld-chr are also in ref-ld-chr-cts?"
                     )
                 })?;
+                let val = src[row];
+                if val.is_nan() {
+                    anyhow::bail!(
+                        "Missing some LD scores from cts files. Are you sure all SNPs in ref-ld-chr are also in ref-ld-chr-cts?"
+                    );
+                }
                 v.push(val);
             }
             cts_arrays.push(col_from_vec(v));
@@ -2221,18 +2183,17 @@ To match Python, provide {} values (first ignored).",
         );
     }
 
-    let ref_ld = load_ld_ref(args.ref_ld.as_deref(), args.ref_ld_chr.as_deref())?
-        .collect()
+    let mut ref_ld = load_ld_ref(args.ref_ld.as_deref(), args.ref_ld_chr.as_deref())
         .context("loading ref LD scores")?;
-    let w_ld = load_ld(args.w_ld.as_deref(), args.w_ld_chr.as_deref(), "w_l2")?
-        .collect()
+    cast_non_snp_to_f64(&mut ref_ld)?;
+    let mut w_ld = load_ld(args.w_ld.as_deref(), args.w_ld_chr.as_deref(), "w_l2")
         .context("loading weight LD scores")?;
+    cast_non_snp_to_f64(&mut w_ld)?;
 
     let ref_l2_cols: Vec<String> = ref_ld
-        .get_column_names()
+        .column_names_owned()
         .into_iter()
-        .filter(|n| n.as_str() != "SNP")
-        .map(|s| s.to_string())
+        .filter(|n| n != "SNP")
         .collect();
     anyhow::ensure!(
         !ref_l2_cols.is_empty(),
@@ -2250,35 +2211,29 @@ To match Python, provide {} values (first ignored).",
         ensure_sumstats_have_alleles(file1)?;
     }
 
-    let ss1 = if args.no_check_alleles {
-        parse::scan_sumstats(file1)?.select([
-            col("SNP"),
-            col("Z").alias("Z1"),
-            col("N").alias("N1"),
-        ])
+    let ss1_df = if args.no_check_alleles {
+        load_sumstats_select(
+            file1,
+            &[("SNP", "SNP", false), ("Z", "Z1", true), ("N", "N1", true)],
+        )?
     } else {
-        parse::scan_sumstats(file1)?.select([
-            col("SNP"),
-            col("A1").alias("A1_1"),
-            col("A2").alias("A2_1"),
-            col("Z").alias("Z1"),
-            col("N").alias("N1"),
-        ])
-    }
-    .join(
-        ref_ld.clone().lazy(),
-        [col("SNP")],
-        [col("SNP")],
-        JoinArgs::new(JoinType::Inner),
-    )
-    .join(
-        w_ld.clone().lazy(),
-        [col("SNP")],
-        [col("SNP")],
-        JoinArgs::new(JoinType::Inner),
-    );
-
-    let ss1_df = ss1.collect().context("loading primary sumstats")?;
+        load_sumstats_select(
+            file1,
+            &[
+                ("SNP", "SNP", false),
+                ("A1", "A1_1", false),
+                ("A2", "A2_1", false),
+                ("Z", "Z1", true),
+                ("N", "N1", true),
+            ],
+        )?
+    };
+    let ss1_df = ss1_df
+        .join_inner_on(&ref_ld, "SNP")
+        .context("joining sumstats with ref LD")?;
+    let ss1_df = ss1_df
+        .join_inner_on(&w_ld, "SNP")
+        .context("joining sumstats with weight LD")?;
 
     let mut rg_results: Vec<RgPairResult> = Vec::new();
 
@@ -2290,22 +2245,24 @@ To match Python, provide {} values (first ignored).",
         }
 
         let ss2 = if args.no_check_alleles {
-            parse::scan_sumstats(file2)?.select([
-                col("SNP"),
-                col("Z").alias("Z2"),
-                col("N").alias("N2"),
-            ])
+            load_sumstats_select(
+                file2,
+                &[("SNP", "SNP", false), ("Z", "Z2", true), ("N", "N2", true)],
+            )?
         } else {
-            parse::scan_sumstats(file2)?.select([
-                col("SNP"),
-                col("A1").alias("A1_2"),
-                col("A2").alias("A2_2"),
-                col("Z").alias("Z2"),
-                col("N").alias("N2"),
-            ])
+            load_sumstats_select(
+                file2,
+                &[
+                    ("SNP", "SNP", false),
+                    ("A1", "A1_2", false),
+                    ("A2", "A2_2", false),
+                    ("Z", "Z2", true),
+                    ("N", "N2", true),
+                ],
+            )?
         };
 
-        let merged = smart_merge_on_snp(ss1_df.clone(), ss2.collect()?)
+        let merged = smart_merge_on_snp(ss1_df.clone(), ss2)
             .with_context(|| format!("merging {} vs {}", file1, file2))?;
 
         let n_obs = merged.height();
@@ -2679,20 +2636,15 @@ fn print_jackknife_diagnostics(
     }
 }
 
-/// Extract a column from a Polars DataFrame as `ColF`.
-/// Missing values (null) are replaced with NaN.
-fn extract_f64(df: &DataFrame, name: &str) -> Result<ColF> {
-    let series = df
+/// Extract a column from a `Frame` as `ColF`. Missing values become NaN.
+fn extract_f64(df: &Frame, name: &str) -> Result<ColF> {
+    let casted = df
         .column(name)
-        .with_context(|| format!("column '{}' not found in DataFrame", name))?;
-    let ca = series
-        .cast(&DataType::Float64)
+        .with_context(|| format!("column '{}' not found in frame", name))?
+        .cast_to_f64()
         .with_context(|| format!("casting column '{}' to f64", name))?;
-    let ca = ca
-        .f64()
-        .with_context(|| format!("column '{}' as f64 chunked array", name))?;
-    let vec: Vec<f64> = ca.into_iter().map(|v| v.unwrap_or(f64::NAN)).collect();
-    Ok(col_from_vec(vec))
+    let v = casted.as_f64()?.to_vec();
+    Ok(col_from_vec(v))
 }
 
 /// Compute the conversion factor for one trait (sample → liability scale).

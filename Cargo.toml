@@ -48,9 +48,10 @@ exclude       = [
 ]
 
 [dependencies]
-# Data munging — replaces pandas in munge_sumstats.py.
-# decompress feature required for transparent .gz decompression in LazyCsvReader.
-polars = { version = "0.53", features = ["lazy", "csv", "decompress", "strings"] }
+# Note: TSV parsing is handled in src/frame.rs (line-split + flate2 / bzip2-rs
+# for decompression). Replaced polars 0.53 to enable wasm32-unknown-unknown
+# builds — polars' `decompress` (zlib-ng), `psm`, and `home` crates do not
+# compile to WASM; sumstats / LD-score files don't need lazy planning.
 
 faer = "0.24.0"
 

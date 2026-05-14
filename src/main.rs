@@ -1,6 +1,7 @@
 mod bed;
 mod cli;
 mod cts_annot;
+mod frame;
 #[cfg(feature = "gpu")]
 mod gpu;
 mod h2;

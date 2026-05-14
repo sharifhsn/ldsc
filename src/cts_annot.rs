@@ -3,11 +3,11 @@ use crate::la::MatF;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufWriter, Write};
 
 use crate::cli::CtsAnnotArgs;
+use crate::frame::open_text_reader;
 use crate::parse::parse_bim;
-use crate::parse::resolve_text_path;
 
 #[derive(Debug)]
 struct BinSpec {
@@ -152,9 +152,7 @@ fn parse_cts_names(raw: Option<&str>, expected: usize) -> Result<Vec<String>> {
 }
 
 fn read_cts_values(path: &str, snp_ids: &[String]) -> Result<Vec<f64>> {
-    let resolved = resolve_text_path(path)?;
-    let file = File::open(&resolved).with_context(|| format!("opening CTS file '{}'", path))?;
-    let reader = BufReader::new(file);
+    let reader = open_text_reader(path).with_context(|| format!("opening CTS file '{}'", path))?;
     let mut values = Vec::with_capacity(snp_ids.len());
     for (i, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("reading CTS line {}", i + 1))?;

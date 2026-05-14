@@ -1,25 +1,10 @@
-/// Summary statistics munging — Polars LazyFrame pipeline for streaming large files.
+/// Summary statistics munging — pure-Rust pipeline (csv + flate2), no polars.
 use anyhow::{Context, Result};
-use polars::prelude::*;
 use statrs::function::erf::erfc_inv;
-use std::fs::File;
-use std::io::BufWriter;
 
 use crate::cli::MungeArgs;
+use crate::frame::{self, Column, Frame};
 use crate::parse;
-
-fn column_names(lf: &LazyFrame) -> Result<Vec<String>> {
-    let header = lf.clone().limit(0).collect()?;
-    Ok(header
-        .get_column_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect())
-}
-
-fn has_col(cols: &[String], name: &str) -> bool {
-    cols.iter().any(|c| c == name)
-}
 
 /// (uppercase_synonym, canonical_name) pairs.
 const CNAME_MAP: &[(&str, &str)] = &[
@@ -56,7 +41,7 @@ const CNAME_MAP: &[(&str, &str)] = &[
     ("NEA", "A2"),
     // Sample size
     ("N", "N"),
-    ("WEIGHT", "N"), // METAL convention
+    ("WEIGHT", "N"),
     // Z-score
     ("Z", "Z"),
     ("ZSCORE", "Z"),
@@ -101,122 +86,90 @@ pub fn run(args: MungeArgs) -> Result<()> {
              FRQ_A/FRQ_U headers, use --daner-n for values from Nca/Nco columns"
         );
     }
-    let lf = parse::scan_sumstats(&args.sumstats)?;
-    let lf = apply_ignore(lf, args.ignore.as_deref())?;
-    let lf = apply_daner_overrides(lf, &mut args)?;
-    // Apply user overrides before synonym map so non-standard names are canonicalised.
-    let lf = apply_col_overrides(lf, &args)?;
-    let lf = normalize_columns(lf)?;
-    let lf = apply_info_list(lf, args.info_list.as_deref())?;
-    let lf = apply_n_override(lf, &args)?;
-    let lf = filter_pvals(lf)?;
-    let lf = derive_z(lf, args.signed_sumstats.as_deref(), args.a1_inc)?;
-    let lf = filter_snps(lf, args.maf, args.n_min, args.info_min, args.no_alleles)?;
-    let lf = apply_nstudy_filter(lf, args.nstudy.as_deref(), args.nstudy_min)?;
 
-    let lf = if let Some(ref allele_path) = args.merge_alleles {
-        apply_merge_alleles(lf, allele_path)?
-    } else {
-        lf
-    };
-
-    // Drop rows with missing required values (aligns with Python's dropna).
-    let lf = drop_missing_required(lf)?;
+    let mut f = parse::scan_sumstats(&args.sumstats)?;
+    apply_ignore(&mut f, args.ignore.as_deref())?;
+    apply_daner_overrides(&mut f, &mut args)?;
+    apply_col_overrides(&mut f, &args)?;
+    normalize_columns(&mut f)?;
+    apply_info_list(&mut f, args.info_list.as_deref())?;
+    apply_n_override(&mut f, &args)?;
+    filter_pvals(&mut f)?;
+    derive_z(&mut f, args.signed_sumstats.as_deref(), args.a1_inc)?;
+    filter_snps(&mut f, args.maf, args.n_min, args.info_min, args.no_alleles)?;
+    apply_nstudy_filter(&mut f, args.nstudy.as_deref(), args.nstudy_min)?;
+    if let Some(allele_path) = args.merge_alleles.clone() {
+        apply_merge_alleles(&mut f, &allele_path)?;
+    }
+    drop_missing_required(&mut f)?;
 
     // Select output columns: --no-alleles omits A1/A2; --keep-maf includes FRQ.
-    let lf = {
-        let mut output_cols: Vec<Expr> = vec![col("SNP")];
-        if !args.no_alleles {
-            output_cols.push(col("A1"));
-            output_cols.push(col("A2"));
-        }
-        output_cols.push(col("Z"));
-        output_cols.push(col("N"));
-        if args.keep_maf {
-            output_cols.push(col("FRQ"));
-        }
-        lf.select(output_cols)
-    };
+    let mut out_cols: Vec<&str> = vec!["SNP"];
+    if !args.no_alleles {
+        out_cols.push("A1");
+        out_cols.push("A2");
+    }
+    out_cols.push("Z");
+    out_cols.push("N");
+    if args.keep_maf {
+        out_cols.push("FRQ");
+    }
+    let mut f = f.select(&out_cols)?;
 
-    let mut df = lf.collect()?;
-
-    let n_before = df.height();
-    let snp_subset = ["SNP".to_string()];
-    df = df
-        .unique_stable(Some(snp_subset.as_slice()), UniqueKeepStrategy::First, None)
-        .context("deduplicating on SNP column")?;
-    let n_dup = n_before - df.height();
+    let n_before = f.height();
+    f = f.unique_first_on("SNP")?;
+    let n_dup = n_before - f.height();
     if n_dup > 0 {
         println!("  Removed {} duplicate SNPs", n_dup);
     }
 
     let out_path = format!("{}.sumstats.gz", args.out);
-    write_sumstats_gz(&out_path, &mut df)?;
+    frame::write_tsv(&out_path, &f).with_context(|| format!("writing '{}'", out_path))?;
 
-    println!("Munging complete: {} SNPs -> {}", df.height(), out_path);
+    println!("Munging complete: {} SNPs -> {}", f.height(), out_path);
     Ok(())
 }
 
 /// Drop user-specified columns before any other processing.
-///
-/// `ignore_csv` is a comma-separated list of column names to drop.
-/// Names are matched case-insensitively against the actual file header.
-/// Unknown names are silently skipped.
-fn apply_ignore(lf: LazyFrame, ignore_csv: Option<&str>) -> Result<LazyFrame> {
+fn apply_ignore(f: &mut Frame, ignore_csv: Option<&str>) -> Result<()> {
     let csv = match ignore_csv {
         Some(s) => s,
-        None => return Ok(lf),
+        None => return Ok(()),
     };
-
     let to_drop: Vec<&str> = csv.split(',').map(|s| s.trim()).collect();
-    let existing = column_names(&lf)?;
-
-    let keep_cols: Vec<Expr> = existing
-        .iter()
-        .filter(|c| !to_drop.iter().any(|d| c.eq_ignore_ascii_case(d)))
-        .map(|c| col(c.as_str()))
+    let drop_names: Vec<String> = f
+        .column_names_owned()
+        .into_iter()
+        .filter(|c| to_drop.iter().any(|d| c.eq_ignore_ascii_case(d)))
         .collect();
-
-    Ok(lf.select(keep_cols))
-}
-
-fn drop_columns(lf: LazyFrame, drop_cols: &[String]) -> Result<LazyFrame> {
-    if drop_cols.is_empty() {
-        return Ok(lf);
+    for n in drop_names {
+        f.drop_column(&n)?;
     }
-    let existing = column_names(&lf)?;
-    let keep_cols: Vec<Expr> = existing
-        .iter()
-        .filter(|c| !drop_cols.iter().any(|d| d == c.as_str()))
-        .map(|c| col(c.as_str()))
-        .collect();
-    Ok(lf.select(keep_cols))
+    Ok(())
 }
 
-fn apply_daner_overrides(lf: LazyFrame, args: &mut MungeArgs) -> Result<LazyFrame> {
+fn apply_daner_overrides(f: &mut Frame, args: &mut MungeArgs) -> Result<()> {
     if !args.daner && !args.daner_n {
-        return Ok(lf);
+        return Ok(());
     }
-
-    let cols = column_names(&lf)?;
-
+    let cols = f.column_names_owned();
     let find_prefix = |prefix: &str| cols.iter().find(|c| c.starts_with(prefix)).cloned();
 
     let frq_u = find_prefix("FRQ_U_")
         .with_context(|| "Could not find FRQ_U_* column expected for daner format")?;
 
-    let mut lf = lf;
-
-    // Drop any existing FRQ synonyms so the daner FRQ_U_* column wins.
+    // Drop any other FRQ-synonyms so the daner FRQ_U_* column wins.
     let drop_frq: Vec<String> = cols
         .iter()
         .filter(|name| cname_lookup(&name.to_uppercase()) == Some("FRQ") && name.as_str() != frq_u)
         .cloned()
         .collect();
-    lf = drop_columns(lf, &drop_frq)?;
+    for d in drop_frq {
+        f.drop_column(&d)?;
+    }
 
     if frq_u != "FRQ" {
-        lf = lf.rename([frq_u.clone()], vec!["FRQ".to_string()], false);
+        f.rename(&frq_u, "FRQ")?;
     }
 
     if args.daner {
@@ -252,23 +205,16 @@ fn apply_daner_overrides(lf: LazyFrame, args: &mut MungeArgs) -> Result<LazyFram
             .cloned()
             .context("Could not find Nco column expected for daner-n format")?;
         if nca != "N_CAS" {
-            lf = lf.rename([nca], vec!["N_CAS".to_string()], false);
+            f.rename(&nca, "N_CAS")?;
         }
         if nco != "N_CON" {
-            lf = lf.rename([nco], vec!["N_CON".to_string()], false);
+            f.rename(&nco, "N_CON")?;
         }
     }
-
-    Ok(lf)
+    Ok(())
 }
 
-/// Apply explicit column-name overrides before the synonym map runs.
-///
-/// Each `--xxx-col` flag maps a user-specified column name (case-insensitive)
-/// to the canonical internal name.  This lets users handle any non-standard
-/// column name that isn't in `CNAME_MAP`.
-fn apply_col_overrides(lf: LazyFrame, args: &MungeArgs) -> Result<LazyFrame> {
-    // (user_specified_column_name, canonical_name)
+fn apply_col_overrides(f: &mut Frame, args: &MungeArgs) -> Result<()> {
     let overrides: &[(Option<&str>, &str)] = &[
         (args.snp_col.as_deref(), "SNP"),
         (args.n_col.as_deref(), "N"),
@@ -280,442 +226,35 @@ fn apply_col_overrides(lf: LazyFrame, args: &MungeArgs) -> Result<LazyFrame> {
         (args.frq_col.as_deref(), "FRQ"),
         (args.info_col.as_deref(), "INFO"),
     ];
-
-    // Collect existing columns (no data load needed).
-    let existing = column_names(&lf)?;
-
-    let mut old_names: Vec<String> = Vec::new();
-    let mut new_names: Vec<String> = Vec::new();
-
+    let existing = f.column_names_owned();
     for (override_opt, canonical) in overrides {
-        if let Some(user_name) = override_opt {
-            // Case-insensitive match against existing columns.
-            if let Some(actual) = existing.iter().find(|e| e.eq_ignore_ascii_case(user_name))
-                && actual != canonical
-            {
-                old_names.push(actual.clone());
-                new_names.push(canonical.to_string());
-            }
-            // If not found: silently skip; the later select() will
-            // raise a clear error if a required column is ultimately missing.
+        if let Some(user_name) = override_opt
+            && let Some(actual) = existing.iter().find(|e| e.eq_ignore_ascii_case(user_name))
+            && actual != *canonical
+        {
+            f.rename(actual, canonical)?;
         }
     }
-
-    if old_names.is_empty() {
-        return Ok(lf);
-    }
-    Ok(lf.rename(old_names, new_names, false))
+    Ok(())
 }
 
-/// Rename input columns to their canonical names using CNAME_MAP, case-insensitively.
-fn normalize_columns(lf: LazyFrame) -> Result<LazyFrame> {
-    let existing = column_names(&lf)?;
-
-    let mut old_names: Vec<String> = Vec::new();
-    let mut new_names: Vec<String> = Vec::new();
-
+fn normalize_columns(f: &mut Frame) -> Result<()> {
+    let existing = f.column_names_owned();
     for name in &existing {
         let upper = name.to_uppercase();
         if let Some(canonical) = cname_lookup(&upper)
-            && *name != canonical
+            && name != canonical
         {
-            old_names.push(name.to_string());
-            new_names.push(canonical.to_string());
+            f.rename(name, canonical)?;
         }
     }
-
-    if old_names.is_empty() {
-        return Ok(lf);
-    }
-    Ok(lf.rename(old_names, new_names, false))
+    Ok(())
 }
 
-/// Apply --n / --n-cas / --n-con overrides.
-///
-/// Priority:
-///   1. --n   → overwrite (or create) the N column with a constant value.
-///   2. --n-cas + --n-con  → compute N = N-cas + N-con as a constant.
-///   3. Neither → leave N column as-is (must be present in the file).
-fn apply_n_override(lf: LazyFrame, args: &MungeArgs) -> Result<LazyFrame> {
-    // Priority 1: --n constant.
-    if let Some(n) = args.n {
-        return Ok(lf.with_column(lit(n).alias("N")));
-    }
-    // Priority 2: --n-cas + --n-con constants.
-    if let (Some(n_cas), Some(n_con)) = (args.n_cas, args.n_con) {
-        return Ok(lf.with_column(lit(n_cas + n_con).alias("N")));
-    }
-    // Priority 3: N_CAS + N_CON per-row columns (from --n-cas-col / --n-con-col).
-    // Python formula: N = N_total * P / P_max, where P = N_CAS/N_total and
-    // P_max = mean(P) at rows where N_total == max(N_total). This normalizes for
-    // varying case/control ratios across SNPs in meta-analyses.
-    let cols = column_names(&lf)?;
-    if has_col(&cols, "N_CAS") && has_col(&cols, "N_CON") {
-        // Materialize to compute P_max, then add N column and drop N_CAS/N_CON.
-        let mut df = lf
-            .with_columns([
-                (col("N_CAS").cast(DataType::Float64) + col("N_CON").cast(DataType::Float64))
-                    .alias("_N_TOTAL"),
-                col("N_CAS").cast(DataType::Float64).alias("_N_CAS_F64"),
-            ])
-            .collect()
-            .context("collecting N_CAS/N_CON frame")?;
-        let n_total = df.column("_N_TOTAL")?.f64()?;
-        let n_cas_f64 = df.column("_N_CAS_F64")?.f64()?;
-        let max_n = n_total
-            .into_no_null_iter()
-            .fold(f64::NEG_INFINITY, f64::max);
-        // P_max = mean case proportion at rows where N_total == max(N_total).
-        let (sum_p, count_p) = n_total
-            .into_no_null_iter()
-            .zip(n_cas_f64.into_no_null_iter())
-            .filter(|(n, _)| *n == max_n)
-            .map(|(n, nc)| nc / n)
-            .fold((0.0, 0u64), |(s, c), p| (s + p, c + 1));
-        let p_max = if count_p > 0 {
-            sum_p / count_p as f64
-        } else {
-            1.0
-        };
-        // N = N_CAS / P_max (equivalent to N_total * P / P_max).
-        let n_col: Vec<f64> = n_cas_f64.into_no_null_iter().map(|nc| nc / p_max).collect();
-        let _ = df.drop_in_place("_N_TOTAL")?;
-        let _ = df.drop_in_place("_N_CAS_F64")?;
-        let _ = df.drop_in_place("N_CAS").ok();
-        let _ = df.drop_in_place("N_CON").ok();
-        let n_series = Series::new("N".into(), &n_col);
-        df.with_column(n_series.into())?;
-        return Ok(df.lazy());
-    }
-    Ok(lf)
-}
-
-/// Derive Z-score using one of four strategies (in priority order):
-///   1. Z column already present → no-op.
-///   2. BETA + SE present → Z = BETA / SE (lazy expression, no data load).
-///   3. P present + signed column:
-///      a. --signed-sumstats COLNAME,null → use that column with sign(val−null).
-///      b. Auto-detect: BETA → sign(BETA), LOG_ODDS → sign(LOG_ODDS), OR → sign(OR − 1).
-///      Z = sign × Φ⁻¹(1 − P/2).  Requires materialising the frame.
-///   4. `--a1-inc`: A1 always increases → Z = +|Φ⁻¹(1 − P/2)| from P-value.
-///   5. None of the above → pass through; final `select` will report the error.
-fn derive_z(lf: LazyFrame, signed_sumstats: Option<&str>, a1_inc: bool) -> Result<LazyFrame> {
-    let cols = column_names(&lf)?;
-    let has = |n: &str| has_col(&cols, n);
-
-    // If P is present, match Python: always compute Z from P (signed if possible).
-    if has("P") {
-        // --a1-inc: A1 always increases → Z = +|Φ⁻¹(1 − P/2)|.
-        if a1_inc {
-            let mut df = lf
-                .collect()
-                .context("collecting for P→Z (a1-inc) conversion")?;
-            let z_col = p_always_positive(&df).context("P→Z conversion with --a1-inc")?;
-            df.with_column(z_col.into())
-                .context("adding Z column (a1-inc)")?;
-            return Ok(df.lazy());
-        }
-
-        let sign_info: Option<(String, f64)> = if let Some(ss) = signed_sumstats {
-            // --signed-sumstats COLNAME,null_value
-            let parts: Vec<&str> = ss.splitn(2, ',').collect();
-            anyhow::ensure!(
-                parts.len() == 2,
-                "--signed-sumstats must be COLNAME,null_value (e.g. Z,0 or OR,1)"
-            );
-            let col_upper = parts[0].trim().to_uppercase();
-            let null_val: f64 = parts[1]
-                .trim()
-                .parse()
-                .with_context(|| format!("parsing null value from --signed-sumstats '{}'", ss))?;
-            // Case-insensitive match against actual columns.
-            let actual = cols
-                .iter()
-                .find(|c| c.to_uppercase() == col_upper)
-                .map(|c| c.to_string());
-            actual.map(|c| (c, null_val))
-        } else if has("BETA") {
-            Some(("BETA".to_string(), 0.0))
-        } else if has("LOG_ODDS") {
-            Some(("LOG_ODDS".to_string(), 0.0))
-        } else if has("OR") {
-            Some(("OR".to_string(), 1.0))
-        } else {
-            None
-        };
-
-        if let Some((sign_col, null_val)) = sign_info {
-            let mut df = lf.collect().context("collecting for P→Z conversion")?;
-            let z_col = p_and_sign_to_z(&df, &sign_col, null_val)
-                .with_context(|| format!("P→Z using sign column '{}'", sign_col))?;
-            df.with_column(z_col.into())
-                .context("adding Z column to DataFrame")?;
-            return Ok(df.lazy());
-        }
-    }
-
-    if has("Z") {
-        return Ok(lf);
-    }
-
-    // BETA / SE → Z = BETA / SE (lazy expression, no collect needed).
-    if has("BETA") && has("SE") {
-        return Ok(lf.with_column((col("BETA") / col("SE")).alias("Z")));
-    }
-
-    Ok(lf)
-}
-
-/// Compute Z = +|Φ⁻¹(1 − P/2)| for each row (--a1-inc: sign always positive).
-fn p_always_positive(df: &DataFrame) -> Result<Series> {
-    let p_series = df.column("P")?.cast(&DataType::Float64)?;
-    let p_ca = p_series.f64().context("P column as f64")?;
-    let z_vals: Vec<Option<f64>> = p_ca
-        .into_iter()
-        .map(|opt_p| {
-            let p = opt_p?;
-            if !p.is_finite() || p <= 0.0 || p > 1.0 {
-                return None;
-            }
-            let p_clip = p.clamp(1e-300, 1.0);
-            Some((2.0f64).sqrt() * erfc_inv(p_clip))
-        })
-        .collect();
-    Ok(Series::new("Z".into(), z_vals))
-}
-
-/// Compute Z = sign(value − null_val) × |Φ⁻¹(1 − P/2)| element-wise.
-///
-/// `null_val` is the "zero-effect" baseline of the signed column:
-///   • 0.0 for BETA, LOG_ODDS, Z  →  sign = sign(value)
-///   • 1.0 for OR                 →  sign = sign(OR − 1)
-fn p_and_sign_to_z(df: &DataFrame, sign_col: &str, null_val: f64) -> Result<Series> {
-    let p_series = df.column("P")?.cast(&DataType::Float64)?;
-    let p_ca = p_series.f64().context("P column as f64")?;
-
-    let sign_series = df.column(sign_col)?.cast(&DataType::Float64)?;
-    let sign_ca = sign_series
-        .f64()
-        .with_context(|| format!("'{sign_col}' column as f64"))?;
-
-    let z_vals: Vec<Option<f64>> = p_ca
-        .into_iter()
-        .zip(sign_ca)
-        .map(|(opt_p, opt_s)| {
-            let p = opt_p?;
-            let s = opt_s?;
-            if !p.is_finite() || p <= 0.0 || p > 1.0 {
-                return None;
-            }
-            let p_clip = p.clamp(1e-300, 1.0);
-            let abs_z = (2.0f64).sqrt() * erfc_inv(p_clip);
-            // sign = sign(s - null_val)
-            let signed = s - null_val;
-            let sign = if signed > 0.0 {
-                1.0
-            } else if signed < 0.0 {
-                -1.0
-            } else {
-                return None; // indeterminate sign
-            };
-            Some(sign * abs_z)
-        })
-        .collect();
-
-    Ok(Series::new("Z".into(), z_vals))
-}
-
-/// Apply MAF/N/INFO filters, optionally remove strand-ambiguous SNPs.
-/// When `no_alleles` is true the strand-ambiguity check is skipped.
-fn filter_snps(
-    lf: LazyFrame,
-    maf: f64,
-    n_min: f64,
-    info_min: f64,
-    no_alleles: bool,
-) -> Result<LazyFrame> {
-    let cols = column_names(&lf)?;
-    let has = |n: &str| has_col(&cols, n);
-
-    let mut lf = lf;
-
-    // Python default: if N exists and --n-min is unset, use 90th percentile / 1.5.
-    let n_min = if n_min == 0.0 && has("N") {
-        compute_default_n_min(&lf)?.unwrap_or(0.0)
-    } else {
-        n_min
-    };
-
-    // Filter by minimum sample size.
-    if n_min > 0.0 && has("N") {
-        lf = lf.filter(col("N").cast(DataType::Float64).gt_eq(lit(n_min)));
-    }
-
-    // Filter by MAF: remove out-of-bounds FRQ and keep MAF > maf.
-    if has("FRQ") {
-        let frq = col("FRQ").cast(DataType::Float64);
-        let bad = frq.clone().lt(lit(0.0)).or(frq.clone().gt(lit(1.0)));
-        let maf_expr = when(frq.clone().lt(lit(0.5)))
-            .then(frq.clone())
-            .otherwise(lit(1.0) - frq.clone());
-        let pred = bad.not().and(maf_expr.gt(lit(maf)));
-        lf = lf.filter(pred);
-    }
-
-    // Filter by INFO score (applies even if info_min == 0).
-    if has("INFO") {
-        lf = lf.filter(col("INFO").cast(DataType::Float64).gt_eq(lit(info_min)));
-    }
-
-    // Remove invalid or strand-ambiguous SNPs unless --no-alleles.
-    if !no_alleles && has("A1") && has("A2") {
-        lf = lf.with_columns([
-            col("A1").str().to_uppercase().alias("A1"),
-            col("A2").str().to_uppercase().alias("A2"),
-        ]);
-
-        let valid_base = |c: &str| {
-            col(c)
-                .eq(lit("A"))
-                .or(col(c).eq(lit("C")))
-                .or(col(c).eq(lit("G")))
-                .or(col(c).eq(lit("T")))
-        };
-        let not_same = col("A1").neq(col("A2"));
-        let not_ambig = col("A1")
-            .eq(lit("A"))
-            .and(col("A2").eq(lit("T")))
-            .or(col("A1").eq(lit("T")).and(col("A2").eq(lit("A"))))
-            .or(col("A1").eq(lit("C")).and(col("A2").eq(lit("G"))))
-            .or(col("A1").eq(lit("G")).and(col("A2").eq(lit("C"))))
-            .not();
-
-        let valid = valid_base("A1")
-            .and(valid_base("A2"))
-            .and(not_same)
-            .and(not_ambig);
-        lf = lf.filter(valid);
-    }
-
-    Ok(lf)
-}
-
-fn compute_default_n_min(lf: &LazyFrame) -> Result<Option<f64>> {
-    let n_df = lf
-        .clone()
-        .select([col("N").cast(DataType::Float64)])
-        .collect()?;
-    let n_series = n_df.column("N")?.f64()?;
-    let mut vals: Vec<f64> = n_series.into_iter().flatten().collect();
-    if vals.is_empty() {
-        return Ok(None);
-    }
-    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let pos = (vals.len() as f64 - 1.0) * 0.9;
-    let lo = pos.floor() as usize;
-    let hi = pos.ceil() as usize;
-    let p90 = if lo == hi {
-        vals[lo]
-    } else {
-        let frac = pos - lo as f64;
-        vals[lo] + frac * (vals[hi] - vals[lo])
-    };
-    Ok(Some(p90 / 1.5))
-}
-
-fn drop_missing_required(lf: LazyFrame) -> Result<LazyFrame> {
-    let header = lf.clone().limit(0).collect()?;
-    let schema = header.schema();
-    let mut predicate = lit(true);
-    for field in schema.iter_fields() {
-        let name = field.name().as_str();
-        if name == "INFO" {
-            continue;
-        }
-        let mut expr = col(name).is_not_null();
-        if matches!(field.dtype(), DataType::Float32 | DataType::Float64) {
-            expr = expr.and(col(name).is_nan().not());
-        }
-        predicate = predicate.and(expr);
-    }
-    Ok(lf.filter(predicate))
-}
-
-fn filter_pvals(lf: LazyFrame) -> Result<LazyFrame> {
-    let cols = column_names(&lf)?;
-    if !has_col(&cols, "P") {
-        return Ok(lf);
-    }
-    Ok(lf.filter(
-        col("P")
-            .cast(DataType::Float64)
-            .gt(lit(0.0))
-            .and(col("P").cast(DataType::Float64).lt_eq(lit(1.0))),
-    ))
-}
-
-fn complement_expr(col_name: &str) -> Expr {
-    when(col(col_name).eq(lit("A")))
-        .then(lit("T"))
-        .when(col(col_name).eq(lit("T")))
-        .then(lit("A"))
-        .when(col(col_name).eq(lit("C")))
-        .then(lit("G"))
-        .when(col(col_name).eq(lit("G")))
-        .then(lit("C"))
-        .otherwise(lit(""))
-}
-
-fn apply_merge_alleles(lf: LazyFrame, allele_path: &str) -> Result<LazyFrame> {
-    let alleles = parse::scan_sumstats(allele_path)?;
-    let alleles = normalize_columns(alleles)?;
-    let alleles = alleles.select([
-        col("SNP"),
-        col("A1").str().to_uppercase().alias("A1_M"),
-        col("A2").str().to_uppercase().alias("A2_M"),
-    ]);
-
-    let merged = lf.join(
-        alleles,
-        [col("SNP")],
-        [col("SNP")],
-        JoinArgs::new(JoinType::Inner),
-    );
-
-    let a1 = col("A1");
-    let a2 = col("A2");
-    let m1 = col("A1_M");
-    let m2 = col("A2_M");
-    let m1c = complement_expr("A1_M");
-    let m2c = complement_expr("A2_M");
-
-    let matches = a1
-        .clone()
-        .eq(m1.clone())
-        .and(a2.clone().eq(m2.clone()))
-        .or(a1.clone().eq(m1c.clone()).and(a2.clone().eq(m2c.clone())))
-        .or(a1.clone().eq(m2.clone()).and(a2.clone().eq(m1.clone())))
-        .or(a1.eq(m2c).and(a2.eq(m1c)));
-
-    let merged = merged.filter(matches);
-    let header = merged.clone().limit(0).collect()?;
-    let keep: Vec<Expr> = header
-        .get_column_names()
-        .iter()
-        .filter(|c| c.as_str() != "A1_M" && c.as_str() != "A2_M")
-        .map(|c| col(c.as_str()))
-        .collect();
-    Ok(merged.select(keep))
-}
-
-/// Compute the mean of multiple INFO columns and store the result as "INFO".
-///
-/// Useful when a summary-stats file provides per-population imputation scores
-/// (e.g. INFO_EUR, INFO_EAS) and the analyst wants to filter on their mean.
-fn apply_info_list(lf: LazyFrame, info_list: Option<&str>) -> Result<LazyFrame> {
+fn apply_info_list(f: &mut Frame, info_list: Option<&str>) -> Result<()> {
     let list = match info_list {
         Some(s) => s,
-        None => return Ok(lf),
+        None => return Ok(()),
     };
     let requested: Vec<&str> = list
         .split(',')
@@ -723,11 +262,9 @@ fn apply_info_list(lf: LazyFrame, info_list: Option<&str>) -> Result<LazyFrame> 
         .filter(|s| !s.is_empty())
         .collect();
     if requested.is_empty() {
-        return Ok(lf);
+        return Ok(());
     }
-
-    // Match requested names case-insensitively against the actual column names.
-    let existing = column_names(&lf)?;
+    let existing = f.column_names_owned();
     let matched: Vec<String> = requested
         .iter()
         .filter_map(|name| {
@@ -744,68 +281,415 @@ fn apply_info_list(lf: LazyFrame, info_list: Option<&str>) -> Result<LazyFrame> 
         requested.join(", ")
     );
 
-    let n = matched.len() as f64;
-    let sum_expr = matched.iter().skip(1).fold(
-        col(matched[0].as_str()).cast(DataType::Float64),
-        |acc, c| acc + col(c.as_str()).cast(DataType::Float64),
-    );
     println!(
         "  --info-list: computing mean INFO from {} columns: {}",
         matched.len(),
         matched.join(", ")
     );
-    Ok(lf.with_column((sum_expr / lit(n)).alias("INFO")))
+    let n = matched.len() as f64;
+    let casted: Vec<Vec<f64>> = matched
+        .iter()
+        .map(|c| {
+            f.column(c)
+                .and_then(|c| c.cast_to_f64())
+                .map(|c| c.as_f64().unwrap().to_vec())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let h = f.height();
+    let mut info = vec![0.0; h];
+    for col in &casted {
+        for (acc, v) in info.iter_mut().zip(col.iter()) {
+            *acc += *v;
+        }
+    }
+    for v in info.iter_mut() {
+        *v /= n;
+    }
+    if f.has_column("INFO") {
+        f.replace_column("INFO", Column::F64(info))?;
+    } else {
+        f.add_column("INFO".into(), Column::F64(info))?;
+    }
+    Ok(())
 }
 
-/// Filter SNPs by the minimum number of studies they appear in.
-///
-/// `nstudy` names the column holding the per-SNP study count;
-/// `nstudy_min` is the minimum required value (inclusive).
-fn apply_nstudy_filter(
-    lf: LazyFrame,
-    nstudy: Option<&str>,
-    nstudy_min: Option<u64>,
-) -> Result<LazyFrame> {
-    let (col_name, min_val) = match (nstudy, nstudy_min) {
-        (Some(c), Some(m)) => (c, m),
-        _ => return Ok(lf),
+fn apply_n_override(f: &mut Frame, args: &MungeArgs) -> Result<()> {
+    let h = f.height();
+    if let Some(n) = args.n {
+        let v = vec![n; h];
+        if f.has_column("N") {
+            f.replace_column("N", Column::F64(v))?;
+        } else {
+            f.add_column("N".into(), Column::F64(v))?;
+        }
+        return Ok(());
+    }
+    if let (Some(n_cas), Some(n_con)) = (args.n_cas, args.n_con) {
+        let v = vec![n_cas + n_con; h];
+        if f.has_column("N") {
+            f.replace_column("N", Column::F64(v))?;
+        } else {
+            f.add_column("N".into(), Column::F64(v))?;
+        }
+        return Ok(());
+    }
+    if f.has_column("N_CAS") && f.has_column("N_CON") {
+        let n_cas_col = f.column("N_CAS")?.cast_to_f64()?;
+        let n_con_col = f.column("N_CON")?.cast_to_f64()?;
+        let n_cas = n_cas_col.as_f64()?;
+        let n_con = n_con_col.as_f64()?;
+        // N_total = N_CAS + N_CON
+        let n_total: Vec<f64> = n_cas.iter().zip(n_con.iter()).map(|(a, b)| a + b).collect();
+        let max_n = n_total
+            .iter()
+            .copied()
+            .filter(|v| !v.is_nan())
+            .fold(f64::NEG_INFINITY, f64::max);
+        // P_max = mean of N_CAS/N_total at rows where N_total == max_n.
+        let mut sum_p = 0.0;
+        let mut count_p: u64 = 0;
+        for (i, &nt) in n_total.iter().enumerate() {
+            if nt == max_n && nt > 0.0 {
+                sum_p += n_cas[i] / nt;
+                count_p += 1;
+            }
+        }
+        let p_max = if count_p > 0 {
+            sum_p / count_p as f64
+        } else {
+            1.0
+        };
+        let n_col: Vec<f64> = n_cas.iter().map(|nc| nc / p_max).collect();
+        let _ = f.drop_column("N_CAS").ok();
+        let _ = f.drop_column("N_CON").ok();
+        if f.has_column("N") {
+            f.replace_column("N", Column::F64(n_col))?;
+        } else {
+            f.add_column("N".into(), Column::F64(n_col))?;
+        }
+    }
+    Ok(())
+}
+
+fn filter_pvals(f: &mut Frame) -> Result<()> {
+    if !f.has_column("P") {
+        return Ok(());
+    }
+    let casted = f.column("P")?.cast_to_f64()?;
+    let p = casted.as_f64()?;
+    let mask: Vec<bool> = p
+        .iter()
+        .map(|v| !v.is_nan() && *v > 0.0 && *v <= 1.0)
+        .collect();
+    *f = f.filter_rows(&mask)?;
+    Ok(())
+}
+
+/// Derive Z-score using one of four strategies.
+fn derive_z(f: &mut Frame, signed_sumstats: Option<&str>, a1_inc: bool) -> Result<()> {
+    let cols = f.column_names_owned();
+    let has = |n: &str| cols.iter().any(|c| c == n);
+
+    if has("P") {
+        if a1_inc {
+            // Z = +|Φ⁻¹(1 − P/2)|
+            let p = f.column("P")?.cast_to_f64()?;
+            let p = p.as_f64()?;
+            let z: Vec<f64> = p.iter().map(|&pv| p_to_abs_z(pv)).collect();
+            insert_z(f, z)?;
+            return Ok(());
+        }
+        let sign_info: Option<(String, f64)> = if let Some(ss) = signed_sumstats {
+            let parts: Vec<&str> = ss.splitn(2, ',').collect();
+            anyhow::ensure!(
+                parts.len() == 2,
+                "--signed-sumstats must be COLNAME,null_value (e.g. Z,0 or OR,1)"
+            );
+            let col_upper = parts[0].trim().to_uppercase();
+            let null_val: f64 = parts[1]
+                .trim()
+                .parse()
+                .with_context(|| format!("parsing null value from --signed-sumstats '{}'", ss))?;
+            cols.iter()
+                .find(|c| c.to_uppercase() == col_upper)
+                .map(|c| (c.clone(), null_val))
+        } else if has("BETA") {
+            Some(("BETA".to_string(), 0.0))
+        } else if has("LOG_ODDS") {
+            Some(("LOG_ODDS".to_string(), 0.0))
+        } else if has("OR") {
+            Some(("OR".to_string(), 1.0))
+        } else {
+            None
+        };
+
+        if let Some((sign_col, null_val)) = sign_info {
+            let p = f.column("P")?.cast_to_f64()?;
+            let p = p.as_f64()?;
+            let s = f.column(&sign_col)?.cast_to_f64()?;
+            let s = s.as_f64()?;
+            let z: Vec<f64> = p
+                .iter()
+                .zip(s.iter())
+                .map(|(&pv, &sv)| p_signed_to_z(pv, sv, null_val))
+                .collect();
+            insert_z(f, z)?;
+            return Ok(());
+        }
+    }
+    if has("Z") {
+        return Ok(());
+    }
+    if has("BETA") && has("SE") {
+        let beta = f.column("BETA")?.cast_to_f64()?;
+        let se = f.column("SE")?.cast_to_f64()?;
+        let beta = beta.as_f64()?;
+        let se = se.as_f64()?;
+        let z: Vec<f64> = beta.iter().zip(se.iter()).map(|(b, s)| b / s).collect();
+        insert_z(f, z)?;
+    }
+    Ok(())
+}
+
+fn insert_z(f: &mut Frame, z: Vec<f64>) -> Result<()> {
+    if f.has_column("Z") {
+        f.replace_column("Z", Column::F64(z))
+    } else {
+        f.add_column("Z".into(), Column::F64(z))
+    }
+}
+
+fn p_to_abs_z(p: f64) -> f64 {
+    if !p.is_finite() || p <= 0.0 || p > 1.0 {
+        return f64::NAN;
+    }
+    let p_clip = p.clamp(1e-300, 1.0);
+    (2.0f64).sqrt() * erfc_inv(p_clip)
+}
+
+fn p_signed_to_z(p: f64, signed: f64, null_val: f64) -> f64 {
+    if !p.is_finite() || p <= 0.0 || p > 1.0 || signed.is_nan() {
+        return f64::NAN;
+    }
+    let p_clip = p.clamp(1e-300, 1.0);
+    let abs_z = (2.0f64).sqrt() * erfc_inv(p_clip);
+    let s = signed - null_val;
+    if s > 0.0 {
+        abs_z
+    } else if s < 0.0 {
+        -abs_z
+    } else {
+        f64::NAN
+    }
+}
+
+fn filter_snps(f: &mut Frame, maf: f64, n_min: f64, info_min: f64, no_alleles: bool) -> Result<()> {
+    let h = f.height();
+    let mut mask = vec![true; h];
+
+    // Default n_min: 90th-pct N / 1.5 if unset and N present.
+    let n_min = if n_min == 0.0 && f.has_column("N") {
+        compute_default_n_min(f)?.unwrap_or(0.0)
+    } else {
+        n_min
     };
 
-    let existing = column_names(&lf)?;
+    // NaN-aware: a NaN value fails every comparison, so we drop it.
+    // (Spelling out `is_nan() || x < min` is equivalent to `!(x >= min)` but
+    // avoids the negated-partial-ord clippy lint and reads more clearly.)
+    if n_min > 0.0 && f.has_column("N") {
+        let n = f.column("N")?.cast_to_f64()?;
+        let n = n.as_f64()?;
+        for i in 0..h {
+            if n[i].is_nan() || n[i] < n_min {
+                mask[i] = false;
+            }
+        }
+    }
+
+    if f.has_column("FRQ") {
+        let frq = f.column("FRQ")?.cast_to_f64()?;
+        let frq = frq.as_f64()?;
+        for i in 0..h {
+            let v = frq[i];
+            if v.is_nan() || !(0.0..=1.0).contains(&v) {
+                mask[i] = false;
+                continue;
+            }
+            let m = if v < 0.5 { v } else { 1.0 - v };
+            if m.is_nan() || m <= maf {
+                mask[i] = false;
+            }
+        }
+    }
+
+    if f.has_column("INFO") {
+        let info = f.column("INFO")?.cast_to_f64()?;
+        let info = info.as_f64()?;
+        for i in 0..h {
+            if info[i].is_nan() || info[i] < info_min {
+                mask[i] = false;
+            }
+        }
+    }
+
+    if !no_alleles && f.has_column("A1") && f.has_column("A2") {
+        f.uppercase_str_column("A1")?;
+        f.uppercase_str_column("A2")?;
+        let a1 = f.column("A1")?.as_str()?.to_vec();
+        let a2 = f.column("A2")?.as_str()?.to_vec();
+        for i in 0..h {
+            let a1 = a1[i].as_deref().unwrap_or("");
+            let a2 = a2[i].as_deref().unwrap_or("");
+            if !valid_unambig_pair(a1, a2) {
+                mask[i] = false;
+            }
+        }
+    }
+
+    *f = f.filter_rows(&mask)?;
+    Ok(())
+}
+
+fn valid_unambig_pair(a1: &str, a2: &str) -> bool {
+    let valid = |s: &str| matches!(s, "A" | "C" | "G" | "T");
+    if !valid(a1) || !valid(a2) || a1 == a2 {
+        return false;
+    }
+    // strand-ambiguous: A-T, T-A, C-G, G-C
+    !matches!((a1, a2), ("A", "T") | ("T", "A") | ("C", "G") | ("G", "C"))
+}
+
+fn compute_default_n_min(f: &Frame) -> Result<Option<f64>> {
+    let n = f.column("N")?.cast_to_f64()?;
+    let mut vals: Vec<f64> = n
+        .as_f64()?
+        .iter()
+        .copied()
+        .filter(|v| !v.is_nan())
+        .collect();
+    if vals.is_empty() {
+        return Ok(None);
+    }
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pos = (vals.len() as f64 - 1.0) * 0.9;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    let p90 = if lo == hi {
+        vals[lo]
+    } else {
+        let frac = pos - lo as f64;
+        vals[lo] + frac * (vals[hi] - vals[lo])
+    };
+    Ok(Some(p90 / 1.5))
+}
+
+fn drop_missing_required(f: &mut Frame) -> Result<()> {
+    let h = f.height();
+    let mut mask = vec![true; h];
+    let names = f.column_names_owned();
+    for name in names {
+        if name == "INFO" {
+            continue;
+        }
+        match f.column(&name)? {
+            Column::F64(v) => {
+                for i in 0..h {
+                    if v[i].is_nan() {
+                        mask[i] = false;
+                    }
+                }
+            }
+            Column::Str(v) => {
+                for i in 0..h {
+                    if v[i].is_none() || v[i].as_deref().map(|s| s.is_empty()).unwrap_or(true) {
+                        mask[i] = false;
+                    }
+                }
+            }
+        }
+    }
+    *f = f.filter_rows(&mask)?;
+    Ok(())
+}
+
+fn apply_nstudy_filter(f: &mut Frame, nstudy: Option<&str>, nstudy_min: Option<u64>) -> Result<()> {
+    let (col_name, min_val) = match (nstudy, nstudy_min) {
+        (Some(c), Some(m)) => (c, m),
+        _ => return Ok(()),
+    };
+    let existing = f.column_names_owned();
     if let Some(actual) = existing
         .iter()
         .find(|c| c.to_uppercase() == col_name.to_uppercase())
     {
-        let actual_owned = actual.to_string();
+        let actual = actual.clone();
         println!(
             "  --nstudy-min {}: filtering on column '{}'",
-            min_val, actual_owned
+            min_val, actual
         );
-        return Ok(lf.filter(
-            col(actual_owned.as_str())
-                .cast(DataType::Float64)
-                .gt_eq(lit(min_val as f64)),
-        ));
+        let casted = f.column(&actual)?.cast_to_f64()?;
+        let v = casted.as_f64()?;
+        let mask: Vec<bool> = v
+            .iter()
+            .map(|&x| !x.is_nan() && x >= min_val as f64)
+            .collect();
+        *f = f.filter_rows(&mask)?;
+    } else {
+        println!(
+            "  Warning: --nstudy column '{}' not found in file; skipping filter",
+            col_name
+        );
     }
-    println!(
-        "  Warning: --nstudy column '{}' not found in file; skipping filter",
-        col_name
-    );
-    Ok(lf)
+    Ok(())
 }
 
-/// Write a DataFrame as a gzip-compressed tab-separated file.
-fn write_sumstats_gz(path: &str, df: &mut DataFrame) -> Result<()> {
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
+fn complement(c: &str) -> &'static str {
+    match c {
+        "A" => "T",
+        "T" => "A",
+        "C" => "G",
+        "G" => "C",
+        _ => "",
+    }
+}
 
-    let file = File::create(path).with_context(|| format!("creating '{}'", path))?;
-    let gz = GzEncoder::new(BufWriter::new(file), Compression::fast());
-    CsvWriter::new(gz)
-        .with_separator(b'\t')
-        .with_float_scientific(Some(false))
-        .with_float_precision(Some(3))
-        .finish(df)
-        .with_context(|| format!("writing '{}'", path))?;
+fn apply_merge_alleles(f: &mut Frame, allele_path: &str) -> Result<()> {
+    let mut alleles = parse::scan_sumstats(allele_path)?;
+    normalize_columns(&mut alleles)?;
+    alleles.uppercase_str_column("A1")?;
+    alleles.uppercase_str_column("A2")?;
+    alleles.rename("A1", "A1_M")?;
+    alleles.rename("A2", "A2_M")?;
+    let alleles = alleles.select(&["SNP", "A1_M", "A2_M"])?;
+
+    let merged = f.join_inner_on(&alleles, "SNP")?;
+
+    // Allele-match filter.
+    let h = merged.height();
+    let a1 = merged.column("A1")?.as_str()?;
+    let a2 = merged.column("A2")?.as_str()?;
+    let m1 = merged.column("A1_M")?.as_str()?;
+    let m2 = merged.column("A2_M")?.as_str()?;
+    let mut mask = vec![false; h];
+    for i in 0..h {
+        let a1 = a1[i].as_deref().unwrap_or("");
+        let a2 = a2[i].as_deref().unwrap_or("");
+        let m1 = m1[i].as_deref().unwrap_or("");
+        let m2 = m2[i].as_deref().unwrap_or("");
+        let m1c = complement(m1);
+        let m2c = complement(m2);
+        if (a1 == m1 && a2 == m2)
+            || (a1 == m1c && a2 == m2c)
+            || (a1 == m2 && a2 == m1)
+            || (a1 == m2c && a2 == m1c)
+        {
+            mask[i] = true;
+        }
+    }
+    let mut out = merged.filter_rows(&mask)?;
+    out.drop_column("A1_M")?;
+    out.drop_column("A2_M")?;
+    *f = out;
     Ok(())
 }

@@ -1,144 +1,26 @@
+use crate::frame::{self, Frame};
 use crate::la::{MatF, mat_add_in_place, matmul_tn_to};
-/// File parsing utilities: Polars LazyFrame readers for `.sumstats` and `.ldscore` files.
+/// File parsing utilities for `.sumstats`, `.ldscore`, `.annot`, `.frq`, `.bim`,
+/// `.l2.M[_5_50]`, etc. Pure-Rust readers (csv-style) — no polars.
 use anyhow::{Context, Result};
 use faer::{Accum, Par};
-use polars::prelude::*;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
 
-use bzip2_rs::DecoderReader;
-use flate2::read::GzDecoder;
-use tempfile::Builder as TempBuilder;
-
-static BZ2_TEMPFILES: OnceLock<Mutex<Vec<tempfile::TempPath>>> = OnceLock::new();
-static WS_TEMPFILES: OnceLock<Mutex<Vec<tempfile::TempPath>>> = OnceLock::new();
-
-fn maybe_decompress_bz2(path: &str) -> Result<PathBuf> {
-    if !path.ends_with(".bz2") {
-        return Ok(PathBuf::from(path));
-    }
-
-    let input = File::open(path).with_context(|| format!("opening bz2 file '{}'", path))?;
-    let mut decoder = DecoderReader::new(input);
-    let mut tmp = TempBuilder::new()
-        .prefix("ldsc_bz2_")
-        .suffix(".tmp")
-        .tempfile()
-        .context("creating temp file for bz2 decompression")?;
-    std::io::copy(&mut decoder, &mut tmp)
-        .with_context(|| format!("decompressing bz2 file '{}'", path))?;
-
-    let temp_path = tmp.into_temp_path();
-    let temp_buf = temp_path.to_path_buf();
-    BZ2_TEMPFILES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .expect("bz2 tempfiles mutex poisoned")
-        .push(temp_path);
-
-    Ok(temp_buf)
-}
-
-fn store_temp_path(path: tempfile::TempPath) {
-    WS_TEMPFILES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .expect("whitespace tempfiles mutex poisoned")
-        .push(path);
-}
-
-fn first_line_contains_tab(path: &str, gz: bool) -> Result<bool> {
-    use std::io::{BufRead, BufReader};
-    let file = File::open(path).with_context(|| format!("opening '{}'", path))?;
-    let reader: Box<dyn BufRead> = if gz {
-        Box::new(BufReader::new(GzDecoder::new(file)))
-    } else {
-        Box::new(BufReader::new(file))
-    };
-    for line in reader.lines() {
-        let line = line?;
-        if !line.is_empty() {
-            return Ok(line.contains('\t'));
-        }
-    }
-    Ok(false)
-}
-
-fn normalize_whitespace_to_tsv(path: &str, gz: bool) -> Result<PathBuf> {
-    use std::io::{BufRead, BufReader, BufWriter, Write};
-    if first_line_contains_tab(path, gz)? {
-        return Ok(PathBuf::from(path));
-    }
-
-    let file = File::open(path).with_context(|| format!("opening '{}'", path))?;
-    let reader: Box<dyn BufRead> = if gz {
-        Box::new(BufReader::new(GzDecoder::new(file)))
-    } else {
-        Box::new(BufReader::new(file))
-    };
-
-    let mut tmp = TempBuilder::new()
-        .prefix("ldsc_ws_")
-        .suffix(".tmp")
-        .tempfile()
-        .context("creating temp file for whitespace normalization")?;
-    {
-        let mut w = BufWriter::new(&mut tmp);
-        for line in reader.lines() {
-            let line = line?;
-            if line.is_empty() {
-                writeln!(w)?;
-                continue;
-            }
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.is_empty() {
-                writeln!(w)?;
-            } else {
-                writeln!(w, "{}", cols.join("\t"))?;
-            }
-        }
-    }
-
-    let temp_path = tmp.into_temp_path();
-    let temp_buf = temp_path.to_path_buf();
-    store_temp_path(temp_path);
-    Ok(temp_buf)
-}
-
-pub(crate) fn resolve_text_path(path: &str) -> Result<PathBuf> {
-    if path.ends_with(".bz2") {
-        let tmp = maybe_decompress_bz2(path)?;
-        return normalize_whitespace_to_tsv(tmp.to_string_lossy().as_ref(), false);
-    }
-    if path.ends_with(".gz") {
-        return normalize_whitespace_to_tsv(path, true);
-    }
-    normalize_whitespace_to_tsv(path, false)
-}
-
-/// Scan a TSV text file (`.sumstats`, `.ldscore`, etc.) as a Polars LazyFrame.
-/// Handles `.gz` and `.bz2` decompression transparently.
-pub fn scan_tsv(path: &str) -> Result<LazyFrame> {
-    let resolved = resolve_text_path(path)?;
-    let resolved_str = resolved.to_string_lossy();
-    let lf = LazyCsvReader::new(resolved_str.as_ref().into())
-        .with_separator(b'\t')
-        .with_has_header(true)
-        .with_null_values(Some(NullValues::AllColumns(vec!["NA".into(), ".".into()])))
-        .finish()?;
-    Ok(lf)
+/// Read a TSV/whitespace-separated text file (`.sumstats`, `.ldscore`, etc.)
+/// into a `Frame`. Handles `.gz` and `.bz2` decompression transparently.
+pub fn scan_tsv(path: &str) -> Result<Frame> {
+    frame::read_tsv(path)
 }
 
 /// Alias for backward compatibility.
-pub fn scan_sumstats(path: &str) -> Result<LazyFrame> {
+pub fn scan_sumstats(path: &str) -> Result<Frame> {
     scan_tsv(path)
 }
 
 /// Alias for backward compatibility.
-pub fn scan_ldscore(path: &str) -> Result<LazyFrame> {
+pub fn scan_ldscore(path: &str) -> Result<Frame> {
     scan_tsv(path)
 }
 
@@ -245,15 +127,17 @@ pub fn read_m_vec_list(prefixes: &[String], suffix: &str) -> Result<Vec<f64>> {
     Ok(out)
 }
 
-/// Concatenate per-chromosome LazyFrames, accepting .gz, .bz2, or plain files.
-pub fn concat_chrs_any(prefix: &str, suffixes: &[&str]) -> Result<LazyFrame> {
+/// Concatenate per-chromosome frames, accepting .gz, .bz2, or plain files.
+/// Tries each suffix in order; uses the first one that has any chromosome
+/// files present.
+pub fn concat_chrs_any(prefix: &str, suffixes: &[&str]) -> Result<Frame> {
     for suffix in suffixes {
         let chrs = get_present_chrs(prefix, suffix);
         if chrs.is_empty() {
             continue;
         }
 
-        let frames: Vec<LazyFrame> = chrs
+        let frames: Vec<Frame> = chrs
             .iter()
             .map(|chr| {
                 let path = make_chr_path(prefix, *chr, suffix);
@@ -261,7 +145,7 @@ pub fn concat_chrs_any(prefix: &str, suffixes: &[&str]) -> Result<LazyFrame> {
             })
             .collect::<Result<_>>()?;
 
-        return Ok(concat(frames, UnionArgs::default())?);
+        return frame::concat_rows(frames);
     }
 
     anyhow::bail!(
@@ -305,12 +189,9 @@ pub fn resolve_annot_path(prefix: &str) -> Result<String> {
 /// Read a partitioned LD score annotation file into a dense `Mat<f64>`.
 /// `path` must include the extension (e.g., `.annot.gz`).
 pub fn read_annot_path(path: &str, thin: bool) -> Result<(MatF, Vec<String>)> {
-    let df = scan_tsv(path)
-        .with_context(|| format!("scanning annot file '{}'", path))?
-        .collect()
-        .with_context(|| format!("reading annot file '{}'", path))?;
+    let df = scan_tsv(path).with_context(|| format!("scanning annot file '{}'", path))?;
 
-    let all_cols = df.get_column_names();
+    let all_cols = df.column_names_owned();
 
     // Annotation columns start at index 4 for full format, 0 for thin.
     let skip = if thin { 0 } else { 4 };
@@ -327,22 +208,20 @@ pub fn read_annot_path(path: &str, thin: bool) -> Result<(MatF, Vec<String>)> {
         }
     );
 
-    let col_names: Vec<String> = all_cols[skip..].iter().map(|s| s.to_string()).collect();
+    let col_names: Vec<String> = all_cols[skip..].to_vec();
     let n_annot = col_names.len();
     let n_rows = df.height();
 
     let mut matrix = MatF::zeros(n_rows, n_annot);
     for (j, name) in col_names.iter().enumerate() {
-        let s = df
+        let casted = df
             .column(name)
             .with_context(|| format!("column '{}' in annot file '{}'", name, path))?
-            .cast(&DataType::Float64)
+            .cast_to_f64()
             .with_context(|| format!("casting annot column '{}' to f64", name))?;
-        let ca = s
-            .f64()
-            .with_context(|| format!("annot column '{}' as f64", name))?;
-        for (i, val) in ca.into_iter().enumerate() {
-            matrix[(i, j)] = val.unwrap_or(0.0);
+        let v = casted.as_f64()?;
+        for (i, &val) in v.iter().enumerate() {
+            matrix[(i, j)] = if val.is_nan() { 0.0 } else { val };
         }
     }
 
@@ -378,30 +257,25 @@ fn resolve_frq_path(prefix: &str, chr: Option<u8>) -> Result<String> {
 /// Read a .frq file and return a MAF filter mask: keep 0.05 < FRQ < 0.95.
 /// Accepts either FRQ or MAF column names (MAF is renamed to FRQ in Python).
 pub fn read_frq_mask(path: &str) -> Result<Vec<bool>> {
-    let df = scan_tsv(path)
-        .with_context(|| format!("scanning frq file '{}'", path))?
-        .collect()
-        .with_context(|| format!("reading frq file '{}'", path))?;
+    let df = scan_tsv(path).with_context(|| format!("scanning frq file '{}'", path))?;
 
-    let col_name = if df.get_column_names().iter().any(|c| c.as_str() == "FRQ") {
+    let col_name = if df.has_column("FRQ") {
         "FRQ"
-    } else if df.get_column_names().iter().any(|c| c.as_str() == "MAF") {
+    } else if df.has_column("MAF") {
         "MAF"
     } else {
         anyhow::bail!("Frequency file '{}' has no FRQ or MAF column", path);
     };
 
-    let s = df
+    let casted = df
         .column(col_name)
         .with_context(|| format!("column '{}' in frq file '{}'", col_name, path))?
-        .cast(&DataType::Float64)
+        .cast_to_f64()
         .with_context(|| format!("casting '{}' to f64 in frq file '{}'", col_name, path))?;
-    let ca = s
-        .f64()
-        .with_context(|| format!("frq column '{}' as f64", col_name))?;
-    let mask = ca
-        .into_iter()
-        .map(|opt| opt.map(|v| v > 0.05 && v < 0.95).unwrap_or(false))
+    let mask: Vec<bool> = casted
+        .as_f64()?
+        .iter()
+        .map(|v| !v.is_nan() && *v > 0.05 && *v < 0.95)
         .collect();
     Ok(mask)
 }

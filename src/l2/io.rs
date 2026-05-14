@@ -1,5 +1,5 @@
 use crate::la::MatF;
-use crate::parse::{self, BimRecord};
+use crate::parse::BimRecord;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::fs::File;
@@ -169,9 +169,7 @@ pub(super) fn load_snp_set(path: &str) -> Result<HashSet<String>> {
 
 /// Load SNP IDs from a file with exactly one column (Python --print-snps behavior).
 pub(super) fn load_print_snps(path: &str) -> Result<HashSet<String>> {
-    let resolved = parse::resolve_text_path(path)?;
-    let file = File::open(&resolved).with_context(|| format!("opening SNP list '{}'", path))?;
-    let reader = BufReader::new(file);
+    let reader = crate::frame::open_text_reader(path)?;
     let mut set: HashSet<String> = HashSet::new();
     for (i, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("reading SNP line {}", i + 1))?;
