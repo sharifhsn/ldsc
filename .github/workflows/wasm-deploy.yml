@@ -1,0 +1,133 @@
+# Deploys the ldsc-web Leptos WASM frontend to GitHub Pages at
+# https://sharifhsn.github.io/ldsc/.
+#
+# Triggers: every push to main (continuous deploy of the latest demo)
+# and every tag matching `v*` (so a `cargo release` tag also bumps
+# the live site). `workflow_dispatch` lets us re-deploy manually
+# without a code change.
+#
+# Pages source must be "GitHub Actions" (Repo Settings → Pages → Source).
+# The first run will fail with a permission error otherwise.
+
+name: Deploy ldsc-web to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Repo-wide default. Individual jobs that need write scope (the
+# deploy job) opt back in below.
+permissions:
+  contents: read
+
+# Only one Pages deploy at a time. New pushes cancel the in-flight
+# build so the latest commit always wins instead of queueing.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: "0"
+  # Pin so a trunk minor release can't silently change build behavior.
+  # Bump deliberately when we want a newer trunk feature.
+  TRUNK_VERSION: v0.21.7
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Skip on forks so a forked CI doesn't try (and fail) to deploy
+    # to our github-pages environment.
+    if: github.repository == 'sharifhsn/ldsc'
+    steps:
+      - uses: actions/checkout@v4
+
+      # Stable Rust + wasm32 target. Multi-threaded WASM (which would
+      # need nightly + build-std + RUSTFLAGS) was attempted in
+      # Workstream C.3 and reverted — see ldsc-web/src/main.rs doc
+      # comment for the spawn_local-from-event-handler bug. Stable
+      # is sufficient for the single-threaded v1.
+      - name: Install Rust (stable + wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # Cache the wasm target dir separately from native CI; sharing
+      # would corrupt either build's incremental state. Key includes
+      # `wasm` so the existing CI cache stays untouched.
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: wasm
+
+      # Binaryen ships wasm-opt; trunk shells out to it for the
+      # `data-wasm-opt="z"` directive in index.html (~80 KB strip
+      # on the current single-threaded bundle). There is no
+      # cargo-installable wasm-opt — the binaryen apt package is
+      # the standard route.
+      - name: Install binaryen (provides wasm-opt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+
+      # Prebuilt trunk binary release — much faster than `cargo
+      # install trunk` (saves ~5-8 min). trunk auto-fetches a
+      # matching wasm-bindgen-cli on first run, so we don't need
+      # to install that separately.
+      - name: Install trunk
+        run: |
+          curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin
+          trunk --version
+
+      # Trunk reads Trunk.toml from cwd, so we must run from inside
+      # ldsc-web/. --public-url /ldsc/ matches the GitHub Pages
+      # project-page path (https://sharifhsn.github.io/ldsc/).
+      - name: Build (trunk build --release)
+        working-directory: ldsc-web
+        run: trunk build --release --public-url /ldsc/
+
+      # Quick visibility into what we're shipping. Useful for
+      # spotting bundle-size regressions in PR review.
+      - name: Show built artifacts
+        run: |
+          echo "=== ldsc-web/dist ==="
+          ls -lah ldsc-web/dist
+          echo ""
+          echo "=== Total size ==="
+          du -sh ldsc-web/dist
+
+      # Required hand-off step before deploy-pages. Uploads
+      # ldsc-web/dist as the special `github-pages` artifact.
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ldsc-web/dist
+
+  deploy:
+    needs: build
+    # Only deploy from main and from version tags. PRs build but
+    # don't push to the live site.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    # `pages: write` + `id-token: write` are the minimum scopes the
+    # deploy-pages action needs to publish.
+    permissions:
+      pages: write
+      id-token: write
+
+    # Pages-environment binding. The URL is surfaced on the workflow
+    # run page so reviewers can click through to the live demo.
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
