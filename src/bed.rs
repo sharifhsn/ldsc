@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use faer::Mat;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 const BED_MAGIC_1: u8 = 0x6c;
@@ -11,9 +11,18 @@ const BED_HEADER_LEN: u64 = 3;
 const DEFAULT_STREAM_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_READ_BLOCK_BYTES: usize = 32 * 1024 * 1024;
 
-#[derive(Debug)]
+/// Anything that can back a [`Bed`] reader: a seekable byte source.
+/// Blanket-implemented for `File`, `Cursor<Vec<u8>>`, etc.
+///
+/// The trait is `pub` so downstream callers (e.g. the WASM frontend) can
+/// supply their own sources, but in practice the two intended sources
+/// are `File` (via [`Bed::builder`]) and `Cursor<Vec<u8>>` (via
+/// [`Bed::from_bytes`]).
+pub trait BedSource: Read + Seek {}
+impl<T: Read + Seek> BedSource for T {}
+
 pub struct Bed {
-    reader: BufReader<File>,
+    reader: BufReader<Box<dyn BedSource>>,
     iid_count: usize,
     sid_count: usize,
     bytes_per_snp: usize,
@@ -34,6 +43,60 @@ impl Bed {
             stream_buffer_bytes: DEFAULT_STREAM_BUFFER_BYTES,
             read_block_bytes: DEFAULT_READ_BLOCK_BYTES,
         }
+    }
+
+    /// Construct a `Bed` from raw `.bed` bytes already in memory.
+    ///
+    /// The browser-side counterpart of [`Bed::builder`]: there are no
+    /// `.fam` / `.bim` files on disk to count lines from, so the caller
+    /// must supply `iid_count` (from the parsed `.fam`) and `sid_count`
+    /// (from the parsed `.bim`). The function validates the BED magic
+    /// bytes, SNP-major mode, and that `bytes.len()` matches the
+    /// dimensions implied by `iid_count × sid_count`.
+    pub fn from_bytes(bytes: Vec<u8>, iid_count: usize, sid_count: usize) -> Result<Self> {
+        anyhow::ensure!(bytes.len() >= 3, "BED bytes too short ({}B)", bytes.len());
+        anyhow::ensure!(
+            bytes[0] == BED_MAGIC_1 && bytes[1] == BED_MAGIC_2,
+            "BED bytes have invalid magic bytes"
+        );
+        anyhow::ensure!(
+            bytes[2] == BED_MODE_SNP_MAJOR,
+            "BED bytes are not SNP-major (mode=1 required)"
+        );
+
+        let bytes_per_snp_u64 = (iid_count as u64)
+            .checked_add(3)
+            .context("iid_count overflow")?
+            / 4;
+        let expected_len = bytes_per_snp_u64
+            .checked_mul(sid_count as u64)
+            .and_then(|v| v.checked_add(BED_HEADER_LEN))
+            .context("BED length overflow")?;
+        let file_len = bytes.len() as u64;
+        anyhow::ensure!(
+            file_len == expected_len,
+            "BED bytes have invalid length (expected {}, got {})",
+            expected_len,
+            file_len
+        );
+        let bytes_per_snp =
+            usize::try_from(bytes_per_snp_u64).context("bytes_per_snp does not fit in usize")?;
+
+        let cursor: Box<dyn BedSource> = Box::new(Cursor::new(bytes));
+        // For an in-memory Cursor the BufReader buffer is mostly redundant
+        // (no syscalls to amortize), but keeping it preserves the same
+        // read/seek semantics as the file path so the rest of the code
+        // does not need to branch on the source kind.
+        let reader = BufReader::with_capacity(DEFAULT_STREAM_BUFFER_BYTES, cursor);
+
+        Ok(Bed {
+            reader,
+            iid_count,
+            sid_count,
+            bytes_per_snp,
+            read_block_bytes: DEFAULT_READ_BLOCK_BYTES,
+            file_len,
+        })
     }
 
     pub fn bytes_per_snp(&self) -> usize {
@@ -191,7 +254,8 @@ impl BedBuilder {
         let bytes_per_snp =
             usize::try_from(bytes_per_snp_u64).context("bytes_per_snp does not fit in usize")?;
 
-        let reader = BufReader::with_capacity(self.stream_buffer_bytes, f);
+        let boxed: Box<dyn BedSource> = Box::new(f);
+        let reader = BufReader::with_capacity(self.stream_buffer_bytes, boxed);
 
         Ok(Bed {
             reader,
@@ -668,5 +732,65 @@ impl MmapBed {
         {
             tracing::warn!("madvise WILLNEED failed (offset={offset}, len={len}): {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal valid BED byte buffer for the given `(iid_count,
+    /// sid_count)` with all genotypes set to homozygous-A1 (raw bits =
+    /// `0b00`, which encodes count-A2 = 2 / count-A1 = 0).
+    ///
+    /// Layout: 3 magic bytes (`6c 1b 01`), then `sid_count` SNP slabs of
+    /// `(iid_count + 3) / 4` bytes each. With all-zero data bytes the
+    /// per-SNP slab is exactly that many `0x00` bytes.
+    fn make_bed_bytes(iid_count: usize, sid_count: usize) -> Vec<u8> {
+        let bytes_per_snp = iid_count.div_ceil(4);
+        let mut bytes = vec![0x6c, 0x1b, 0x01];
+        bytes.resize(3 + bytes_per_snp * sid_count, 0u8);
+        bytes
+    }
+
+    /// `Bed::from_bytes` accepts a well-formed in-memory BED and the
+    /// resulting reader behaves identically to a file-backed one.
+    #[test]
+    fn bed_from_bytes_round_trip() {
+        let iid_count = 4;
+        let sid_count = 2;
+        let bytes = make_bed_bytes(iid_count, sid_count);
+        let mut bed =
+            Bed::from_bytes(bytes.clone(), iid_count, sid_count).expect("from_bytes accepts valid");
+        assert_eq!(bed.bytes_per_snp(), 1);
+
+        let mut buf = vec![0u8; bed.bytes_per_snp()];
+        bed.read_snp_bytes(0, &mut buf).expect("read SNP 0");
+        assert_eq!(buf, vec![0u8]);
+        bed.read_snp_bytes(1, &mut buf).expect("read SNP 1");
+        assert_eq!(buf, vec![0u8]);
+    }
+
+    /// Magic-byte / mode / length validation must reject malformed inputs
+    /// — the same gate `BedBuilder::build` enforces for files.
+    #[test]
+    fn bed_from_bytes_rejects_bad_magic() {
+        let mut bytes = make_bed_bytes(4, 2);
+        bytes[0] = 0xff;
+        assert!(Bed::from_bytes(bytes, 4, 2).is_err());
+    }
+
+    #[test]
+    fn bed_from_bytes_rejects_truncated_body() {
+        let mut bytes = make_bed_bytes(4, 2);
+        bytes.pop(); // chop off the last data byte
+        let err = match Bed::from_bytes(bytes, 4, 2) {
+            Ok(_) => panic!("expected truncated BED to be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("invalid length"),
+            "unexpected error message: {err}"
+        );
     }
 }

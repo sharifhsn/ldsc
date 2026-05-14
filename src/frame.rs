@@ -26,6 +26,10 @@ impl Column {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn as_f64(&self) -> Result<&[f64]> {
         match self {
             Column::F64(v) => Ok(v),

@@ -1,18 +1,12 @@
-mod bed;
-mod cli;
-mod cts_annot;
-mod frame;
-#[cfg(feature = "gpu")]
-mod gpu;
-mod h2;
-mod irwls;
-mod jackknife;
-mod l2;
-mod la;
-mod make_annot;
-mod munge;
-mod parse;
-mod regressions;
+//! `ldsc` CLI binary — thin shim around the [`ldsc`] library crate.
+//!
+//! All subcommand logic lives in the library; this binary owns only:
+//! - Global allocator selection (mimalloc on opt-in feature).
+//! - `tracing` subscriber init from `RUST_LOG` / `--log-level`.
+//! - Rayon thread-pool sizing.
+//! - Python-LDSC compatibility shim that injects an implicit subcommand
+//!   for callers who pass `--l2 / --h2 / --rg` or invoke us as
+//!   `munge_sumstats.py`.
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -23,7 +17,8 @@ use clap::Parser;
 use rayon::ThreadPoolBuilder;
 use tracing_subscriber::EnvFilter;
 
-use cli::{Cli, Command};
+use ldsc::cli::{Cli, Command};
+use ldsc::{run_cts_annot, run_h2, run_l2, run_make_annot, run_munge, run_rg};
 
 fn init_tracing(level: &str) {
     let filter = EnvFilter::try_from_default_env()
@@ -102,11 +97,11 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Command::MungeSumstats(args) => munge::run(args),
-        Command::L2(args) => l2::run(args),
-        Command::H2(args) => regressions::run_h2(args),
-        Command::Rg(args) => regressions::run_rg(args),
-        Command::MakeAnnot(args) => make_annot::run(args),
-        Command::CtsAnnot(args) => cts_annot::run(args),
+        Command::MungeSumstats(args) => run_munge(args),
+        Command::L2(args) => run_l2(args),
+        Command::H2(args) => run_h2(args),
+        Command::Rg(args) => run_rg(args),
+        Command::MakeAnnot(args) => run_make_annot(args),
+        Command::CtsAnnot(args) => run_cts_annot(args),
     }
 }

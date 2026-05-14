@@ -509,9 +509,17 @@ pub struct BimRecord {
 /// Parse a PLINK .bim file.  Returns one `BimRecord` per row.
 pub fn parse_bim(path: &str) -> Result<Vec<BimRecord>> {
     let f = File::open(path).with_context(|| format!("opening BIM file '{}'", path))?;
-    let reader = BufReader::new(f);
-    let mut records = Vec::new();
+    parse_bim_reader(BufReader::new(f))
+}
 
+/// Parse a PLINK .bim file from an in-memory string. Browser-side
+/// counterpart to [`parse_bim`].
+pub fn parse_bim_str(s: &str) -> Result<Vec<BimRecord>> {
+    parse_bim_reader(BufReader::new(s.as_bytes()))
+}
+
+fn parse_bim_reader<R: BufRead>(reader: R) -> Result<Vec<BimRecord>> {
+    let mut records = Vec::new();
     for (line_no, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("reading BIM line {}", line_no + 1))?;
         let cols: Vec<&str> = line.split('\t').collect();
@@ -530,6 +538,29 @@ pub fn parse_bim(path: &str) -> Result<Vec<BimRecord>> {
             bed_idx: line_no,
         });
     }
-
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `parse_bim_str` (in-memory) must produce the same records as
+    /// `parse_bim` (file). This pins down the contract that the WASM
+    /// frontend can swap in `parse_bim_str` without changing semantics.
+    #[test]
+    fn parse_bim_str_matches_file() {
+        let bim = "1\trs1\t0\t100\tA\tG\n\
+                   1\trs2\t0.1\t200\tC\tT\n\
+                   2\trs3\t0\t300\tG\tA\n";
+        let recs = parse_bim_str(bim).expect("parse_bim_str");
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0].snp, "rs1");
+        assert_eq!(recs[0].chr, 1);
+        assert_eq!(recs[0].bp, 100);
+        assert_eq!(recs[1].cm, 0.1);
+        assert_eq!(recs[2].chr, 2);
+        // bed_idx is the 0-based row position
+        assert_eq!(recs[2].bed_idx, 2);
+    }
 }

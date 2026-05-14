@@ -11,10 +11,29 @@ pub fn count_fam(path: &str) -> Result<usize> {
     Ok(BufReader::new(f).lines().count())
 }
 
+/// Count individuals in a PLINK .fam file already loaded into memory.
+/// Browser-side counterpart to [`count_fam`].
+pub fn count_fam_str(s: &str) -> usize {
+    // Match the BufReader::lines() semantics used by the file path: a
+    // trailing newline does NOT add an empty record, but a missing final
+    // newline still counts the last partial line. `str::lines()` does
+    // exactly this.
+    s.lines().count()
+}
+
 /// Parse (FID, IID) pairs from a PLINK .fam file in order.
 pub fn parse_fam(path: &str) -> Result<Vec<(String, String)>> {
     let f = File::open(path).with_context(|| format!("opening FAM file '{}'", path))?;
-    let reader = BufReader::new(f);
+    parse_fam_reader(BufReader::new(f))
+}
+
+/// Parse (FID, IID) pairs from a PLINK .fam file already loaded into
+/// memory. Browser-side counterpart to [`parse_fam`].
+pub fn parse_fam_str(s: &str) -> Result<Vec<(String, String)>> {
+    parse_fam_reader(BufReader::new(s.as_bytes()))
+}
+
+fn parse_fam_reader<R: BufRead>(reader: R) -> Result<Vec<(String, String)>> {
     let mut ids = Vec::new();
     for (i, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("reading FAM line {}", i + 1))?;

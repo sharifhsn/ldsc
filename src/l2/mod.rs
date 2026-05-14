@@ -4,8 +4,8 @@ mod normalize;
 mod snp_stats;
 mod window;
 
-pub use crate::parse::{BimRecord, parse_bim};
-pub use io::{count_fam, parse_fam};
+pub use crate::parse::{BimRecord, parse_bim, parse_bim_str};
+pub use io::{count_fam, count_fam_str, parse_fam, parse_fam_str};
 pub use window::WindowMode;
 
 use crate::bed::Bed;
