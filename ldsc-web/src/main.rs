@@ -10,6 +10,15 @@
 //! a centered card column for content, and a sticky `#2a71a5`
 //! footer. See the `assets/palette.css` overrides applied on top of
 //! Bootstrap 5.
+//!
+//! Single-threaded WASM in v1. A multi-threaded build via
+//! `wasm-bindgen-rayon` was attempted in Workstream C.3 of the
+//! WASM-demo plan but reverted: futures spawned from event-handler
+//! closures stop being polled under the multi-threaded toolchain
+//! (`+atomics` + `build-std`), which breaks file uploads + the Run
+//! button. See the plan file's Workstream C.3 section for repro
+//! details. The single-threaded build is comfortably fast enough for
+//! the chr22-sized demo case the README headlines.
 
 mod components;
 

@@ -8,10 +8,12 @@
 
     <!-- COOP / COEP polyfill so SharedArrayBuffer (and thus
          multi-threaded WASM via wasm-bindgen-rayon) works on GitHub
-         Pages. First page load installs the service worker and
-         reloads; subsequent loads have crossOriginIsolated === true.
-         The local dev server already sends these headers natively
-         (see Trunk.toml). -->
+         Pages. The bundled wasm in v1 doesn't actually use
+         SharedArrayBuffer (multi-threaded WASM was attempted in
+         Workstream C.3 but reverted — see plan), so this script is
+         currently a no-op. Kept in place so re-enabling C.3 in a
+         future iteration only requires flipping a Cargo.toml dep
+         back on. -->
     <script src="coi-serviceworker.min.js"></script>
 
     <!-- Bootstrap 5.3.x: the LDLink-look base. We don't load
