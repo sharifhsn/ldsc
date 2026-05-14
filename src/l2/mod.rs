@@ -408,9 +408,18 @@ pub fn run(args: L2Args) -> Result<()> {
     let t_compute_start = std::time::Instant::now();
     let (l2, maf_per_snp) = if args.global_pass || force_global_pass {
         // Legacy single-pass across all chromosomes.
+        let bed = Bed::builder(bed_path.as_str())
+            .build()
+            .context("opening BED file")?;
+        let mmap_bed = if args.mmap {
+            Some(crate::bed::MmapBed::open(bed_path.as_str()).context("memory-mapping BED file")?)
+        } else {
+            None
+        };
         compute_ldscore_global(
             &all_snps,
-            bed_path.as_str(),
+            bed,
+            mmap_bed,
             n_indiv_actual,
             mode,
             chunk_c,
@@ -426,7 +435,6 @@ pub fn run(args: L2Args) -> Result<()> {
             args.verbose_timing,
             args.sketch,
             args.sketch_maf_aware,
-            args.mmap,
             args.snp_level_masking,
         )
         .context("computing LD scores")?
@@ -468,9 +476,24 @@ pub fn run(args: L2Args) -> Result<()> {
                     }
                     sub
                 });
+                // Each chr opens its own Bed (and optional MmapBed) — they
+                // run concurrently from rayon tasks so they can't share a
+                // single file handle.
+                let bed = Bed::builder(bed_path_str)
+                    .build()
+                    .context("opening BED file")?;
+                let mmap_bed = if args.mmap {
+                    Some(
+                        crate::bed::MmapBed::open(bed_path_str)
+                            .context("memory-mapping BED file")?,
+                    )
+                } else {
+                    None
+                };
                 compute_ldscore_global(
                     chr_snps,
-                    bed_path_str,
+                    bed,
+                    mmap_bed,
                     n_indiv_actual,
                     mode,
                     chunk_c,
@@ -486,7 +509,6 @@ pub fn run(args: L2Args) -> Result<()> {
                     false, // verbose_timing disabled per-chr (noisy)
                     args.sketch,
                     args.sketch_maf_aware,
-                    args.mmap,
                     args.snp_level_masking,
                 )
             })
@@ -861,4 +883,215 @@ fn pearson_corr(x: &[f64], y: &[f64]) -> f64 {
         return f64::NAN;
     }
     cov / (vx * vy).sqrt()
+}
+
+// ── Public compute API for ldsc-web / library callers ─────────────────────────
+//
+// The `run(L2Args)` orchestrator above does end-to-end disk I/O —
+// `--bfile` paths, `--annot` / `--extract` / `--keep` / `--print-snps`
+// file loaders, `.l2.ldscore.gz` writers, the Python-style stdout
+// summary. It exists because every CLI test fixture and production
+// pipeline calls it.
+//
+// The MVP web demo doesn't have a filesystem, so it can't go through
+// `run`. The slim `compute_l2_from_bytes` API below accepts BED / BIM
+// / FAM contents already in memory, exposes the headline LD-score
+// computation knobs, and returns the L2 / MAF arrays for the caller
+// to plot. Annotation / extract / keep / per-allele aren't wired in
+// yet — they'll come back as additional fields on `L2Config` when
+// the UI grows past v1.
+
+/// Configuration knobs for [`compute_l2_from_bytes`]. Mirrors the
+/// subset of `L2Args` that the in-browser demo exposes.
+#[derive(Debug, Clone)]
+pub struct L2Config {
+    /// Window definition (`--ld-wind-kb` / `--ld-wind-snps` / `--ld-wind-cm`).
+    pub mode: WindowMode,
+    /// `--chunk-size`. Defaults to 200 — Python LDSC is 50.
+    pub chunk_size: usize,
+    /// `--fast-f32`.
+    pub use_f32: bool,
+    /// `--sketch d`. `None` runs exact.
+    pub sketch: Option<usize>,
+    /// `--sketch-maf-aware` (only meaningful when `sketch` is `Some`).
+    pub sketch_maf_aware: bool,
+    /// `--snp-level-masking`.
+    pub snp_level_masking: bool,
+    /// `--yes-really` — bypass the "your window covers a whole
+    /// chromosome" safety check. In the browser we always have small
+    /// inputs by design, so this is fine to default to `true`.
+    pub yes_really: bool,
+    /// `--pq-exp` (or `Some(1.0)` for `--per-allele`).
+    pub pq_exp: Option<f64>,
+    /// `--verbose-timing`. Off in the browser; we render our own timing.
+    pub verbose_timing: bool,
+}
+
+impl Default for L2Config {
+    fn default() -> Self {
+        Self {
+            mode: WindowMode::Kb(1000.0),
+            chunk_size: 200,
+            use_f32: false,
+            sketch: None,
+            sketch_maf_aware: false,
+            snp_level_masking: false,
+            yes_really: true,
+            pq_exp: None,
+            verbose_timing: false,
+        }
+    }
+}
+
+/// Result of [`compute_l2_from_bytes`]. `l2`, `maf` and `snps` are
+/// aligned: `l2[i]` and `maf[i]` correspond to `snps[i]`.
+#[derive(Debug, Clone)]
+pub struct L2Output {
+    pub snps: Vec<BimRecord>,
+    pub l2: Vec<f64>,
+    pub maf: Vec<f64>,
+    pub wall_seconds: f64,
+}
+
+/// Compute LD scores from in-memory BED / BIM / FAM contents.
+///
+/// This is the browser-facing entry point. It performs no I/O: BIM
+/// and FAM are passed as `&str` (what `FileReader.readAsText()` hands
+/// the Leptos app), BED as a raw byte buffer (`FileReader.readAsArrayBuffer()`).
+///
+/// The current implementation drives the single-annotation
+/// (`K = 1`) path with no `--extract` / `--keep` / `--annot`
+/// filtering — that's the headline demo. Annotation support will land
+/// as additional `L2Config` fields once the UI grows past v1.
+pub fn compute_l2_from_bytes(
+    bed_bytes: Vec<u8>,
+    bim_text: &str,
+    fam_text: &str,
+    config: L2Config,
+) -> Result<L2Output> {
+    let snps = crate::parse::parse_bim_str(bim_text)
+        .context("parsing BIM text in compute_l2_from_bytes")?;
+    anyhow::ensure!(!snps.is_empty(), "compute_l2_from_bytes: BIM has zero SNPs");
+
+    let n_indiv = io::count_fam_str(fam_text);
+    anyhow::ensure!(
+        n_indiv > 0,
+        "compute_l2_from_bytes: FAM has zero individuals"
+    );
+
+    let bed = Bed::from_bytes(bed_bytes, n_indiv, snps.len())
+        .context("validating BED bytes in compute_l2_from_bytes")?;
+
+    let t0 = std::time::Instant::now();
+    let (l2_mat, maf) = compute_ldscore_global(
+        &snps,
+        bed,
+        None, // mmap is unavailable / pointless in-browser
+        n_indiv,
+        config.mode,
+        config.chunk_size,
+        None, // no --annot in MVP
+        None, // no --keep in MVP
+        config.pq_exp,
+        config.yes_really,
+        #[cfg(feature = "gpu")]
+        None,
+        #[cfg(feature = "gpu")]
+        crate::gpu::GpuConfig::default(),
+        config.use_f32,
+        config.verbose_timing,
+        config.sketch,
+        config.sketch_maf_aware,
+        config.snp_level_masking,
+    )
+    .context("computing LD scores in compute_l2_from_bytes")?;
+
+    // K = 1: collapse the (n × 1) matrix into a flat Vec<f64>.
+    debug_assert_eq!(l2_mat.ncols(), 1);
+    let l2: Vec<f64> = (0..l2_mat.nrows()).map(|i| l2_mat[(i, 0)]).collect();
+
+    Ok(L2Output {
+        snps,
+        l2,
+        maf,
+        wall_seconds: t0.elapsed().as_secs_f64(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hand-crafted micro BED: 4 individuals × 2 perfectly-correlated SNPs.
+    ///
+    /// Genotype counts (count-A1 semantics, what ldsc uses):
+    ///   SNP1:  [2, 2, 0, 0]
+    ///   SNP2:  [2, 2, 0, 0]
+    /// PLINK packs each genotype as 2 bits within a byte, iid 0 in the
+    /// least-significant pair. With the LUT `[2, missing, 1, 0]`:
+    ///   count=2 → bits `00`
+    ///   count=0 → bits `11`
+    /// So per SNP the byte is `0b11_11_00_00 = 0xF0`.
+    ///
+    /// Pure-Rust expectation: SNPs are identical after centering →
+    /// r² = 1 between SNP1 and SNP2. With unbiased correction
+    /// `r² − (1 − r²)/(N − 2)`, contribution = 1.0 either way. Plus
+    /// every SNP includes its self-LD of 1.0. So `l2 = [2.0, 2.0]`
+    /// up to float precision, and `maf = [0.5, 0.5]`.
+    #[test]
+    fn compute_l2_from_bytes_smoke() {
+        let mut bed_bytes = vec![0x6c, 0x1b, 0x01];
+        bed_bytes.push(0xF0); // SNP 1 slab
+        bed_bytes.push(0xF0); // SNP 2 slab
+
+        // BIM: chr 1, SNP id, CM 0, BP 100/200, A1 A2 (tab-separated)
+        let bim_text = "1\trs1\t0\t100\tA\tG\n1\trs2\t0\t200\tA\tG\n";
+        // FAM: 4 individuals (FID IID PID MID SEX PHEN)
+        let fam_text =
+            "F1\tI1\t0\t0\t1\t-9\nF2\tI2\t0\t0\t1\t-9\nF3\tI3\t0\t0\t1\t-9\nF4\tI4\t0\t0\t1\t-9\n";
+
+        let cfg = L2Config {
+            // 100 kb window — both SNPs land in each other's window (200 - 100 = 100 bp ≤ 100 kb)
+            mode: WindowMode::Kb(100.0),
+            chunk_size: 2,
+            yes_really: true,
+            ..L2Config::default()
+        };
+        let out = compute_l2_from_bytes(bed_bytes, bim_text, fam_text, cfg)
+            .expect("compute_l2_from_bytes must accept a valid micro BED");
+
+        assert_eq!(out.snps.len(), 2);
+        assert_eq!(out.l2.len(), 2);
+        assert_eq!(out.maf.len(), 2);
+        for &maf in &out.maf {
+            assert!((maf - 0.5).abs() < 1e-9, "MAF should be 0.5, got {}", maf);
+        }
+        for (i, &l2) in out.l2.iter().enumerate() {
+            assert!(
+                (l2 - 2.0).abs() < 1e-9,
+                "SNP {i} LD score should be 2.0 (self + perfect-LD partner), got {l2}"
+            );
+        }
+    }
+
+    /// Configuration mismatches (here: a too-short BED) must produce a
+    /// graceful `Result::Err`, not a panic.
+    #[test]
+    fn compute_l2_from_bytes_rejects_truncated_bed() {
+        let bed_bytes = vec![0x6c, 0x1b, 0x01, 0xF0]; // header + only 1 SNP slab
+        let bim_text = "1\trs1\t0\t100\tA\tG\n1\trs2\t0\t200\tA\tG\n";
+        let fam_text =
+            "F1\tI1\t0\t0\t1\t-9\nF2\tI2\t0\t0\t1\t-9\nF3\tI3\t0\t0\t1\t-9\nF4\tI4\t0\t0\t1\t-9\n";
+
+        let cfg = L2Config {
+            yes_really: true,
+            ..L2Config::default()
+        };
+        let result = compute_l2_from_bytes(bed_bytes, bim_text, fam_text, cfg);
+        assert!(
+            result.is_err(),
+            "truncated BED must be rejected; got {:?}",
+            result.as_ref().map(|o| o.l2.len())
+        );
+    }
 }

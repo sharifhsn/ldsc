@@ -1023,10 +1023,18 @@ pub(super) fn quadratic_sketch_correction_maf_aware(
 }
 
 /// Compute LD scores for all SNPs. Returns `(l2, maf)`.
+///
+/// The caller is responsible for opening the `Bed` (via
+/// [`Bed::builder`] for a file or [`Bed::from_bytes`] for an
+/// in-memory buffer) and, on native targets that want zero-copy I/O,
+/// optionally pre-opening a matching [`MmapBed`]. The `Bed` is
+/// consumed; if the caller wants to compute on multiple chromosomes
+/// independently it must open one `Bed` per chromosome.
 #[allow(clippy::too_many_arguments, clippy::unnecessary_cast)]
 pub(super) fn compute_ldscore_global(
     all_snps: &[BimRecord],
-    bed_path: &str,
+    bed: Bed,
+    mmap_bed: Option<MmapBed>,
     n_indiv: usize,
     mode: WindowMode,
     chunk_c: usize,
@@ -1040,9 +1048,12 @@ pub(super) fn compute_ldscore_global(
     verbose_timing: bool,
     sketch: Option<usize>,
     sketch_maf_aware: bool,
-    use_mmap: bool,
     snp_level_masking: bool,
 ) -> Result<(MatF, Vec<f64>)> {
+    // `use_mmap` is derived from whether the caller pre-opened a
+    // memory-mapped view; that's the only meaningful signal at this
+    // layer. Browser callers always pass `mmap_bed = None`.
+    let use_mmap = mmap_bed.is_some();
     let m = all_snps.len();
     if m == 0 {
         let n_annot = annot.map(|a| a.ncols()).unwrap_or(1);
@@ -1245,17 +1256,11 @@ pub(super) fn compute_ldscore_global(
     let (_gpu_tile_cols, _gpu_flex32, _gpu_f64) =
         (gpu_config.tile_cols, gpu_config.flex32, gpu_config.f64);
 
-    // Memory-mapped BED: zero-copy access, replaces BufReader for fused path.
-    let mmap_bed = if use_mmap {
-        Some(MmapBed::open(bed_path).context("memory-mapping BED file")?)
-    } else {
-        None
-    };
-
-    // Sequential path: open BED once with pre-computed ChunkReader.
-    // When mmap is enabled, we still need ChunkReader for metadata (iid_positions, etc.)
-    // but I/O goes through MmapBed instead.
-    let mut seq_bed = Some(Bed::builder(bed_path).build().context("opening BED file")?);
+    // Sequential path: use the caller-supplied BED with pre-computed
+    // ChunkReader. When mmap is enabled (caller pre-opened a `MmapBed`),
+    // we still need ChunkReader for metadata (iid_positions, etc.) but
+    // I/O goes through MmapBed instead.
+    let mut seq_bed = Some(bed);
     let mut chunk_reader: Option<ChunkReader<f32>> = {
         let bed = seq_bed.as_ref().unwrap();
         Some(
