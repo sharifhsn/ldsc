@@ -118,6 +118,54 @@ pub fn matmul_tn_to_f32(
     accum: Accum,
     par: Par,
 ) {
+    // On wasm32 with simd128, route the f32 hot-path TN matmul into
+    // our hand-rolled kernel — faer's `pulp` SIMD backend doesn't
+    // support wasm32 and otherwise lowers to a fully scalar GEMM
+    // (the entire ~30-50× wall-time gap vs native CLI on full 1000G).
+    //
+    // Only the alpha=1.0 / accum=Replace fast path is custom; both
+    // hot-path call sites in `l2/compute.rs::compute_ldscore_global`
+    // (within-chunk B^T·B at compute.rs:1718, cross-window A^T·B at
+    // compute.rs:2027) use exactly these parameters. Other shapes
+    // (rare on wasm) fall through to faer.
+    //
+    // F.2 dispatches to the v128 SIMD microkernel
+    // (`simd128::gemm_tn_f32`): 4 parallel f32x4 accumulators,
+    // K-unroll-16, scalar tail. Bit-identical to the scalar reference
+    // (and to the previous faer scalar fallback at L2-score precision)
+    // but ~10× faster — closing most of the remaining gap to native.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        // Comparison to the exact f32 literal `1.0` is intentional:
+        // both compute.rs call sites pass `1.0f32` literally, so the
+        // bit pattern matches. Anything else falls to faer.
+        #[allow(clippy::float_cmp)]
+        let is_unit_alpha = alpha == 1.0;
+        // Also require column-major (row_stride==1) on all three
+        // operands. The kernel debug-asserts this; the explicit
+        // pre-check here means non-contiguous shapes (rare in the
+        // wild — we don't construct them in compute.rs) silently fall
+        // through to faer instead of UB-ing in release builds.
+        let all_col_major = dst.row_stride() == 1 && lhs.row_stride() == 1 && rhs.row_stride() == 1;
+        if is_unit_alpha && matches!(accum, Accum::Replace) && all_col_major {
+            // SAFETY: the four preconditions of `simd128::gemm_tn_f32`
+            // are all upheld here:
+            //   - col-major (just checked)
+            //   - shapes consistent (faer matmul has the same
+            //     requirement; the kernel debug-asserts identically)
+            //   - col strides non-negative (faer Mat / submatrix
+            //     invariant)
+            unsafe {
+                crate::wasm_simd::simd128::gemm_tn_f32(dst, lhs, rhs);
+            }
+            // `par` is intentionally unused on this path: our kernel
+            // is single-threaded (faer's wasm fallback is too — the
+            // `rayon` feature is disabled on wasm because spindle and
+            // atomic-wait don't compile to wasm32-unknown-unknown).
+            let _ = par;
+            return;
+        }
+    }
     matmul(dst, accum, lhs.transpose(), rhs, alpha, par);
 }
 

@@ -1,0 +1,27 @@
+# Enable wasm32-simd128 for the in-browser ldsc-web build.
+#
+# This config is discovered by trunk (which runs `cargo build` from
+# `ldsc-web/`, the directory containing Trunk.toml) and by manual
+# `cd ldsc-web && cargo build --target wasm32-unknown-unknown`. Cargo
+# also walks upward and merges the workspace root's `.cargo/config.toml`,
+# whose existing AVX2/FMA flags are scoped to x86_64 targets and so do
+# not interact with this section.
+#
+# `+simd128` enables the v128 instruction set for wasm32-unknown-unknown
+# (Chrome 91+, Firefox 89+, Safari 16.4+, Node 16+). Our hand-rolled
+# GEMM microkernel in `crate::wasm_simd::simd128` requires this feature
+# to compile. The dispatch in `crate::la::matmul_tn_to_f32` is gated on
+# `cfg(all(target_arch = "wasm32", target_feature = "simd128"))`, so
+# without this flag the wasm build silently falls back to faer's scalar
+# GEMM (which is correct but ~30-50× slower than native).
+#
+# We do NOT use `+relaxed-simd` (gives FMA but introduces 1 ULP
+# nondeterminism, breaking browser-vs-CLI bit-identity); see workstream
+# F's "out of scope" notes in the plan file.
+#
+# We do NOT use `+atomics`/`+bulk-memory`/`+mutable-globals` here. Those
+# are required for `wasm-bindgen-rayon` (workstream G) and would force
+# a nightly toolchain plus `-Zbuild-std`. F is independent of G.
+
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

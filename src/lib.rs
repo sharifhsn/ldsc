@@ -39,6 +39,7 @@ pub mod make_annot;
 pub mod munge;
 pub mod parse;
 pub mod regressions;
+pub mod wasm_simd;
 
 // Convenience re-exports so callers can `use ldsc::run_l2;` rather than
 // reaching into submodules.
