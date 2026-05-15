@@ -58,6 +58,8 @@ web-sys = { version = "0.3", features = [
     "HtmlHeadElement",
     "Location",
     "ErrorEvent",
+    # Navigator.hardwareConcurrency for the worker pool size cap.
+    "Navigator",
 ] }
 
 # Bridge from the worker's wasm-bindgen exports to JS via

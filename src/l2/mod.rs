@@ -4,9 +4,37 @@ mod normalize;
 mod snp_stats;
 mod window;
 
-pub use crate::parse::{BimRecord, parse_bim, parse_bim_str};
+pub use crate::parse::{BimRecord, parse_bim, parse_bim_reader, parse_bim_str};
 pub use io::{count_fam, count_fam_str, parse_fam, parse_fam_str};
 pub use window::WindowMode;
+
+/// Per-chunk progress event emitted from inside the chunked GEMM
+/// loop in [`compute_ldscore_global`]. The browser frontend wires
+/// this to a `postMessage` so the main-thread UI can show a progress
+/// bar; native callers typically pass `|_| {}` and ignore it.
+///
+/// Note: this is **progress only** (monotonic SNP-coverage counter).
+/// L2 values for SNPs in the just-finished chunk are *not* finalized
+/// yet — later chunks contribute cross-window r². The full L2 array
+/// is returned at the end via [`L2Output`].
+#[derive(Debug, Clone, Copy)]
+pub struct L2Progress {
+    /// Number of chunks processed so far (1-based; 1 after the first
+    /// chunk completes, equals `chunks_total` after the last).
+    pub chunks_done: usize,
+    /// Total number of chunks the chunked-GEMM loop will run for
+    /// this call to `compute_ldscore_global`.
+    pub chunks_total: usize,
+    /// Number of SNPs the loop has covered so far (= chunk_end of
+    /// the most-recent chunk).
+    pub snps_done: usize,
+    /// Total SNPs in this call (= length of the input `all_snps`).
+    pub snps_total: usize,
+    /// Wall time consumed by *this chunk only* (decode + GEMM +
+    /// ring store), in milliseconds. The orchestrator can sum these
+    /// across workers for a real-time throughput readout.
+    pub chunk_wall_ms: f64,
+}
 
 use crate::bed::Bed;
 use crate::cli::L2Args;
@@ -436,6 +464,7 @@ pub fn run(args: L2Args) -> Result<()> {
             args.sketch,
             args.sketch_maf_aware,
             args.snp_level_masking,
+            |_| {}, // CLI: no per-chunk progress (terminal stdout would be too noisy)
         )
         .context("computing LD scores")?
     } else {
@@ -510,6 +539,7 @@ pub fn run(args: L2Args) -> Result<()> {
                     args.sketch,
                     args.sketch_maf_aware,
                     args.snp_level_masking,
+                    |_| {}, // CLI: no per-chr progress (rayon already prints chr msgs)
                 )
             })
             .collect::<Result<Vec<_>>>()
@@ -968,6 +998,7 @@ pub fn compute_l2_from_bytes(
     bim_text: &str,
     fam_text: &str,
     config: L2Config,
+    on_progress: impl FnMut(L2Progress),
 ) -> Result<L2Output> {
     let snps = crate::parse::parse_bim_str(bim_text)
         .context("parsing BIM text in compute_l2_from_bytes")?;
@@ -982,7 +1013,7 @@ pub fn compute_l2_from_bytes(
     let bed = Bed::from_bytes(bed_bytes, n_indiv, snps.len())
         .context("validating BED bytes in compute_l2_from_bytes")?;
 
-    compute_l2_from_bed(bed, snps, n_indiv, config)
+    compute_l2_from_bed(bed, snps, n_indiv, config, on_progress)
 }
 
 /// Compute LD scores from a pre-opened [`Bed`] + parsed BIM + FAM
@@ -999,6 +1030,7 @@ pub fn compute_l2_from_bed(
     snps: Vec<BimRecord>,
     n_indiv: usize,
     config: L2Config,
+    on_progress: impl FnMut(L2Progress),
 ) -> Result<L2Output> {
     anyhow::ensure!(!snps.is_empty(), "compute_l2_from_bed: BIM has zero SNPs");
     anyhow::ensure!(n_indiv > 0, "compute_l2_from_bed: FAM has zero individuals");
@@ -1024,6 +1056,7 @@ pub fn compute_l2_from_bed(
         config.sketch,
         config.sketch_maf_aware,
         config.snp_level_masking,
+        on_progress,
     )
     .context("computing LD scores in compute_l2_from_bed")?;
 
@@ -1078,7 +1111,7 @@ mod tests {
             yes_really: true,
             ..L2Config::default()
         };
-        let out = compute_l2_from_bytes(bed_bytes, bim_text, fam_text, cfg)
+        let out = compute_l2_from_bytes(bed_bytes, bim_text, fam_text, cfg, |_| {})
             .expect("compute_l2_from_bytes must accept a valid micro BED");
 
         assert_eq!(out.snps.len(), 2);
@@ -1108,7 +1141,7 @@ mod tests {
             yes_really: true,
             ..L2Config::default()
         };
-        let result = compute_l2_from_bytes(bed_bytes, bim_text, fam_text, cfg);
+        let result = compute_l2_from_bytes(bed_bytes, bim_text, fam_text, cfg, |_| {});
         assert!(
             result.is_err(),
             "truncated BED must be rejected; got {:?}",

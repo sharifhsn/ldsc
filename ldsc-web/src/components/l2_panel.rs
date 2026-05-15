@@ -17,7 +17,7 @@ use leptos::prelude::*;
 
 use super::charts::{percentile, render_l2_histogram, render_l2_vs_maf};
 use super::file_upload::{FileUploadRow, LoadedFile, ReadAs};
-use super::worker_client::{WorkerComputeResult, spawn_compute_l2};
+use super::worker_client::{PoolProgress, WorkerComputeResult, spawn_compute_l2_pool};
 use crate::worker::{WireL2Config, WireWindowMode};
 
 /// Mode preset radio (mirrors the "Mode" section of the CLI README's
@@ -122,6 +122,10 @@ pub fn L2Panel() -> impl IntoView {
     let is_running = RwSignal::new(false);
     let result: RwSignal<Option<WorkerComputeResult>> = RwSignal::new(None);
     let error: RwSignal<Option<String>> = RwSignal::new(None);
+    // Live progress: `(snps_done, snps_total)`. `(0, 0)` = unknown
+    // (scan worker hasn't reported yet). Updated mid-compute by
+    // progress messages from each per-chr worker.
+    let progress: RwSignal<(usize, usize)> = RwSignal::new((0, 0));
 
     // Re-render charts whenever a new result lands.
     Effect::new(move |_| {
@@ -140,7 +144,7 @@ pub fn L2Panel() -> impl IntoView {
 
     let all_loaded = move || {
         bed.with(|f| f.file_handle.is_some())
-            && bim.with(|f| f.text.is_some())
+            && bim.with(|f| f.file_handle.is_some())
             && fam.with(|f| f.text.is_some())
     };
 
@@ -157,6 +161,7 @@ pub fn L2Panel() -> impl IntoView {
         }
         error.set(None);
         result.set(None);
+        progress.set((0, 0));
         is_running.set(true);
 
         let preset_now = preset.get();
@@ -165,16 +170,19 @@ pub fn L2Panel() -> impl IntoView {
         let f32_now = fast_f32.get();
         let kb_now = ld_wind_kb.get();
 
-        // BED stays as a `web_sys::File` handle the whole way —
-        // never read into wasm memory on the main thread. Worker
-        // streams chunks via FileReaderSync. BIM + FAM are small
-        // enough to be already in memory as Strings on the main
-        // thread; we just clone-move them into the worker call.
+        // BED + BIM both stay as `web_sys::File` handles — never
+        // read into main-thread JS heap or wasm memory. The
+        // per-chromosome worker pool streams both via FileReaderSync
+        // inside each Worker. FAM is tiny (~1 MB at biobank scale)
+        // and stays as a String passed through postMessage.
         let bed_file = bed
             .with(|f| f.file_handle.clone())
             .expect("bed loaded")
             .take();
-        let bim_text = bim.with(|f| f.text.clone()).expect("bim loaded");
+        let bim_file = bim
+            .with(|f| f.file_handle.clone())
+            .expect("bim loaded")
+            .take();
         let fam_text = fam.with(|f| f.text.clone()).expect("fam loaded");
 
         let cfg = build_config(preset_now, sketch_d_now, snp_mask_now, f32_now, kb_now);
@@ -188,26 +196,37 @@ pub fn L2Panel() -> impl IntoView {
         };
 
         tracing::info!(
-            "Spawning L2 worker: BED size={} bim={} fam={}",
+            "Spawning L2 worker pool: BED size={} BIM size={} FAM len={}",
             bed_file.size(),
-            bim_text.len(),
+            bim_file.size(),
             fam_text.len()
         );
 
+        let on_progress = move |p: PoolProgress| {
+            progress.set((p.snps_done, p.snps_total));
+        };
         let on_done = move |out: WorkerComputeResult| {
             tracing::info!("L2 done: {} SNPs in {:.2}s", out.n_snps, out.wall_seconds);
             result.set(Some(out));
             is_running.set(false);
         };
         let on_err = move |msg: String| {
-            tracing::error!("L2 worker failed: {msg}");
+            tracing::error!("L2 worker pool failed: {msg}");
             error.set(Some(msg));
             is_running.set(false);
         };
 
-        if let Err(e) = spawn_compute_l2(bed_file, bim_text, fam_text, cfg_json, on_done, on_err) {
-            tracing::error!("spawn_compute_l2 failed: {e:?}");
-            error.set(Some(format!("worker spawn: {e:?}")));
+        if let Err(e) = spawn_compute_l2_pool(
+            bed_file,
+            bim_file,
+            fam_text,
+            cfg_json,
+            on_progress,
+            on_done,
+            on_err,
+        ) {
+            tracing::error!("spawn_compute_l2_pool failed: {e:?}");
+            error.set(Some(format!("worker pool spawn: {e:?}")));
             is_running.set(false);
         }
     };
@@ -221,7 +240,7 @@ pub fn L2Panel() -> impl IntoView {
             </div>
             <div class="card-body">
                 <FileUploadRow ext=".bed" read_as=ReadAs::BlobHandle file=bed />
-                <FileUploadRow ext=".bim" read_as=ReadAs::Text file=bim />
+                <FileUploadRow ext=".bim" read_as=ReadAs::BlobHandle file=bim />
                 <FileUploadRow ext=".fam" read_as=ReadAs::Text file=fam />
                 <p class="text-muted mt-2 mb-0" style="font-size: 0.825rem;">
                     "Files stay in your browser — no data is uploaded anywhere. \
@@ -303,6 +322,36 @@ pub fn L2Panel() -> impl IntoView {
                 {move || if is_running.get() { "Running…" } else { "Run" }}
             </button>
         </div>
+
+        // ── Progress bar (visible while running) ───────────────────────
+        {move || {
+            if !is_running.get() {
+                return view! { <span></span> }.into_any();
+            }
+            let (done, total) = progress.get();
+            let pct = if total > 0 {
+                (done as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            let label = if total == 0 {
+                "Scanning BIM…".to_string()
+            } else {
+                format!("{} / {} SNPs ({:.1}%)", format_int(done), format_int(total), pct)
+            };
+            view! {
+                <div class="mb-3">
+                    <div class="progress" role="progressbar" style="height: 1.25rem;">
+                        <div class="progress-bar progress-bar-striped progress-bar-animated"
+                             style=move || format!("width: {:.1}%; background-color: #2a71a5;", pct)>
+                        </div>
+                    </div>
+                    <div class="text-muted text-end" style="font-size: 0.825rem;">
+                        {label}
+                    </div>
+                </div>
+            }.into_any()
+        }}
 
         // ── Error box ──────────────────────────────────────────────────
         {move || error.get().map(|msg| view! {

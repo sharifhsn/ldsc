@@ -1,12 +1,23 @@
 // ldsc-web Web Worker entry point.
 //
-// Loads the same wasm bundle the main thread uses, then waits for an
-// init message that hands us the (hash-suffixed) bundle URL plus the
-// computation payload. Why route the URL through postMessage rather
-// than hard-coding it: trunk content-hashes the JS+wasm filenames on
-// every build, so a static URL would 404 after every rebuild. The
-// main thread already knows the active hashes (it loaded itself from
-// them) and is the natural source of truth.
+// Loads the same wasm bundle the main thread uses, then dispatches
+// inbound messages to the appropriate wasm export. There are three
+// active message kinds:
+//
+//   init         : { wasmJsUrl, wasmBgUrl }
+//                  → load wasm bundle, post { kind: 'ready' }
+//
+//   scan_bim     : { bimFile }
+//                  → call wasm.worker_scan_bim, post
+//                    { kind: 'scan_bim_done', summaries: [{chr, snp_count}] }
+//
+//   compute_l2_chrs : { bedFile, bimFile, famText, chrsFilterJson, configJson }
+//                  → call wasm.worker_compute_l2_chrs, post
+//                    { kind: 'compute_l2_chrs_done', result: WireL2Output }
+//                    Mid-compute, the wasm callback posts
+//                    { kind: 'progress', chunks_done, chunks_total, snps_done, snps_total, chunk_wall_ms }
+//                    directly via DedicatedWorkerGlobalScope.postMessage.
+//                    We don't intercept those — they flow straight through.
 //
 // We use ES module workers (`new Worker(url, { type: 'module' })`)
 // so we can `import()` the trunk-emitted ES module bundle directly.
@@ -36,21 +47,32 @@ self.onmessage = async (e) => {
             return;
         }
 
-        if (kind === 'compute_l2') {
-            // Make sure init is done. The main thread always sends
-            // an init message before compute_l2, but we await
-            // defensively in case messages get reordered.
-            if (initPromise) await initPromise;
-            if (!wasm) {
-                self.postMessage({ kind: 'error', error: 'wasm not initialised' });
-                return;
-            }
+        // Make sure init is done. The main thread always sends an
+        // init message before any compute/scan, but we await
+        // defensively in case messages get reordered.
+        if (initPromise) await initPromise;
+        if (!wasm) {
+            self.postMessage({ kind: 'error', error: 'wasm not initialised' });
+            return;
+        }
 
-            const { bedFile, bimText, famText, configJson } = e.data;
+        if (kind === 'scan_bim') {
+            const { bimFile } = e.data;
             const t0 = performance.now();
-            const result = wasm.worker_compute_l2(bedFile, bimText, famText, configJson);
+            const summaries = wasm.worker_scan_bim(bimFile);
             const dt = performance.now() - t0;
-            self.postMessage({ kind: 'compute_l2_done', result, walkSecondsJs: dt / 1000 });
+            self.postMessage({ kind: 'scan_bim_done', summaries, walkSecondsJs: dt / 1000 });
+            return;
+        }
+
+        if (kind === 'compute_l2_chrs') {
+            const { bedFile, bimFile, famText, chrsFilterJson, configJson } = e.data;
+            const t0 = performance.now();
+            const result = wasm.worker_compute_l2_chrs(
+                bedFile, bimFile, famText, chrsFilterJson, configJson,
+            );
+            const dt = performance.now() - t0;
+            self.postMessage({ kind: 'compute_l2_chrs_done', result, walkSecondsJs: dt / 1000 });
             return;
         }
 

@@ -518,7 +518,13 @@ pub fn parse_bim_str(s: &str) -> Result<Vec<BimRecord>> {
     parse_bim_reader(BufReader::new(s.as_bytes()))
 }
 
-fn parse_bim_reader<R: BufRead>(reader: R) -> Result<Vec<BimRecord>> {
+/// Parse a PLINK .bim file streamingly from any `BufRead` source.
+/// The browser frontend wraps a `Blob`-backed `Read` shim so the BIM
+/// never has to live in JS-string heap (which caps at ~256-512 MB
+/// depending on browser → ~4-8M SNPs of BIM). Once parsed, the
+/// `Vec<BimRecord>` is in wasm linear memory, which has the wider
+/// 4 GB cap — supporting ~60M SNPs.
+pub fn parse_bim_reader<R: BufRead>(reader: R) -> Result<Vec<BimRecord>> {
     let mut records = Vec::new();
     for (line_no, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("reading BIM line {}", line_no + 1))?;

@@ -1049,6 +1049,7 @@ pub(super) fn compute_ldscore_global(
     sketch: Option<usize>,
     sketch_maf_aware: bool,
     snp_level_masking: bool,
+    mut on_progress: impl FnMut(crate::l2::L2Progress),
 ) -> Result<(MatF, Vec<f64>)> {
     // `use_mmap` is derived from whether the caller pre-opened a
     // memory-mapped view; that's the only meaningful signal at this
@@ -1283,7 +1284,10 @@ pub(super) fn compute_ldscore_global(
             .context("starting sequential BED read")?;
     }
 
+    let chunks_total = m.div_ceil(chunk_c.max(1));
+    let mut chunks_done = 0usize;
     for chunk_start in (0..m).step_by(chunk_c) {
+        let chunk_started = Instant::now();
         let chunk_end = (chunk_start + chunk_c).min(m);
         let c = chunk_end - chunk_start;
 
@@ -2377,6 +2381,22 @@ pub(super) fn compute_ldscore_global(
         }
         ring_next += c;
         t_ring_store += t0.elapsed();
+
+        // Fire the per-chunk progress callback. Native callers
+        // typically pass `|_| {}`; the WASM worker turns this into a
+        // postMessage back to the main thread for the progress bar.
+        // Note: L2 contributions for SNPs in this chunk are NOT
+        // finalized yet — later chunks add cross-window r² for them.
+        // This callback is for *progress* (monotonic SNP-coverage
+        // counter), not for streaming finalized output.
+        chunks_done += 1;
+        on_progress(crate::l2::L2Progress {
+            chunks_done,
+            chunks_total,
+            snps_done: chunk_end,
+            snps_total: m,
+            chunk_wall_ms: chunk_started.elapsed().as_secs_f64() * 1000.0,
+        });
     } // end for chunk_start
 
     if verbose_timing {
