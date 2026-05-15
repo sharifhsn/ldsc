@@ -4,7 +4,9 @@ mod normalize;
 mod snp_stats;
 mod window;
 
-pub use crate::parse::{BimRecord, parse_bim, parse_bim_reader, parse_bim_str};
+pub use crate::parse::{
+    BimRecord, parse_bim, parse_bim_reader, parse_bim_reader_filtered, parse_bim_str,
+};
 pub use io::{count_fam, count_fam_str, parse_fam, parse_fam_str};
 pub use window::WindowMode;
 
@@ -464,7 +466,7 @@ pub fn run(args: L2Args) -> Result<()> {
             args.sketch,
             args.sketch_maf_aware,
             args.snp_level_masking,
-            |_| {}, // CLI: no per-chunk progress (terminal stdout would be too noisy)
+            &mut |_| {}, // CLI: no per-chunk progress (terminal stdout would be too noisy)
         )
         .context("computing LD scores")?
     } else {
@@ -539,7 +541,7 @@ pub fn run(args: L2Args) -> Result<()> {
                     args.sketch,
                     args.sketch_maf_aware,
                     args.snp_level_masking,
-                    |_| {}, // CLI: no per-chr progress (rayon already prints chr msgs)
+                    &mut |_| {}, // CLI: no per-chr progress (rayon already prints chr msgs)
                 )
             })
             .collect::<Result<Vec<_>>>()
@@ -993,7 +995,25 @@ pub struct L2Output {
 /// (`K = 1`) path with no `--extract` / `--keep` / `--annot`
 /// filtering — that's the headline demo. Annotation support will land
 /// as additional `L2Config` fields once the UI grows past v1.
+/// Back-compat shim: same shape as the pre-progress-callback API.
+/// Equivalent to [`compute_l2_from_bytes_with_progress`] with a
+/// no-op callback.
 pub fn compute_l2_from_bytes(
+    bed_bytes: Vec<u8>,
+    bim_text: &str,
+    fam_text: &str,
+    config: L2Config,
+) -> Result<L2Output> {
+    compute_l2_from_bytes_with_progress(bed_bytes, bim_text, fam_text, config, |_| {})
+}
+
+/// Compute LD scores from in-memory BED / BIM / FAM contents, with
+/// a per-chunk progress callback.
+///
+/// The browser frontend wires the callback to a postMessage so the
+/// main-thread UI can render a progress bar. CLI / native callers
+/// who don't want progress should use [`compute_l2_from_bytes`].
+pub fn compute_l2_from_bytes_with_progress(
     bed_bytes: Vec<u8>,
     bim_text: &str,
     fam_text: &str,
@@ -1013,7 +1033,7 @@ pub fn compute_l2_from_bytes(
     let bed = Bed::from_bytes(bed_bytes, n_indiv, snps.len())
         .context("validating BED bytes in compute_l2_from_bytes")?;
 
-    compute_l2_from_bed(bed, snps, n_indiv, config, on_progress)
+    compute_l2_from_bed_with_progress(bed, snps, n_indiv, config, on_progress)
 }
 
 /// Compute LD scores from a pre-opened [`Bed`] + parsed BIM + FAM
@@ -1025,12 +1045,39 @@ pub fn compute_l2_from_bytes(
 /// browser never has to load the whole multi-GB BED into wasm
 /// linear memory. Native callers can use the same API with any
 /// `Bed` (e.g. `Bed::builder(path).build()`).
+/// Back-compat shim: same shape as the pre-progress-callback API.
+/// Equivalent to [`compute_l2_from_bed_with_progress`] with a no-op
+/// callback.
 pub fn compute_l2_from_bed(
     bed: Bed,
     snps: Vec<BimRecord>,
     n_indiv: usize,
     config: L2Config,
-    on_progress: impl FnMut(L2Progress),
+) -> Result<L2Output> {
+    compute_l2_from_bed_with_progress(bed, snps, n_indiv, config, |_| {})
+}
+
+/// Compute LD scores from a pre-opened [`Bed`] + parsed BIM + FAM
+/// individual count, with a per-chunk progress callback.
+///
+/// This is the API ldsc-web's Web Worker calls — the Worker
+/// constructs a [`Bed`] backed by a [`crate::bed::BedSource`] that
+/// streams chunks out of a JS `Blob` via `FileReaderSync`, so the
+/// browser never has to load the whole multi-GB BED into wasm
+/// linear memory. Native callers can use the same API with any
+/// `Bed` (e.g. `Bed::builder(path).build()`).
+///
+/// The `on_progress` closure is boxed into a `&mut dyn FnMut`
+/// before being threaded into [`compute_ldscore_global`] — that
+/// keeps the chunked-GEMM function (~1900 LOC) at one
+/// monomorphization across all callers regardless of how many
+/// distinct closure types exist at the public boundary.
+pub fn compute_l2_from_bed_with_progress(
+    bed: Bed,
+    snps: Vec<BimRecord>,
+    n_indiv: usize,
+    config: L2Config,
+    mut on_progress: impl FnMut(L2Progress),
 ) -> Result<L2Output> {
     anyhow::ensure!(!snps.is_empty(), "compute_l2_from_bed: BIM has zero SNPs");
     anyhow::ensure!(n_indiv > 0, "compute_l2_from_bed: FAM has zero individuals");
@@ -1056,7 +1103,7 @@ pub fn compute_l2_from_bed(
         config.sketch,
         config.sketch_maf_aware,
         config.snp_level_masking,
-        on_progress,
+        &mut on_progress,
     )
     .context("computing LD scores in compute_l2_from_bed")?;
 
@@ -1111,7 +1158,7 @@ mod tests {
             yes_really: true,
             ..L2Config::default()
         };
-        let out = compute_l2_from_bytes(bed_bytes, bim_text, fam_text, cfg, |_| {})
+        let out = compute_l2_from_bytes(bed_bytes, bim_text, fam_text, cfg)
             .expect("compute_l2_from_bytes must accept a valid micro BED");
 
         assert_eq!(out.snps.len(), 2);
@@ -1141,7 +1188,7 @@ mod tests {
             yes_really: true,
             ..L2Config::default()
         };
-        let result = compute_l2_from_bytes(bed_bytes, bim_text, fam_text, cfg, |_| {});
+        let result = compute_l2_from_bytes(bed_bytes, bim_text, fam_text, cfg);
         assert!(
             result.is_err(),
             "truncated BED must be rejected; got {:?}",

@@ -1049,8 +1049,19 @@ pub(super) fn compute_ldscore_global(
     sketch: Option<usize>,
     sketch_maf_aware: bool,
     snp_level_masking: bool,
-    mut on_progress: impl FnMut(crate::l2::L2Progress),
+    on_progress: &mut dyn FnMut(crate::l2::L2Progress),
 ) -> Result<(MatF, Vec<f64>)> {
+    // chunk_c=0 makes `(0..m).step_by(chunk_c)` panic ("step must be
+    // non-zero"). Catch the malformed-config case here with a real
+    // error instead of a wasm `unreachable executed` trap. The
+    // `chunks_total = m.div_ceil(chunk_c.max(1))` line below would
+    // otherwise mask this with a defensive-looking `.max(1)` that
+    // doesn't actually defend the loop.
+    anyhow::ensure!(
+        chunk_c >= 1,
+        "compute_ldscore_global: chunk_size must be >= 1, got {}",
+        chunk_c,
+    );
     // `use_mmap` is derived from whether the caller pre-opened a
     // memory-mapped view; that's the only meaningful signal at this
     // layer. Browser callers always pass `mmap_bed = None`.
@@ -2382,13 +2393,18 @@ pub(super) fn compute_ldscore_global(
         ring_next += c;
         t_ring_store += t0.elapsed();
 
-        // Fire the per-chunk progress callback. Native callers
-        // typically pass `|_| {}`; the WASM worker turns this into a
-        // postMessage back to the main thread for the progress bar.
-        // Note: L2 contributions for SNPs in this chunk are NOT
-        // finalized yet — later chunks add cross-window r² for them.
-        // This callback is for *progress* (monotonic SNP-coverage
-        // counter), not for streaming finalized output.
+        // Fire the per-chunk progress callback. Native callers pass
+        // a no-op; the WASM worker turns this into a postMessage
+        // back to the main thread for the progress bar. Note: L2
+        // contributions for SNPs in this chunk are NOT finalized yet
+        // — later chunks add cross-window r² for them. This callback
+        // is for *progress* (monotonic SNP-coverage counter), not
+        // for streaming finalized output.
+        //
+        // Closure is `&mut dyn FnMut` (boxed once at the public API
+        // boundary in `compute_l2_from_bed_with_progress`) so this
+        // ~1900 LOC function only monomorphizes once across all
+        // call sites.
         chunks_done += 1;
         on_progress(crate::l2::L2Progress {
             chunks_done,

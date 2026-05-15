@@ -23,20 +23,44 @@
 //! browser) or in wasm linear memory in full — the working set is
 //! the current chunk + ring buffer + output L2 array. BED has no
 //! practical size limit; BIM is bounded by the parsed
-//! `Vec<BimRecord>` size in wasm linear memory (~60 bytes/record →
-//! ~60M SNPs at the 4 GB wasm32 cap).
+//! `Vec<BimRecord>` size in wasm linear memory (~75 bytes/record
+//! once the rsID `String` heap allocation is counted → ~50M SNPs in
+//! ONE worker at the 4 GB wasm32 cap).
+//!
+//! Per-worker BIM memory is *further* bounded by the per-chr filter
+//! — each compute worker only keeps the BimRecords for its assigned
+//! chromosomes, via [`parse_bim_reader_filtered`]. So 4 workers split
+//! the BIM by chr instead of each parsing the full genome.
 
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
 use ldsc::bed::Bed;
 use ldsc::l2::{
-    L2Config, L2Progress, WindowMode, compute_l2_from_bed, count_fam_str, parse_bim_reader,
+    L2Config, WindowMode, compute_l2_from_bed_with_progress, count_fam_str, parse_bim_reader,
+    parse_bim_reader_filtered,
 };
 use ldsc::parse::BimRecord;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::{Blob, DedicatedWorkerGlobalScope, FileReaderSync};
+
+/// Wrap the BIM source in a BufReader with this much capacity. Default
+/// 8 KB triggers ~12,800 JS round-trips for a 1.66M-SNP BIM (~50 µs
+/// each in Chrome) — ~640 ms wasted on reader chatter alone. 256 KB
+/// drops that to ~400 round-trips, ~20 ms.
+const BIM_BUFREADER_CAP: usize = 256 * 1024;
+
+/// Throttle progress posts from the worker side. Compute can fire
+/// thousands of chunks/sec at biobank scale; posting every one would
+/// queue ~250+ messages/sec on the main thread, each triggering a
+/// Leptos re-render of the progress bar. 16 ms is one rAF frame at
+/// 60 Hz — fast enough for a smooth bar, slow enough to amortize
+/// JS message dispatch.
+///
+/// We always post the FIRST and LAST chunk regardless, so the bar
+/// is responsive at the start and reaches 100% at the end.
+const PROGRESS_THROTTLE_MS: f64 = 16.0;
 
 // ── Read shims over JS Blobs via FileReaderSync ─────────────────────
 
@@ -222,7 +246,6 @@ pub struct WireL2Config {
     pub snp_level_masking: bool,
     pub yes_really: bool,
     pub pq_exp: Option<f64>,
-    pub verbose_timing: bool,
 }
 
 impl From<WireL2Config> for L2Config {
@@ -236,7 +259,9 @@ impl From<WireL2Config> for L2Config {
             snp_level_masking: w.snp_level_masking,
             yes_really: w.yes_really,
             pq_exp: w.pq_exp,
-            verbose_timing: w.verbose_timing,
+            // verbose_timing is wasm-only no-op (we render our own
+            // perf in the result card); never expose to wire.
+            verbose_timing: false,
         }
     }
 }
@@ -270,13 +295,16 @@ pub struct WireChrSummary {
 /// shard work across the compute worker pool.
 ///
 /// Cost: one streaming pass over the BIM. ~100 MB at biobank-50K
-/// scale, ~1 second wall on a single thread.
+/// scale, ~1 second wall on a single thread. The full
+/// `Vec<BimRecord>` is built during the parse — the cost is bounded
+/// by the lifetime of this function call (Rust drops it on return),
+/// so it doesn't compound across worker fan-out.
 #[wasm_bindgen]
 pub fn worker_scan_bim(bim_file: web_sys::File) -> Result<JsValue, JsError> {
     let blob: Blob = bim_file.into();
     let source =
         BlobBimSource::new(blob).map_err(|e| JsError::new(&format!("BlobBimSource: {e:?}")))?;
-    let snps = parse_bim_reader(BufReader::new(source))
+    let snps = parse_bim_reader(BufReader::with_capacity(BIM_BUFREADER_CAP, source))
         .map_err(|e| JsError::new(&format!("parse BIM: {e:#}")))?;
 
     // Group consecutive same-chr SNPs into summaries. BIM is
@@ -331,21 +359,33 @@ pub fn worker_compute_l2_chrs(
         .into(),
     );
 
-    // Stream + parse BIM, filter to assigned chrs.
+    // We need TWO things from the BIM that the filtered parse can't
+    // give us in one normal pass:
+    //
+    //   - `total_bim_snps` (the *full* sid_count, used by Bed::from_source
+    //     to validate the BED file size against `iid × total + 3`).
+    //   - the per-chr SNP records for our assigned chrs.
+    //
+    // The cheap way: stream the BIM once with a counter that ticks
+    // every line and a filter that decides what to keep. The
+    // predicate closes over `&mut total` so we get both in one pass
+    // without ever materializing the full Vec<BimRecord>.
     let bim_blob: Blob = bim_file.into();
     let bim_source =
         BlobBimSource::new(bim_blob).map_err(|e| JsError::new(&format!("BlobBimSource: {e:?}")))?;
-    let all_snps = parse_bim_reader(BufReader::new(bim_source))
-        .map_err(|e| JsError::new(&format!("parse BIM: {e:#}")))?;
-    let total_bim_snps = all_snps.len();
+    let mut total_bim_snps: usize = 0;
+    let snps: Vec<BimRecord> = parse_bim_reader_filtered(
+        BufReader::with_capacity(BIM_BUFREADER_CAP, bim_source),
+        |chr| {
+            total_bim_snps += 1;
+            match chrs_set {
+                Some(ref set) => set.contains(&chr),
+                None => true,
+            }
+        },
+    )
+    .map_err(|e| JsError::new(&format!("parse BIM: {e:#}")))?;
 
-    let snps: Vec<BimRecord> = match chrs_set {
-        Some(ref set) => all_snps
-            .into_iter()
-            .filter(|s| set.contains(&s.chr))
-            .collect(),
-        None => all_snps,
-    };
     if snps.is_empty() {
         // Empty assignment is harmless — return an empty result so
         // the orchestrator can degrade gracefully.
@@ -360,6 +400,7 @@ pub fn worker_compute_l2_chrs(
             .map_err(|e| JsError::new(&format!("output serialise: {e}")));
     }
     let bed_idx: Vec<usize> = snps.iter().map(|s| s.bed_idx).collect();
+    let n_snps_in = snps.len();
 
     let n_indiv = count_fam_str(&fam_text);
 
@@ -376,30 +417,55 @@ pub fn worker_compute_l2_chrs(
     let cfg: WireL2Config = serde_json::from_str(&config_json)
         .map_err(|e| JsError::new(&format!("config JSON: {e}")))?;
 
-    // Progress callback: postMessage back to main on every chunk.
-    // js_sys::global() in a Worker context is the
-    // DedicatedWorkerGlobalScope; this is the only way to reach
-    // self.postMessage from inside synchronous wasm code.
-    let global: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
-    let on_progress = move |p: L2Progress| {
+    // Progress callback: postMessage back to main, throttled.
+    // js_sys::global() in a Worker context returns the
+    // DedicatedWorkerGlobalScope; use dyn_into so a misuse from a
+    // non-worker context surfaces as a Result error rather than an
+    // unreachable trap.
+    let global: DedicatedWorkerGlobalScope = js_sys::global()
+        .dyn_into()
+        .map_err(|_| JsError::new("worker_compute_l2_chrs called outside a DedicatedWorker"))?;
+    let mut last_post_ms: f64 = 0.0;
+    let on_progress = move |p: ldsc::l2::L2Progress| {
+        // Always post the FIRST chunk (latency = how long the user
+        // waits before seeing anything happen) and the LAST chunk
+        // (so the bar reaches 100%). Throttle the middle to ~1 per
+        // PROGRESS_THROTTLE_MS to keep main-thread Leptos re-renders
+        // amortized at biobank-scale chunk rates.
+        let now_ms = js_sys::Date::now();
+        let is_first = p.chunks_done == 1;
+        let is_last = p.chunks_done == p.chunks_total;
+        let is_due = now_ms - last_post_ms >= PROGRESS_THROTTLE_MS;
+        if !(is_first || is_last || is_due) {
+            return;
+        }
+        last_post_ms = now_ms;
         let obj = js_sys::Object::new();
         let _ = js_sys::Reflect::set(&obj, &"kind".into(), &"progress".into());
-        let _ = js_sys::Reflect::set(&obj, &"chunks_done".into(), &(p.chunks_done as f64).into());
-        let _ = js_sys::Reflect::set(
-            &obj,
-            &"chunks_total".into(),
-            &(p.chunks_total as f64).into(),
-        );
+        // Only `snps_done` is consumed by the orchestrator; the
+        // other L2Progress fields stay in-process to avoid 200+
+        // bytes per post for fields nobody reads.
         let _ = js_sys::Reflect::set(&obj, &"snps_done".into(), &(p.snps_done as f64).into());
-        let _ = js_sys::Reflect::set(&obj, &"snps_total".into(), &(p.snps_total as f64).into());
-        let _ = js_sys::Reflect::set(&obj, &"chunk_wall_ms".into(), &p.chunk_wall_ms.into());
-        // Best-effort post; if it fails (worker shutting down) we
-        // just drop the update — compute keeps going.
-        let _ = global.post_message(&obj);
+        if let Err(e) = global.post_message(&obj) {
+            web_sys::console::warn_1(&format!("worker progress postMessage failed: {e:?}").into());
+        }
     };
 
-    let out = compute_l2_from_bed(bed, snps, n_indiv, cfg.into(), on_progress)
+    let out = compute_l2_from_bed_with_progress(bed, snps, n_indiv, cfg.into(), on_progress)
         .map_err(|e| JsError::new(&format!("compute_l2_from_bed: {e:#}")))?;
+
+    // Length invariant — guards against future drift in the lib's
+    // L2Output shape that would silently truncate via the triple-zip
+    // in worker_client::assemble_partials.
+    if bed_idx.len() != out.l2.len() || out.l2.len() != out.maf.len() {
+        return Err(JsError::new(&format!(
+            "internal: length mismatch in WireL2Output (bed_idx={}, l2={}, maf={}, input snps={})",
+            bed_idx.len(),
+            out.l2.len(),
+            out.maf.len(),
+            n_snps_in,
+        )));
+    }
 
     let wire = WireL2Output {
         n_snps: out.l2.len(),

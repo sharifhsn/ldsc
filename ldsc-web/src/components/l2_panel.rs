@@ -131,11 +131,23 @@ pub fn L2Panel() -> impl IntoView {
     Effect::new(move |_| {
         if let Some(out) = result.get() {
             // Defer one tick so the canvas elements exist in the DOM.
+            // Guard against the canvases having been detached (user
+            // switched modules / navigated mid-render); without the
+            // guard, plotters tries to paint to a missing element
+            // and the render functions log a confusing error.
             request_animation_frame(move || {
-                if let Err(e) = render_l2_histogram("chart-hist", &out.l2) {
+                let doc = match web_sys::window().and_then(|w| w.document()) {
+                    Some(d) => d,
+                    None => return,
+                };
+                if doc.get_element_by_id("chart-hist").is_some()
+                    && let Err(e) = render_l2_histogram("chart-hist", &out.l2)
+                {
                     tracing::error!("histogram render: {e:?}");
                 }
-                if let Err(e) = render_l2_vs_maf("chart-scatter", &out.maf, &out.l2) {
+                if doc.get_element_by_id("chart-scatter").is_some()
+                    && let Err(e) = render_l2_vs_maf("chart-scatter", &out.maf, &out.l2)
+                {
                     tracing::error!("scatter render: {e:?}");
                 }
             });
@@ -175,15 +187,28 @@ pub fn L2Panel() -> impl IntoView {
         // per-chromosome worker pool streams both via FileReaderSync
         // inside each Worker. FAM is tiny (~1 MB at biobank scale)
         // and stays as a String passed through postMessage.
-        let bed_file = bed
-            .with(|f| f.file_handle.clone())
-            .expect("bed loaded")
-            .take();
-        let bim_file = bim
-            .with(|f| f.file_handle.clone())
-            .expect("bim loaded")
-            .take();
-        let fam_text = fam.with(|f| f.text.clone()).expect("fam loaded");
+        //
+        // We re-check each handle here (in addition to the
+        // `all_loaded()` button-disable gate) because that gate is
+        // client-side and a determined user could bypass it via
+        // devtools. Surfacing as an `error.set(...)` is the safe
+        // failure mode; the previous `.expect("bed loaded")` would
+        // panic the wasm module.
+        let Some(bed_file) = bed.with(|f| f.file_handle.clone()).map(|h| h.take()) else {
+            error.set(Some("BED file not loaded".into()));
+            is_running.set(false);
+            return;
+        };
+        let Some(bim_file) = bim.with(|f| f.file_handle.clone()).map(|h| h.take()) else {
+            error.set(Some("BIM file not loaded".into()));
+            is_running.set(false);
+            return;
+        };
+        let Some(fam_text) = fam.with(|f| f.text.clone()) else {
+            error.set(Some("FAM file not loaded".into()));
+            is_running.set(false);
+            return;
+        };
 
         let cfg = build_config(preset_now, sketch_d_now, snp_mask_now, f32_now, kb_now);
         let cfg_json = match serde_json::to_string(&cfg) {
@@ -486,7 +511,6 @@ fn build_config(
         snp_level_masking: snp_mask,
         yes_really: true,
         pq_exp: None,
-        verbose_timing: false,
     };
     match preset {
         ModePreset::Sketch => {

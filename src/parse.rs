@@ -523,24 +523,68 @@ pub fn parse_bim_str(s: &str) -> Result<Vec<BimRecord>> {
 /// never has to live in JS-string heap (which caps at ~256-512 MB
 /// depending on browser → ~4-8M SNPs of BIM). Once parsed, the
 /// `Vec<BimRecord>` is in wasm linear memory, which has the wider
-/// 4 GB cap — supporting ~60M SNPs.
+/// 4 GB cap.
+///
+/// Per-record memory is ~70-80 bytes once you count the `String`
+/// header for the rsID + the heap allocation for typical
+/// `rs1234567`-style IDs. So the practical wasm32 cap is ~50M SNPs
+/// for one buffered parse — bigger inputs need
+/// [`parse_bim_reader_filtered`] to skip rows the caller doesn't
+/// keep.
 pub fn parse_bim_reader<R: BufRead>(reader: R) -> Result<Vec<BimRecord>> {
+    parse_bim_reader_filtered(reader, |_chr| true)
+}
+
+/// Streaming BIM parser with an inline `chr` predicate filter. Rows
+/// where `keep_chr(chr)` returns `false` are decoded enough to advance
+/// `bed_idx` (the per-line counter) but not stored. Browser-side per-
+/// chromosome workers use this to consume just their assigned slice of
+/// the genome without holding the full `Vec<BimRecord>` for the rest
+/// — without it, 4 workers × ~100 MB BIM ≈ 400 MB of redundant parsed
+/// state, and at the documented 60M-SNP scale the per-worker fan-out
+/// blows past the 4 GB wasm32 cap.
+///
+/// `bed_idx` is preserved for *every* line (matching the unfiltered
+/// path), so the kept records still index correctly into the original
+/// BED file's SNP slabs.
+pub fn parse_bim_reader_filtered<R: BufRead, F: FnMut(u8) -> bool>(
+    reader: R,
+    mut keep_chr: F,
+) -> Result<Vec<BimRecord>> {
     let mut records = Vec::new();
     for (line_no, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("reading BIM line {}", line_no + 1))?;
-        let cols: Vec<&str> = line.split('\t').collect();
-        anyhow::ensure!(
-            cols.len() >= 6,
-            "BIM line {}: expected 6 columns, got {}",
-            line_no + 1,
-            cols.len()
-        );
-
+        let mut cols = line.split('\t');
+        let chr_str = cols
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("BIM line {}: empty", line_no + 1))?;
+        let chr = chr_str.parse::<u8>().unwrap_or(0);
+        if !keep_chr(chr) {
+            continue;
+        }
+        let snp = cols
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("BIM line {}: expected SNP column", line_no + 1))?
+            .to_string();
+        let cm = cols
+            .next()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let bp = cols.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+        // Columns 5+6 (A1/A2) are still validated by the original
+        // 6-col contract — we read them via remaining iterator advance
+        // to mirror the strictness of `parse_bim_reader`'s old check.
+        let _a1 = cols
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("BIM line {}: missing A1 col", line_no + 1))?;
+        let _a2 = cols
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("BIM line {}: missing A2 col", line_no + 1))?;
         records.push(BimRecord {
-            chr: cols[0].parse::<u8>().unwrap_or(0),
-            snp: cols[1].to_string(),
-            cm: cols[2].parse::<f64>().unwrap_or(0.0),
-            bp: cols[3].parse::<u32>().unwrap_or(0),
+            chr,
+            snp,
+            cm,
+            bp,
             bed_idx: line_no,
         });
     }
