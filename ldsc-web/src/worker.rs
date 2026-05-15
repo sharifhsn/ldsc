@@ -32,6 +32,7 @@
 //! chromosomes, via [`parse_bim_reader_filtered`]. So 4 workers split
 //! the BIM by chr instead of each parsing the full genome.
 
+use std::cell::Cell;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
 use ldsc::bed::Bed;
@@ -401,71 +402,139 @@ pub fn worker_compute_l2_chrs(
     }
     let bed_idx: Vec<usize> = snps.iter().map(|s| s.bed_idx).collect();
     let n_snps_in = snps.len();
+    let total_assigned = snps.len();
+
+    // Group consecutive same-chr SNPs. The BIM filter preserves the
+    // input order, and the BIM is sorted by (chr, bp), so each chr
+    // appears as a contiguous run within `snps`. We must call
+    // `compute_l2_from_bed` ONCE PER CHR rather than once for the
+    // whole worker shard, otherwise the chunked GEMM's chunk
+    // boundaries straddle chr transitions and compute spurious
+    // cross-chr r² inside the within-chunk B^T·B (~12% mean L2
+    // inflation observed on full 1000G in default chunked mode).
+    // This mirrors the native CLI's per-chr rayon dispatch in
+    // `src/l2/mod.rs::run` (the non-`--global-pass` path).
+    let mut chr_ranges: Vec<(usize, usize)> = Vec::new();
+    {
+        let mut start = 0usize;
+        while start < snps.len() {
+            let chr = snps[start].chr;
+            let mut end = start + 1;
+            while end < snps.len() && snps[end].chr == chr {
+                end += 1;
+            }
+            chr_ranges.push((start, end));
+            start = end;
+        }
+    }
 
     let n_indiv = count_fam_str(&fam_text);
-
-    // Open BED with `total_bim_snps` (the *full* sid_count) — the
-    // BED file size is validated against `iid_count × total_bim_snps`
-    // even though we only read a chr's worth of slabs from it.
     let bed_blob: Blob = bed_file.into();
     let bed_len = bed_blob.size() as u64;
-    let bed_source =
-        BlobBedSource::new(bed_blob).map_err(|e| JsError::new(&format!("BlobBedSource: {e:?}")))?;
-    let bed = Bed::from_source(bed_source, n_indiv, total_bim_snps, bed_len)
-        .map_err(|e| JsError::new(&format!("Bed::from_source: {e:#}")))?;
 
-    let cfg: WireL2Config = serde_json::from_str(&config_json)
+    let cfg_wire: WireL2Config = serde_json::from_str(&config_json)
         .map_err(|e| JsError::new(&format!("config JSON: {e}")))?;
+    let cfg: L2Config = cfg_wire.into();
 
-    // Progress callback: postMessage back to main, throttled.
-    // js_sys::global() in a Worker context returns the
-    // DedicatedWorkerGlobalScope; use dyn_into so a misuse from a
-    // non-worker context surfaces as a Result error rather than an
-    // unreachable trap.
     let global: DedicatedWorkerGlobalScope = js_sys::global()
         .dyn_into()
         .map_err(|_| JsError::new("worker_compute_l2_chrs called outside a DedicatedWorker"))?;
-    let mut last_post_ms: f64 = 0.0;
-    let on_progress = move |p: ldsc::l2::L2Progress| {
-        // Always post the FIRST chunk (latency = how long the user
-        // waits before seeing anything happen) and the LAST chunk
-        // (so the bar reaches 100%). Throttle the middle to ~1 per
-        // PROGRESS_THROTTLE_MS to keep main-thread Leptos re-renders
-        // amortized at biobank-scale chunk rates.
-        let now_ms = js_sys::Date::now();
-        let is_first = p.chunks_done == 1;
-        let is_last = p.chunks_done == p.chunks_total;
-        let is_due = now_ms - last_post_ms >= PROGRESS_THROTTLE_MS;
-        if !(is_first || is_last || is_due) {
-            return;
-        }
-        last_post_ms = now_ms;
-        let obj = js_sys::Object::new();
-        let _ = js_sys::Reflect::set(&obj, &"kind".into(), &"progress".into());
-        // Only `snps_done` is consumed by the orchestrator; the
-        // other L2Progress fields stay in-process to avoid 200+
-        // bytes per post for fields nobody reads.
-        let _ = js_sys::Reflect::set(&obj, &"snps_done".into(), &(p.snps_done as f64).into());
-        if let Err(e) = global.post_message(&obj) {
-            web_sys::console::warn_1(&format!("worker progress postMessage failed: {e:?}").into());
-        }
-    };
 
-    let out = compute_l2_from_bed_with_progress(bed, snps, n_indiv, cfg.into(), on_progress)
-        .map_err(|e| JsError::new(&format!("compute_l2_from_bed: {e:#}")))?;
+    // Throttle + cumulative-progress state lives in `Cell`s shared
+    // across per-chr calls. Each per-chr call's L2Progress reports
+    // chunks_done relative to its own chr; we add `snps_done_base`
+    // (cumulative SNPs from prior chrs in this worker) before
+    // posting upstream.
+    let last_post_ms: Cell<f64> = Cell::new(0.0);
+    let snps_done_base: Cell<usize> = Cell::new(0);
 
-    // Length invariant — guards against future drift in the lib's
-    // L2Output shape that would silently truncate via the triple-zip
-    // in worker_client::assemble_partials.
-    if bed_idx.len() != out.l2.len() || out.l2.len() != out.maf.len() {
+    let mut accum_l2: Vec<f64> = Vec::with_capacity(snps.len());
+    let mut accum_maf: Vec<f64> = Vec::with_capacity(snps.len());
+    let mut total_wall_seconds = 0.0f64;
+
+    // Move snps into a temp Vec we can drain by chr-range. Avoids
+    // cloning each chr's slice.
+    let mut snps_remaining = snps;
+
+    for &(start, end) in &chr_ranges {
+        let chr_n = end - start;
+        // Drain the first `chr_n` records (consumes the head of
+        // snps_remaining; preserves order).
+        let chr_snps: Vec<BimRecord> = snps_remaining.drain(..chr_n).collect();
+
+        // Fresh Bed handle per chr — Bed is consumed by
+        // compute_l2_from_bed. BlobBedSource just wraps a Blob
+        // reference (cheap clone in JS, refcounted by the browser).
+        let bed_source_chr = BlobBedSource::new(bed_blob.clone())
+            .map_err(|e| JsError::new(&format!("BlobBedSource (chr {start}..{end}): {e:?}")))?;
+        let bed_chr = Bed::from_source(bed_source_chr, n_indiv, total_bim_snps, bed_len)
+            .map_err(|e| JsError::new(&format!("Bed::from_source (chr {start}..{end}): {e:#}")))?;
+
+        // Per-chr progress callback wraps the shared throttle +
+        // cumulative-offset state. `is_first` / `is_last` semantics
+        // are computed against the cumulative counter, not the
+        // per-chr one, so the bar advances smoothly across chr
+        // boundaries within the worker.
+        let on_progress = |p: ldsc::l2::L2Progress| {
+            let cumulative = snps_done_base.get() + p.snps_done;
+            let now_ms = js_sys::Date::now();
+            let is_first = cumulative == p.snps_done && p.chunks_done == 1;
+            let is_last = cumulative == total_assigned;
+            let is_due = now_ms - last_post_ms.get() >= PROGRESS_THROTTLE_MS;
+            if !(is_first || is_last || is_due) {
+                return;
+            }
+            last_post_ms.set(now_ms);
+            let obj = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&obj, &"kind".into(), &"progress".into());
+            let _ = js_sys::Reflect::set(&obj, &"snps_done".into(), &(cumulative as f64).into());
+            if let Err(e) = global.post_message(&obj) {
+                web_sys::console::warn_1(
+                    &format!("worker progress postMessage failed: {e:?}").into(),
+                );
+            }
+        };
+
+        let chr_out =
+            compute_l2_from_bed_with_progress(bed_chr, chr_snps, n_indiv, cfg.clone(), on_progress)
+                .map_err(|e| {
+                    JsError::new(&format!("compute_l2_from_bed (chr {start}..{end}): {e:#}"))
+                })?;
+
+        // Length invariant per chr.
+        if chr_out.l2.len() != chr_n || chr_out.maf.len() != chr_n {
+            return Err(JsError::new(&format!(
+                "internal: chr {start}..{end} length mismatch (l2={}, maf={}, expected={})",
+                chr_out.l2.len(),
+                chr_out.maf.len(),
+                chr_n,
+            )));
+        }
+
+        accum_l2.extend(chr_out.l2);
+        accum_maf.extend(chr_out.maf);
+        total_wall_seconds += chr_out.wall_seconds;
+        snps_done_base.set(snps_done_base.get() + chr_n);
+    }
+
+    // Pool-level length invariant — guards against future drift in
+    // the lib's L2Output shape that would silently truncate via the
+    // triple-zip in worker_client::assemble_partials.
+    if bed_idx.len() != accum_l2.len() || accum_l2.len() != accum_maf.len() {
         return Err(JsError::new(&format!(
             "internal: length mismatch in WireL2Output (bed_idx={}, l2={}, maf={}, input snps={})",
             bed_idx.len(),
-            out.l2.len(),
-            out.maf.len(),
+            accum_l2.len(),
+            accum_maf.len(),
             n_snps_in,
         )));
     }
+    let out = ldsc::l2::L2Output {
+        snps: Vec::new(), // unused on the wire side
+        l2: accum_l2,
+        maf: accum_maf,
+        wall_seconds: total_wall_seconds,
+    };
 
     let wire = WireL2Output {
         n_snps: out.l2.len(),
