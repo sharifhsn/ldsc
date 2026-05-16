@@ -4,6 +4,42 @@ This log captures **post-change** performance measurements and parity checks.
 Each entry should list the dataset, command, and key timings so we can track
 how changes affect runtime.
 
+## 2026-05-16 (FIX: inner-worker TLS allocation)
+
+- Bug: full 1000G EUR no-mask consistently traps with
+  `RuntimeError: unreachable` in `worker_compute_l2_chrs` on the
+  Workstream G manual SAB worker pool (commit c50b90a + e04295c).
+  chr22 worked, full 1000G crashed.
+- Root cause: `assets/inner_worker.js` called `mod.default({
+  module_or_path, memory })` without `thread_stack_size`. The
+  generated wasm-bindgen `__wbindgen_start(stack_size)` allocates
+  per-thread stack + TLS via `malloc(stack_size + 16)` ONLY when
+  called with a non-zero stack size (verified by disassembling
+  `__wbindgen_start` func 1170 — the second branch of the atomic
+  cmpxchg-counter dispatch). With size 0/undefined, each inner
+  Worker got a 16-BYTE stack; any subsequent Rust function call
+  scribbled on neighbour TLS / shared static memory and crashed.
+  chr22 didn't trigger it because the inner workers ran few
+  enough GEMM dispatches that the corruption didn't accumulate
+  to a fatal trap before completion.
+- Fix: 1-line addition to `inner_worker.js` — pass
+  `thread_stack_size: 2 * 1024 * 1024` (2 MB, multiple of the
+  64 KB wasm page size; matches wasm-bindgen-rayon's default) so
+  each inner Worker gets its own stack + TLS region in the
+  shared SAB linear memory.
+- End-to-end browser smoke (Chrome on M5 Pro, fresh tab):
+  full 1000G EUR no-mask completes in **66.31 s** wall (vs F.4
+  baseline 236 s = **3.56×** end-to-end speedup, multiplicative
+  of the cache-block + FMA kernel + 4-outer-worker pool).
+  Per-worker breakdown:
+  - w0: m=427K wall=66.3s bb_dot=15.9s ab_dot=40.0s
+  - w1: m=406K wall=62.7s bb_dot=15.9s ab_dot=36.4s
+  - w2: m=408K wall=63.5s bb_dot=16.1s ab_dot=37.2s
+  - w3: m=423K wall=65.5s bb_dot=16.2s ab_dot=38.7s
+  Kernel speedup translates from wasmtime to browser: ab_dot
+  178s → 40s = 4.5× (cache-block kicked in on m=8000 ✓); bb_dot
+  50s → 16s = 3.1× (FMA ✓).
+
 ## 2026-05-15 (Aggressive GEMM: relaxed-SIMD FMA + cache-block loop reorder)
 
 - Change: stacked two more optimizations on top of the morning's

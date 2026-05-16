@@ -43,7 +43,26 @@ self.onmessage = async (e) => {
         // we can override the `memory` import — that's how we bind
         // this nested Worker's wasm instance to the outer Worker's
         // SAB-backed memory.
-        await mod.default({ module_or_path: wasmBgUrl, memory });
+        //
+        // **CRITICAL:** pass `thread_stack_size` so that
+        // `__wbindgen_start(stack_size)` allocates a UNIQUE stack +
+        // thread-local-storage region for this inner Worker in the
+        // SHARED linear memory. Without this, every inner Worker
+        // shares the outer Worker's TLS region — concurrent
+        // thread_local!() access from multiple inner Workers
+        // silently corrupts memory and crashes on large workloads
+        // (e.g. full 1000G; small workloads like chr22 don't trigger
+        // it because the rare TLS access doesn't race). Must be a
+        // multiple of the wasm page size (65 536). 2 MB matches
+        // wasm-bindgen-rayon's WASM_BINDGEN_THREADS_STACK_SIZE
+        // default and is more than enough for our compute path
+        // (deepest call stack is ~10 frames in the GEMM kernel).
+        const THREAD_STACK_SIZE = 2 * 1024 * 1024; // 2 MB
+        await mod.default({
+            module_or_path: wasmBgUrl,
+            memory,
+            thread_stack_size: THREAD_STACK_SIZE,
+        });
         self.postMessage({ kind: 'ready', workerId });
         // Park forever (returns only on exit signal). All work happens
         // via shared atomics — no further postMessages between outer
