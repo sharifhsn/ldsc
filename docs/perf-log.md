@@ -43,10 +43,43 @@ how changes affect runtime.
   Wasm gates: `trunk build --release` produces 1.1 MB bundle
   (+100 KB vs pre-H, well within the +30 % budget the plan set).
 
-- Browser wall numbers TBD — verification requires a foregrounded
-  Chrome tab (`visibility: hidden` triggers throttling that
-  invalidates the measurement). The CLI target on biobank d=200
-  is 24.9 s; the success bar is ≤ 35 s in-browser, stretch ≤ 28 s.
+- **Wasmtime microbench (single-threaded, serial scatter):**
+  Added `scatter/*` cases to `wasm-bench/src/main.rs`. Numbers on
+  M5 Pro, cranelift JIT, `+simd128 +relaxed-simd`:
+
+  | Shape | Per-chunk wall | Per-column |
+  |---|---|---|
+  | 1000G N=2,490, c=200, d=200 | 260 µs | 1.30 µs |
+  | Biobank N=50,000, c=200, d=200 | **4.16 ms** | 20.8 µs |
+  | Biobank N=50,000, c=500, d=200 | 10.5 ms | 20.9 µs |
+
+  Per-column is flat at ~21 µs across c=200/c=500 (scatter is
+  O(N) per column, c-independent). Bandwidth-bound: 50K
+  scatter-add per col × ~8 bytes touched per add ≈ 400 KB/col →
+  20 µs/col ≈ 20 GB/s effective, consistent with M5 single-core
+  L2 bandwidth.
+
+- **Extrapolation to browser wall (biobank d=200):**
+  Chr1 outer (~620 chunks at c=200) does **~2.6 s of serial
+  scatter** wall pre-H. Post-H with 4 inner Workers in perfect
+  parallel = **~0.65 s** (saved ~2 s on the long-tail outer).
+  Total scatter work across all 8,324 chunks = 34.6 s; with
+  8 outer × 4 inner = 32 thread-slots ideal = 1.1 s if perfect
+  load balance, realistically dominated by chr1's ~2 s tail.
+
+- **Implication:** the residual browser-vs-CLI gap on biobank
+  (~70 s vs 24.9 s pre-H) is **not** scatter-dominated.
+  Workstream H is a real but small win (≈2-5 s of wall on the
+  long-tail outer); the remaining ~40+ s gap must be elsewhere
+  — most likely FileReaderSync I/O for the 20.81 GB BED (~5-10×
+  slower than native mmap), with potential contributions from
+  BIM parsing and main↔worker postMessage roundtrips.
+
+- **Browser smoke** still pending (needs foregrounded tab).
+  Wasmtime data suggests expected biobank d=200 post-H wall is
+  ≈ 65-67 s, not the 35 s success bar the plan called for. Next
+  attack vector should be the I/O path, not further scatter
+  parallelism.
 
 ## 2026-05-16 (Speed-optimize button + browser sketch sweep)
 
