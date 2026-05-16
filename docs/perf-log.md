@@ -4,6 +4,51 @@ This log captures **post-change** performance measurements and parity checks.
 Each entry should list the dataset, command, and key timings so we can track
 how changes affect runtime.
 
+## 2026-05-16 (Speed-optimize button + browser sketch sweep)
+
+- Change: added `⚡ Speed-optimize for your data` button to the
+  sketch slider in `ldsc-web/src/components/l2_panel.rs`. Reads
+  N from the uploaded FAM (line count), picks
+  `d = max(200, N/20)` snapped to the slider's step=100, and
+  sets the sketch_d signal.
+
+  Rationale: CountSketch wall ≈ `T_scatter(N) + T_GEMM × d`.
+  Below the crossover `d* ≈ N/20`, the GEMM term is dominated by
+  the scatter floor and shrinking d further saves no wall-time
+  (just hurts accuracy). At N=2,490 → d=200; at N=50,000 → d=2500.
+
+- Browser smoke (Apple M5 Pro laptop, fresh tab, Chrome):
+
+  Full 1000G EUR (N=2,490, 1.66M SNPs):
+
+  | Mode | d | Wall | Mean L2 |
+  |---|---|---|---|
+  | Default (exact + masking) | — | 66.31s | 24.825 |
+  | Sketch (UI default) | 1600 | 38.73s | 24.509 |
+  | **Sketch (speed-optimize)** | **200** | **9.11s** | **22.576** |
+
+  vs Python LDSC baseline 1548.5s, sketch d=200 is **170×** faster
+  in the browser. Per-worker breakdown at d=200: sketch=3.1s
+  bb_dot=1.6s ab_dot=3.7s (all 4 workers within 1s of each other).
+
+  Biobank-scale (N=50,000, 1.66M SNPs, 20.81 GB BED):
+
+  | Mode | d | Wall | Mean L2 |
+  |---|---|---|---|
+  | **Sketch (speed-optimize)** | **2500** | **101.53s** | **23.793** |
+
+  Fetched into a single JS Blob in 8.6s (localhost, ~2.4 GB/s
+  effective). Each compute Worker's `BlobBedSource` streams via
+  FileReaderSync — neither the BED nor the BIM are ever fully
+  materialised in wasm linear memory. Per-worker breakdown:
+  sketch=58-61s (dominant — BED decode + scatter at biobank N
+  is the true cost now), bb_dot=8.5s, ab_dot=22-24s. The GEMM
+  is no longer the bottleneck — the BED scan is.
+
+  vs Python LDSC biobank baseline 6541s, this is **64×** faster
+  in the browser, on a consumer laptop, against Python on a
+  32-vCPU server.
+
 ## 2026-05-16 (FIX: inner-worker TLS allocation)
 
 - Bug: full 1000G EUR no-mask consistently traps with

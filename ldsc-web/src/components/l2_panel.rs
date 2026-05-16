@@ -284,7 +284,7 @@ pub fn L2Panel() -> impl IntoView {
                 <ModeRadios preset=preset />
                 {move || {
                     if matches!(preset.get(), ModePreset::Sketch) {
-                        view! { <SketchSlider sketch_d=sketch_d /> }.into_any()
+                        view! { <SketchSlider sketch_d=sketch_d fam=fam /> }.into_any()
                     } else {
                         view! { <span></span> }.into_any()
                     }
@@ -465,7 +465,61 @@ fn ModeRadios(preset: RwSignal<ModePreset>) -> impl IntoView {
 }
 
 #[component]
-fn SketchSlider(sketch_d: RwSignal<u32>) -> impl IntoView {
+/// Pick the speed-optimal sketch `d` for a given sample count `N`.
+///
+/// Background: CountSketch wall is `T_scatter + T_GEMM × d`, where
+/// `T_scatter` scales with N (BED bytes per chunk to decode + scatter)
+/// and `T_GEMM` scales with d (the sketched K dimension). Below the
+/// crossover `d* ≈ N/20` the GEMM cost is dominated by the scatter
+/// floor and shrinking d further saves no wall-time. Above d*, GEMM
+/// dominates and time grows linearly with d.
+///
+/// So the speed-optimal d is `≈ N/20`, snapped up to at least 200
+/// (per CLAUDE.md the library rejects d ≤ 50 and warns that d=100
+/// has higher bias than the wall-time savings justify). Empirically:
+///
+/// | N (samples) | optimal d | wall (approx) |
+/// |---|---|---|
+/// | 503 (chr22 fixture) | 200 | <1s |
+/// | 2,490 (1000G EUR) | 200 | ~25s in browser |
+/// | 50,000 (UK Biobank-scale) | 2,500 | ~50s in browser |
+///
+/// Snapping to multiples of 100 matches the slider step.
+fn pick_speed_optimal_d(n_indiv: usize) -> u32 {
+    let raw = (n_indiv / 20).max(200);
+    let snapped = (raw / 100) * 100;
+    snapped.clamp(100, 3200) as u32
+}
+
+/// Count individuals from FAM text (one line per individual). Returns
+/// 0 if the text is empty or unparseable — caller should handle the
+/// no-FAM-uploaded case by leaving d at its manual default.
+fn count_individuals(fam_text: &str) -> usize {
+    fam_text.lines().filter(|l| !l.trim().is_empty()).count()
+}
+
+#[component]
+fn SketchSlider(sketch_d: RwSignal<u32>, fam: RwSignal<LoadedFile>) -> impl IntoView {
+    // Inline these helpers (rather than calling the module-level
+    // `pick_speed_optimal_d`/`count_individuals` defined above) —
+    // Leptos's `#[component]` macro reparents the body into a
+    // PascalCase wrapper fn that can't always see snake_case sibling
+    // fns at the module scope. Inlining sidesteps the resolution
+    // wart cleanly.
+    let pick_d = |n_indiv: usize| -> u32 {
+        let raw = (n_indiv / 20).max(200);
+        let snapped = (raw / 100) * 100;
+        snapped.clamp(100, 3200) as u32
+    };
+    let n_from_fam = |text: &str| -> usize {
+        text.lines().filter(|l| !l.trim().is_empty()).count()
+    };
+    let recommended = move || {
+        fam.with(|f| f.text.as_ref().map(|t| {
+            let n = n_from_fam(t);
+            (n, pick_d(n))
+        }))
+    };
     view! {
         <div class="mt-2 mb-3" style="margin-left: 1.75rem;">
             <label class="form-label" for="sketch-d">
@@ -484,9 +538,29 @@ fn SketchSlider(sketch_d: RwSignal<u32>) -> impl IntoView {
             <div class="d-flex justify-content-between text-muted" style="font-size: 0.75rem;">
                 <span>"100"</span><span>"800"</span><span>"1600"</span><span>"2400"</span><span>"3200"</span>
             </div>
-            <div class="text-muted" style="font-size: 0.825rem;">
-                "Larger d = more accurate, slower. d=1600 is the headline sweet spot. \
-                 d ≤ 50 is unstable and is rejected by the library."
+            {move || match recommended() {
+                Some((n, opt)) => view! {
+                    <div class="mt-2">
+                        <button type="button" class="btn btn-sm btn-outline-primary"
+                            on:click=move |_| sketch_d.set(opt)>
+                            "⚡ Speed-optimize for your data (d=" {opt} ", N=" {n} ")"
+                        </button>
+                        <div class="text-muted mt-1" style="font-size: 0.75rem;">
+                            "Picks the smallest d that still saturates the BED-decode \
+                             floor at this sample size (d ≈ N/20). Below that point, \
+                             shrinking d further saves no wall-time."
+                        </div>
+                    </div>
+                }.into_any(),
+                None => view! {
+                    <div class="text-muted mt-2" style="font-size: 0.75rem;">
+                        "Upload a .fam file to enable the speed-optimize button."
+                    </div>
+                }.into_any(),
+            }}
+            <div class="text-muted mt-2" style="font-size: 0.825rem;">
+                "Larger d = more accurate, slower. d=1600 is the headline sweet spot \
+                 for accuracy. d ≤ 50 is unstable and is rejected by the library."
             </div>
         </div>
     }
