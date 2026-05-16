@@ -465,52 +465,34 @@ fn ModeRadios(preset: RwSignal<ModePreset>) -> impl IntoView {
 }
 
 #[component]
-/// Pick the speed-optimal sketch `d` for a given sample count `N`.
-///
-/// Background: CountSketch wall is `T_scatter + T_GEMM × d`, where
-/// `T_scatter` scales with N (BED bytes per chunk to decode + scatter)
-/// and `T_GEMM` scales with d (the sketched K dimension). Below the
-/// crossover `d* ≈ N/20` the GEMM cost is dominated by the scatter
-/// floor and shrinking d further saves no wall-time. Above d*, GEMM
-/// dominates and time grows linearly with d.
-///
-/// So the speed-optimal d is `≈ N/20`, snapped up to at least 200
-/// (per CLAUDE.md the library rejects d ≤ 50 and warns that d=100
-/// has higher bias than the wall-time savings justify). Empirically:
-///
-/// | N (samples) | optimal d | wall (approx) |
-/// |---|---|---|
-/// | 503 (chr22 fixture) | 200 | <1s |
-/// | 2,490 (1000G EUR) | 200 | ~25s in browser |
-/// | 50,000 (UK Biobank-scale) | 2,500 | ~50s in browser |
-///
-/// Snapping to multiples of 100 matches the slider step.
-fn pick_speed_optimal_d(n_indiv: usize) -> u32 {
-    let raw = (n_indiv / 20).max(200);
-    let snapped = (raw / 100) * 100;
-    snapped.clamp(100, 3200) as u32
-}
-
-/// Count individuals from FAM text (one line per individual). Returns
-/// 0 if the text is empty or unparseable — caller should handle the
-/// no-FAM-uploaded case by leaving d at its manual default.
-fn count_individuals(fam_text: &str) -> usize {
-    fam_text.lines().filter(|l| !l.trim().is_empty()).count()
-}
-
-#[component]
 fn SketchSlider(sketch_d: RwSignal<u32>, fam: RwSignal<LoadedFile>) -> impl IntoView {
-    // Inline these helpers (rather than calling the module-level
-    // `pick_speed_optimal_d`/`count_individuals` defined above) —
-    // Leptos's `#[component]` macro reparents the body into a
-    // PascalCase wrapper fn that can't always see snake_case sibling
-    // fns at the module scope. Inlining sidesteps the resolution
-    // wart cleanly.
-    let pick_d = |n_indiv: usize| -> u32 {
-        let raw = (n_indiv / 20).max(200);
-        let snapped = (raw / 100) * 100;
-        snapped.clamp(100, 3200) as u32
-    };
+    // Inline these helpers — Leptos's `#[component]` macro reparents
+    // the body in a way that snake_case module-level fns can't always
+    // be resolved from. Inlining sidesteps that wart cleanly.
+    //
+    // **Empirical wall-floor:** the CountSketch fused scatter has
+    // cost roughly `T_scatter(N) + T_GEMM × d`. Across both AWS
+    // EPYC and Apple M5 Pro benchmarks (CLI + WASM), `T_scatter`
+    // dominates up to ~d=500-1000, after which GEMM kicks in and
+    // wall grows linearly with d. Measured on M5 Pro biobank
+    // (N=50,000, 1.66M SNPs):
+    //
+    //   d=50   wall=23.5s   mean L2=20.30  (unstable per warning)
+    //   d=100  wall=24.2s   mean L2=21.78
+    //   d=200  wall=24.9s   mean L2=22.57  ← floor + stable
+    //   d=500  wall=26.3s   mean L2=24.26
+    //   d=1000 wall=32.2s   mean L2=23.70
+    //   d=2500 wall=56.2s   mean L2=23.79  (+31s for negligible gain)
+    //
+    // So **d=200 is the empirical speed-optimal d regardless of N**
+    // (CLAUDE.md's "practical sweet spot"). The library rejects
+    // d ≤ 50 and CLAUDE.md warns d=100 is bias-correction-unstable.
+    // We use d=200 universally — it's the lowest stable d that's
+    // also at the empirical wall-floor on every shape we've tested.
+    // (Going lower buys ~1s and risks numerical instability per
+    // the CLAUDE.md warning; going higher costs linearly with d
+    // beyond the GEMM-vs-scatter crossover near d=500-1000.)
+    let pick_d = |_n_indiv: usize| -> u32 { 200 };
     let n_from_fam = |text: &str| -> usize {
         text.lines().filter(|l| !l.trim().is_empty()).count()
     };
@@ -546,9 +528,10 @@ fn SketchSlider(sketch_d: RwSignal<u32>, fam: RwSignal<LoadedFile>) -> impl Into
                             "⚡ Speed-optimize for your data (d=" {opt} ", N=" {n} ")"
                         </button>
                         <div class="text-muted mt-1" style="font-size: 0.75rem;">
-                            "Picks the smallest d that still saturates the BED-decode \
-                             floor at this sample size (d ≈ N/20). Below that point, \
-                             shrinking d further saves no wall-time."
+                            "Sets d to the empirical wall-floor across all sample sizes. \
+                             Sketch wall = T_scatter(N) + T_GEMM × d; T_scatter dominates \
+                             below the GEMM-vs-scatter crossover (~d=500-1000), so d=200 \
+                             is at the floor on every shape we've benchmarked."
                         </div>
                     </div>
                 }.into_any(),
