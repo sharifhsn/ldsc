@@ -4,6 +4,50 @@ This log captures **post-change** performance measurements and parity checks.
 Each entry should list the dataset, command, and key timings so we can track
 how changes affect runtime.
 
+## 2026-05-16 (Workstream H: scatter parallelism via SAB pool)
+
+- Change: extended the manual SAB-backed worker pool in
+  `src/wasm_simd.rs::pool` to dispatch the CountSketch fused
+  scatter (not just GEMM). New `JOB_KIND=3` (scatter_f32) and
+  `JOB_KIND=4` (scatter_f64), plus dedicated `ScatterArgsF32` /
+  `ScatterArgsF64` cells. Outer-side entry points
+  `parallel_scatter_f32` / `_f64` mirror `parallel_gemm_tn_f32`'s
+  release/acquire pattern on `JOB_GEN`.
+
+- Pre-H, `(0..c).into_par_iter()` in `countsketch_fused_project_*`
+  was a no-op on wasm32 — rayon has no spindle / atomic-wait
+  integration and ran the entire scatter serially on the calling
+  outer Worker. Each outer therefore saturated one core for the
+  full sketch wall, leaving inner Workers idle during the path
+  that skips GEMM (sketch mode bypasses GEMM entirely).
+
+- Per-column body factored into `wasm_simd::scatter::scatter_one_column_f32`
+  / `_f64` (with the LUT builders pulled out of `compute.rs` and
+  colocated). Both the native rayon path AND the wasm pool dispatch
+  go through the same helper so numerics are identical across
+  routes. Native: rayon `(0..c).into_par_iter().for_each(|j| …)`
+  calls `scatter_one_column_f32(...)`. Wasm: outer dispatches to
+  `pool::parallel_scatter_f32(args)` which fans out to inner
+  Workers each running `[j_start, j_end)` slices.
+
+- Refactor sanity: added 3 native tests in `wasm_simd::tests`:
+  `scatter_one_column_f32_matches_ref_all_iids` (vs hand-decoded
+  reference; covers tail-byte logic at n_indiv=503),
+  `scatter_one_column_f64_matches_f32_to_tolerance` (f64 ↔ f32
+  cross-check within f32 precision), and
+  `scatter_one_column_f32_subsample_matches_all_iids_on_full_keep`
+  (subsample path with iid_positions covering every individual
+  reproduces the all_iids fast path bit-for-bit).
+
+- Native gates: all 20 tests pass, clippy clean, fmt clean.
+  Wasm gates: `trunk build --release` produces 1.1 MB bundle
+  (+100 KB vs pre-H, well within the +30 % budget the plan set).
+
+- Browser wall numbers TBD — verification requires a foregrounded
+  Chrome tab (`visibility: hidden` triggers throttling that
+  invalidates the measurement). The CLI target on biobank d=200
+  is 24.9 s; the success bar is ≤ 35 s in-browser, stretch ≤ 28 s.
+
 ## 2026-05-16 (Speed-optimize button + browser sketch sweep)
 
 - Change: added `⚡ Speed-optimize for your data` button to the

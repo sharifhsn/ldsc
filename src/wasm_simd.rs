@@ -129,11 +129,11 @@ pub fn gemm_tn_f32_scalar(dst: MatMut<'_, f32>, lhs: MatRef<'_, f32>, rhs: MatRe
 /// only shape used by `l2/compute.rs::compute_ldscore_global`).
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 pub mod simd128 {
+    #[cfg(target_feature = "relaxed-simd")]
+    use core::arch::wasm32::f32x4_relaxed_madd;
     use core::arch::wasm32::{
         f32x4_add, f32x4_extract_lane, f32x4_mul, f32x4_splat, v128, v128_load,
     };
-    #[cfg(target_feature = "relaxed-simd")]
-    use core::arch::wasm32::f32x4_relaxed_madd;
     use faer::{MatMut, MatRef};
 
     /// In-place TN GEMM for f32 column-major matrices: `dst = lhs^T · rhs`.
@@ -238,15 +238,7 @@ pub mod simd128 {
             // dst region is exclusively owned by us.
             let dispatched = unsafe {
                 crate::wasm_simd::pool::parallel_gemm_tn_f32(
-                    dst_ptr,
-                    dst_col,
-                    m,
-                    n,
-                    a_ptr,
-                    a_col,
-                    k,
-                    b_ptr,
-                    b_col,
+                    dst_ptr, dst_col, m, n, a_ptr, a_col, k, b_ptr, b_col,
                 )
             };
             if dispatched {
@@ -479,17 +471,13 @@ pub mod simd128 {
 
                     // Horizontal-reduce each accumulator. Same
                     // (l0+l1)+(l2+l3) pattern as the reference.
-                    let mut s0 = (f32x4_extract_lane::<0>(acc0)
-                        + f32x4_extract_lane::<1>(acc0))
+                    let mut s0 = (f32x4_extract_lane::<0>(acc0) + f32x4_extract_lane::<1>(acc0))
                         + (f32x4_extract_lane::<2>(acc0) + f32x4_extract_lane::<3>(acc0));
-                    let mut s1 = (f32x4_extract_lane::<0>(acc1)
-                        + f32x4_extract_lane::<1>(acc1))
+                    let mut s1 = (f32x4_extract_lane::<0>(acc1) + f32x4_extract_lane::<1>(acc1))
                         + (f32x4_extract_lane::<2>(acc1) + f32x4_extract_lane::<3>(acc1));
-                    let mut s2 = (f32x4_extract_lane::<0>(acc2)
-                        + f32x4_extract_lane::<1>(acc2))
+                    let mut s2 = (f32x4_extract_lane::<0>(acc2) + f32x4_extract_lane::<1>(acc2))
                         + (f32x4_extract_lane::<2>(acc2) + f32x4_extract_lane::<3>(acc2));
-                    let mut s3 = (f32x4_extract_lane::<0>(acc3)
-                        + f32x4_extract_lane::<1>(acc3))
+                    let mut s3 = (f32x4_extract_lane::<0>(acc3) + f32x4_extract_lane::<1>(acc3))
                         + (f32x4_extract_lane::<2>(acc3) + f32x4_extract_lane::<3>(acc3));
 
                     // Scalar tail (≤3 elements). Left-to-right.
@@ -1536,6 +1524,266 @@ pub mod simd128 {
     }
 }
 
+/// Per-column body for the fused CountSketch scatter-add (BED-decode →
+/// normalize → scatter-add → renorm). Lives alongside the GEMM kernels
+/// so the wasm SAB pool can dispatch it without a circular module
+/// dependency: `compute.rs` (high-level) only needs to depend on
+/// `wasm_simd` (low-level), not the other way round.
+///
+/// Both native (via `rayon::par_iter`) and wasm (via [`pool::parallel_scatter_f32`])
+/// call into the same `scatter_one_column_*` helper for IEEE-754
+/// bit-identical numerics across the two parallel paths.
+pub(crate) mod scatter {
+    use crate::bed::IidPos;
+
+    /// Build a branchless 256-entry byte LUT for fused CountSketch scatter-add.
+    /// For a given (mean, inv_std), each BED byte (4 packed genotypes) maps
+    /// to 4 normalized f32 values. Missing genotypes map to 0.0 (impute
+    /// to mean → center → 0), so the scatter-add is unconditional.
+    #[inline]
+    fn build_norm_byte_lut_f32(mean: f32, inv_std: f32) -> [[f32; 4]; 256] {
+        // 0b00 = hom A1 (geno=2) → (2 - mean) * inv_std
+        // 0b01 = missing         → 0.0
+        // 0b10 = het (geno=1)    → (1 - mean) * inv_std
+        // 0b11 = hom A2 (geno=0) → -mean * inv_std
+        let code_vals: [f32; 4] = [
+            (2.0 - mean) * inv_std,
+            0.0,
+            (1.0 - mean) * inv_std,
+            -mean * inv_std,
+        ];
+        core::array::from_fn(|b| {
+            let byte = b as u8;
+            [
+                code_vals[(byte & 0b11) as usize],
+                code_vals[((byte >> 2) & 0b11) as usize],
+                code_vals[((byte >> 4) & 0b11) as usize],
+                code_vals[((byte >> 6) & 0b11) as usize],
+            ]
+        })
+    }
+
+    /// f64 variant of the branchless byte LUT. See [`build_norm_byte_lut_f32`].
+    #[inline]
+    fn build_norm_byte_lut_f64(mean: f64, inv_std: f64) -> [[f64; 4]; 256] {
+        let code_vals: [f64; 4] = [
+            (2.0 - mean) * inv_std,
+            0.0,
+            (1.0 - mean) * inv_std,
+            -mean * inv_std,
+        ];
+        core::array::from_fn(|b| {
+            let byte = b as u8;
+            [
+                code_vals[(byte & 0b11) as usize],
+                code_vals[((byte >> 2) & 0b11) as usize],
+                code_vals[((byte >> 4) & 0b11) as usize],
+                code_vals[((byte >> 6) & 0b11) as usize],
+            ]
+        })
+    }
+
+    /// Scatter-add one column `j` of the fused CountSketch (f32 variant).
+    ///
+    /// Decodes the BED bytes for SNP `j` (each byte = 4 packed
+    /// genotypes), normalizes each genotype using the supplied
+    /// per-SNP `mean` and `inv_std`, scatter-adds into
+    /// `out[bucket[i], j]` with sign `sign[i]`, then ratio-renorms so
+    /// `||out[:, j]||² == n_norm`.
+    ///
+    /// # Safety
+    ///
+    /// - `raw_bytes` must point to at least `(j + 1) * bytes_per_snp` bytes.
+    /// - `bucket` and `sign` must point to at least `n_indiv` elements each.
+    /// - When `all_iids == false`, `iid_positions` must point to at least
+    ///   `iid_positions_len` elements (the per-kept-individual byte/shift
+    ///   indices), and `n_indiv` must equal `iid_positions_len`.
+    /// - `out_ptr + j * out_col_stride` must be a valid pointer to at least
+    ///   `d` f32 elements, exclusively owned for this call (no other thread
+    ///   may write that column).
+    /// - All pointer arguments must outlive the call. Reads from
+    ///   `raw_bytes`, `bucket`, `sign`, `iid_positions` may be aliased with
+    ///   other concurrent reads (treated as `&[_]` here) but must not be
+    ///   mutated by any other thread during this call.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn scatter_one_column_f32(
+        j: usize,
+        raw_bytes: *const u8,
+        bytes_per_snp: usize,
+        n_indiv: usize,
+        bucket: *const u32,
+        sign: *const f32,
+        iid_positions: *const IidPos,
+        iid_positions_len: usize,
+        all_iids: bool,
+        mean: f32,
+        inv_std: f32,
+        n_norm: f64,
+        out_ptr: *mut f32,
+        out_col_stride: isize,
+        d: usize,
+    ) {
+        // Reconstruct slices from raw pointers (the pool dispatch carries
+        // them as `usize` to keep `JobArgs` POD/Copy/Sync).
+        let snp_bytes =
+            unsafe { core::slice::from_raw_parts(raw_bytes.add(j * bytes_per_snp), bytes_per_snp) };
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(out_ptr.offset(j as isize * out_col_stride), d)
+        };
+        let bucket_slice = unsafe { core::slice::from_raw_parts(bucket, n_indiv) };
+        let sign_slice = unsafe { core::slice::from_raw_parts(sign, n_indiv) };
+
+        // Zero output column. Replace-not-add accumulation, so no need to
+        // touch this from the caller.
+        for v in dst.iter_mut() {
+            *v = 0.0;
+        }
+
+        let norm_lut = build_norm_byte_lut_f32(mean, inv_std);
+
+        if all_iids {
+            // Branchless byte-level decode: each byte → 4 normalized
+            // values; missing genotypes map to 0.0 so scatter-add is
+            // unconditional. SAFETY: bucket[i] is built from
+            // `rng.u32(..d as u32)` so `< d`; verified at CountSketchProj
+            // construction.
+            let n_full_bytes = n_indiv / 4;
+            for byte_idx in 0..n_full_bytes {
+                let vals = unsafe { &norm_lut[*snp_bytes.get_unchecked(byte_idx) as usize] };
+                let base_i = byte_idx * 4;
+                for (k, &val) in vals.iter().enumerate() {
+                    let i = base_i + k;
+                    unsafe {
+                        *dst.get_unchecked_mut(*bucket_slice.get_unchecked(i) as usize) +=
+                            *sign_slice.get_unchecked(i) * val;
+                    }
+                }
+            }
+            // Remainder individuals in the trailing partial byte.
+            let rem_start = n_full_bytes * 4;
+            if rem_start < n_indiv {
+                let vals = unsafe { &norm_lut[*snp_bytes.get_unchecked(n_full_bytes) as usize] };
+                for (k, &val) in vals.iter().enumerate().take(n_indiv - rem_start) {
+                    let i = rem_start + k;
+                    unsafe {
+                        *dst.get_unchecked_mut(*bucket_slice.get_unchecked(i) as usize) +=
+                            *sign_slice.get_unchecked(i) * val;
+                    }
+                }
+            }
+        } else {
+            // Subsample path: each kept individual's byte/shift is
+            // precomputed in iid_positions. `shift / 2` maps byte shift
+            // (0, 2, 4, 6) to LUT index (0, 1, 2, 3).
+            let iid_pos = unsafe { core::slice::from_raw_parts(iid_positions, iid_positions_len) };
+            for (i, pos) in iid_pos.iter().enumerate() {
+                let vals = unsafe { &norm_lut[*snp_bytes.get_unchecked(pos.byte_idx) as usize] };
+                let val = vals[(pos.shift / 2) as usize];
+                unsafe {
+                    *dst.get_unchecked_mut(*bucket_slice.get_unchecked(i) as usize) +=
+                        *sign_slice.get_unchecked(i) * val;
+                }
+            }
+        }
+
+        // Ratio-estimator renorm: rescale so ||col||² = n_norm. Accumulate
+        // squared sum in f64 to keep the renorm bit-identical regardless
+        // of the order of partial sums.
+        let mut nrm_sq = 0.0f64;
+        for &v in dst.iter() {
+            nrm_sq += (v as f64) * (v as f64);
+        }
+        if nrm_sq > 0.0 {
+            let scale = (n_norm / nrm_sq).sqrt() as f32;
+            for v in dst.iter_mut() {
+                *v *= scale;
+            }
+        }
+    }
+
+    /// f64 variant of [`scatter_one_column_f32`]. Same algorithm,
+    /// different element width on `sign`, `mean`/`inv_std`, and `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn scatter_one_column_f64(
+        j: usize,
+        raw_bytes: *const u8,
+        bytes_per_snp: usize,
+        n_indiv: usize,
+        bucket: *const u32,
+        sign: *const f64,
+        iid_positions: *const IidPos,
+        iid_positions_len: usize,
+        all_iids: bool,
+        mean: f64,
+        inv_std: f64,
+        n_norm: f64,
+        out_ptr: *mut f64,
+        out_col_stride: isize,
+        d: usize,
+    ) {
+        let snp_bytes =
+            unsafe { core::slice::from_raw_parts(raw_bytes.add(j * bytes_per_snp), bytes_per_snp) };
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(out_ptr.offset(j as isize * out_col_stride), d)
+        };
+        let bucket_slice = unsafe { core::slice::from_raw_parts(bucket, n_indiv) };
+        let sign_slice = unsafe { core::slice::from_raw_parts(sign, n_indiv) };
+
+        for v in dst.iter_mut() {
+            *v = 0.0;
+        }
+
+        let norm_lut = build_norm_byte_lut_f64(mean, inv_std);
+
+        if all_iids {
+            let n_full_bytes = n_indiv / 4;
+            for byte_idx in 0..n_full_bytes {
+                let vals = unsafe { &norm_lut[*snp_bytes.get_unchecked(byte_idx) as usize] };
+                let base_i = byte_idx * 4;
+                for (k, &val) in vals.iter().enumerate() {
+                    let i = base_i + k;
+                    unsafe {
+                        *dst.get_unchecked_mut(*bucket_slice.get_unchecked(i) as usize) +=
+                            *sign_slice.get_unchecked(i) * val;
+                    }
+                }
+            }
+            let rem_start = n_full_bytes * 4;
+            if rem_start < n_indiv {
+                let vals = unsafe { &norm_lut[*snp_bytes.get_unchecked(n_full_bytes) as usize] };
+                for (k, &val) in vals.iter().enumerate().take(n_indiv - rem_start) {
+                    let i = rem_start + k;
+                    unsafe {
+                        *dst.get_unchecked_mut(*bucket_slice.get_unchecked(i) as usize) +=
+                            *sign_slice.get_unchecked(i) * val;
+                    }
+                }
+            }
+        } else {
+            let iid_pos = unsafe { core::slice::from_raw_parts(iid_positions, iid_positions_len) };
+            for (i, pos) in iid_pos.iter().enumerate() {
+                let vals = unsafe { &norm_lut[*snp_bytes.get_unchecked(pos.byte_idx) as usize] };
+                let val = vals[(pos.shift / 2) as usize];
+                unsafe {
+                    *dst.get_unchecked_mut(*bucket_slice.get_unchecked(i) as usize) +=
+                        *sign_slice.get_unchecked(i) * val;
+                }
+            }
+        }
+
+        let mut nrm_sq = 0.0f64;
+        for &v in dst.iter() {
+            nrm_sq += v * v;
+        }
+        if nrm_sq > 0.0 {
+            let scale = (n_norm / nrm_sq).sqrt();
+            for v in dst.iter_mut() {
+                *v *= scale;
+            }
+        }
+    }
+}
+
 /// Manual SAB-backed worker pool for parallel f32 GEMM on
 /// `wasm32 + atomics + simd128`.
 ///
@@ -1605,12 +1853,21 @@ pub mod pool {
     /// waits for it to reach `POOL_SIZE - 1`.
     pub static JOB_DONE: AtomicI32 = AtomicI32::new(0);
 
-    /// Job discriminator. `1` = exit (worker_loop returns), `2` = gemm.
+    /// Job discriminator. `1` = exit (worker_loop returns), `2` = gemm,
+    /// `3` = scatter_f32 (CountSketch fused scatter, f32 variant),
+    /// `4` = scatter_f64 (same, f64 variant). Set by the outer Worker
+    /// BEFORE incrementing `JOB_GEN`; read by inner workers AFTER they
+    /// observe the new generation. Each kind has its own dedicated args
+    /// cell (`JOB_ARGS`, `SCATTER_ARGS_F32`, `SCATTER_ARGS_F64`); only
+    /// the active kind's cell is touched per dispatch.
     pub static JOB_KIND: AtomicI32 = AtomicI32::new(0);
 
     /// Wrapper around `UnsafeCell<JobArgs>` to manually mark Sync. Sound
     /// because all access is ordered through `JOB_GEN`'s
-    /// release/acquire fences.
+    /// release/acquire fences. The same invariant applies to
+    /// [`ScatterArgsCellF32`] / [`ScatterArgsCellF64`] below: between
+    /// `JOB_GEN` bumps only the outer Worker writes; inner Workers read
+    /// the cell selected by [`JOB_KIND`] after the Acquire fence.
     pub struct JobArgsCell(UnsafeCell<JobArgs>);
     // SAFETY: see module docs.
     unsafe impl Sync for JobArgsCell {}
@@ -1647,6 +1904,108 @@ pub mod pool {
     }
 
     pub static JOB_ARGS: JobArgsCell = JobArgsCell(UnsafeCell::new(JobArgs::ZERO));
+
+    /// Args for a CountSketch scatter dispatch (f32 variant).
+    ///
+    /// All pointers are passed as `usize` to keep the struct POD/Copy/Sync.
+    /// They are cast back at the per-worker entry point
+    /// ([`run_scatter_slice_f32`]). The contract on each pointer (length,
+    /// aliasing, mutability) is documented in
+    /// [`super::scatter::scatter_one_column_f32`].
+    #[derive(Clone, Copy)]
+    pub struct ScatterArgsF32 {
+        pub raw_bytes_ptr: usize, // *const u8, len >= c * bytes_per_snp
+        pub bytes_per_snp: usize,
+        pub n_indiv: usize,
+        pub c: usize,           // number of SNPs (output columns)
+        pub bucket_ptr: usize,  // *const u32, len n_indiv
+        pub sign_ptr: usize,    // *const f32, len n_indiv
+        pub iid_pos_ptr: usize, // *const IidPos, len iid_pos_len
+        pub iid_pos_len: usize,
+        pub all_iids: u32,  // bool as u32 (1 = all individuals kept)
+        pub n_norm: f64,    // renorm target: ||out[:, j]||^2 = n_norm
+        pub out_ptr: usize, // *mut f32
+        pub out_col_stride: isize,
+        pub d: usize,           // sketch dimension (output rows)
+        pub mean_ptr: usize,    // *const f32, len c
+        pub inv_std_ptr: usize, // *const f32, len c
+    }
+
+    impl ScatterArgsF32 {
+        const ZERO: Self = Self {
+            raw_bytes_ptr: 0,
+            bytes_per_snp: 0,
+            n_indiv: 0,
+            c: 0,
+            bucket_ptr: 0,
+            sign_ptr: 0,
+            iid_pos_ptr: 0,
+            iid_pos_len: 0,
+            all_iids: 0,
+            n_norm: 0.0,
+            out_ptr: 0,
+            out_col_stride: 0,
+            d: 0,
+            mean_ptr: 0,
+            inv_std_ptr: 0,
+        };
+    }
+
+    pub struct ScatterArgsCellF32(UnsafeCell<ScatterArgsF32>);
+    // SAFETY: see `JobArgsCell` doc-comment — same release/acquire
+    // sequencing on `JOB_GEN`.
+    unsafe impl Sync for ScatterArgsCellF32 {}
+
+    pub static SCATTER_ARGS_F32: ScatterArgsCellF32 =
+        ScatterArgsCellF32(UnsafeCell::new(ScatterArgsF32::ZERO));
+
+    /// f64 sibling of [`ScatterArgsF32`]. Used by the f64 fused-CountSketch
+    /// dispatch path (rare on wasm — only when the user opts out of
+    /// `--fast-f32`).
+    #[derive(Clone, Copy)]
+    pub struct ScatterArgsF64 {
+        pub raw_bytes_ptr: usize,
+        pub bytes_per_snp: usize,
+        pub n_indiv: usize,
+        pub c: usize,
+        pub bucket_ptr: usize, // *const u32
+        pub sign_ptr: usize,   // *const f64
+        pub iid_pos_ptr: usize,
+        pub iid_pos_len: usize,
+        pub all_iids: u32,
+        pub n_norm: f64,
+        pub out_ptr: usize, // *mut f64
+        pub out_col_stride: isize,
+        pub d: usize,
+        pub mean_ptr: usize,    // *const f64
+        pub inv_std_ptr: usize, // *const f64
+    }
+
+    impl ScatterArgsF64 {
+        const ZERO: Self = Self {
+            raw_bytes_ptr: 0,
+            bytes_per_snp: 0,
+            n_indiv: 0,
+            c: 0,
+            bucket_ptr: 0,
+            sign_ptr: 0,
+            iid_pos_ptr: 0,
+            iid_pos_len: 0,
+            all_iids: 0,
+            n_norm: 0.0,
+            out_ptr: 0,
+            out_col_stride: 0,
+            d: 0,
+            mean_ptr: 0,
+            inv_std_ptr: 0,
+        };
+    }
+
+    pub struct ScatterArgsCellF64(UnsafeCell<ScatterArgsF64>);
+    unsafe impl Sync for ScatterArgsCellF64 {}
+
+    pub static SCATTER_ARGS_F64: ScatterArgsCellF64 =
+        ScatterArgsCellF64(UnsafeCell::new(ScatterArgsF64::ZERO));
 
     /// Initialise the pool size. Call once per outer Worker, after the
     /// JS side has spawned the N inner Workers and they have called
@@ -1695,6 +2054,17 @@ pub mod pool {
                     // above with Acquire, so the args are visible.
                     let args = unsafe { *JOB_ARGS.0.get() };
                     run_gemm_slice(worker_id, n_workers, &args);
+                }
+                3 => {
+                    // SAFETY: same release/acquire on JOB_GEN — outer
+                    // wrote SCATTER_ARGS_F32 before bumping JOB_GEN; the
+                    // Acquire load above gives the happens-before edge.
+                    let args = unsafe { *SCATTER_ARGS_F32.0.get() };
+                    run_scatter_slice_f32(worker_id, n_workers, &args);
+                }
+                4 => {
+                    let args = unsafe { *SCATTER_ARGS_F64.0.get() };
+                    run_scatter_slice_f64(worker_id, n_workers, &args);
                 }
                 _ => {}
             }
@@ -1832,6 +2202,182 @@ pub mod pool {
             );
         }
     }
+
+    /// Outer-side dispatch for the fused CountSketch scatter (f32 variant).
+    /// Returns `true` if the work was farmed out to the pool; `false`
+    /// (caller falls back to serial / native-rayon) when the pool isn't
+    /// initialised or N <= 1.
+    ///
+    /// # Safety
+    ///
+    /// All pointers inside `args` must remain valid for the duration of
+    /// this call. The `out` region (covering `c * out_col_stride` f32
+    /// elements at `out_ptr`) must be exclusively owned (no aliasing
+    /// reads/writes by other code while the pool is computing). All
+    /// read-only inputs (`raw_bytes`, `bucket`, `sign`, `iid_positions`,
+    /// `mean`, `inv_std`) must outlive this call and must not be mutated
+    /// by any other thread during it. See
+    /// [`super::scatter::scatter_one_column_f32`] for per-pointer length
+    /// requirements.
+    pub unsafe fn parallel_scatter_f32(args: ScatterArgsF32) -> bool {
+        let n = POOL_SIZE.load(Ordering::Acquire);
+        if n <= 1 {
+            return false;
+        }
+
+        // SAFETY: between dispatches, only the outer Worker writes
+        // SCATTER_ARGS_F32. The Release ordering on the JOB_GEN
+        // increment below makes inner workers' Acquire-loads see this
+        // write.
+        unsafe {
+            *SCATTER_ARGS_F32.0.get() = args;
+        }
+
+        JOB_KIND.store(3, Ordering::Release);
+        JOB_DONE.store(0, Ordering::Release);
+
+        // Wake all inner workers. fetch_add returns the OLD value;
+        // memory_atomic_notify wakes up to N waiters.
+        JOB_GEN.fetch_add(1, Ordering::Release);
+        // SAFETY: see worker_loop's notify SAFETY comment.
+        unsafe {
+            let _ = memory_atomic_notify(JOB_GEN.as_ptr().cast(), n as u32);
+        }
+
+        // Outer Worker runs its share (worker_id = 0).
+        run_scatter_slice_f32(0, n, &args);
+
+        // Wait for the n-1 inner workers to finish.
+        let target = (n - 1) as i32;
+        loop {
+            let done = JOB_DONE.load(Ordering::Acquire);
+            if done >= target {
+                break;
+            }
+            unsafe {
+                let _ = memory_atomic_wait32(JOB_DONE.as_ptr().cast(), done, -1);
+            }
+        }
+
+        true
+    }
+
+    /// f64 sibling of [`parallel_scatter_f32`]. Same dispatch shape;
+    /// only the args cell, `JOB_KIND` (4 instead of 3) and per-worker
+    /// slice fn change.
+    pub unsafe fn parallel_scatter_f64(args: ScatterArgsF64) -> bool {
+        let n = POOL_SIZE.load(Ordering::Acquire);
+        if n <= 1 {
+            return false;
+        }
+        unsafe {
+            *SCATTER_ARGS_F64.0.get() = args;
+        }
+        JOB_KIND.store(4, Ordering::Release);
+        JOB_DONE.store(0, Ordering::Release);
+        JOB_GEN.fetch_add(1, Ordering::Release);
+        unsafe {
+            let _ = memory_atomic_notify(JOB_GEN.as_ptr().cast(), n as u32);
+        }
+        run_scatter_slice_f64(0, n, &args);
+        let target = (n - 1) as i32;
+        loop {
+            let done = JOB_DONE.load(Ordering::Acquire);
+            if done >= target {
+                break;
+            }
+            unsafe {
+                let _ = memory_atomic_wait32(JOB_DONE.as_ptr().cast(), done, -1);
+            }
+        }
+        true
+    }
+
+    /// Per-worker slice for the f32 scatter dispatch. Computes the
+    /// `[j_start, j_end)` slice of output columns by repeatedly invoking
+    /// [`super::scatter::scatter_one_column_f32`].
+    fn run_scatter_slice_f32(worker_id: usize, n_workers: usize, args: &ScatterArgsF32) {
+        let total = args.c;
+        let chunk = total.div_ceil(n_workers);
+        let j_start = (worker_id * chunk).min(total);
+        let j_end = ((worker_id + 1) * chunk).min(total);
+        if j_start >= j_end {
+            return;
+        }
+        let raw_bytes = args.raw_bytes_ptr as *const u8;
+        let bucket = args.bucket_ptr as *const u32;
+        let sign = args.sign_ptr as *const f32;
+        let iid_pos = args.iid_pos_ptr as *const crate::bed::IidPos;
+        let mean_arr = args.mean_ptr as *const f32;
+        let inv_std_arr = args.inv_std_ptr as *const f32;
+        let out_ptr = args.out_ptr as *mut f32;
+        let all_iids = args.all_iids != 0;
+        // SAFETY: args was provided by the outer Worker, which upholds
+        // the per-pointer preconditions of `scatter_one_column_f32`.
+        // Workers operate on disjoint `[j_start, j_end)` slices so the
+        // `out` column writes don't overlap.
+        for j in j_start..j_end {
+            unsafe {
+                super::scatter::scatter_one_column_f32(
+                    j,
+                    raw_bytes,
+                    args.bytes_per_snp,
+                    args.n_indiv,
+                    bucket,
+                    sign,
+                    iid_pos,
+                    args.iid_pos_len,
+                    all_iids,
+                    *mean_arr.add(j),
+                    *inv_std_arr.add(j),
+                    args.n_norm,
+                    out_ptr,
+                    args.out_col_stride,
+                    args.d,
+                );
+            }
+        }
+    }
+
+    /// f64 sibling of [`run_scatter_slice_f32`].
+    fn run_scatter_slice_f64(worker_id: usize, n_workers: usize, args: &ScatterArgsF64) {
+        let total = args.c;
+        let chunk = total.div_ceil(n_workers);
+        let j_start = (worker_id * chunk).min(total);
+        let j_end = ((worker_id + 1) * chunk).min(total);
+        if j_start >= j_end {
+            return;
+        }
+        let raw_bytes = args.raw_bytes_ptr as *const u8;
+        let bucket = args.bucket_ptr as *const u32;
+        let sign = args.sign_ptr as *const f64;
+        let iid_pos = args.iid_pos_ptr as *const crate::bed::IidPos;
+        let mean_arr = args.mean_ptr as *const f64;
+        let inv_std_arr = args.inv_std_ptr as *const f64;
+        let out_ptr = args.out_ptr as *mut f64;
+        let all_iids = args.all_iids != 0;
+        for j in j_start..j_end {
+            unsafe {
+                super::scatter::scatter_one_column_f64(
+                    j,
+                    raw_bytes,
+                    args.bytes_per_snp,
+                    args.n_indiv,
+                    bucket,
+                    sign,
+                    iid_pos,
+                    args.iid_pos_len,
+                    all_iids,
+                    *mean_arr.add(j),
+                    *inv_std_arr.add(j),
+                    args.n_norm,
+                    out_ptr,
+                    args.out_col_stride,
+                    args.d,
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1944,6 +2490,376 @@ mod tests {
         for j in 0..n {
             for i in 0..m {
                 assert_eq!(got[(i, j)], 0.0);
+            }
+        }
+    }
+
+    // ── scatter::scatter_one_column_f32/_f64 parity tests ──────────
+    //
+    // Regression tests for the W. H scatter refactor: ensure the
+    // factored per-column body matches a hand-written reference
+    // implementation (decode → normalize → scatter-add → renorm)
+    // bit-for-bit. The hand reference uses the same operation order
+    // as the LUT version, so f32 round-trips collapse identically.
+
+    use crate::bed::IidPos;
+    use crate::wasm_simd::scatter::{scatter_one_column_f32, scatter_one_column_f64};
+
+    /// Deterministic small PLINK BED fixture: `c` SNPs × `n_indiv`
+    /// individuals, biased toward non-missing values so per-SNP
+    /// stats are well-defined.
+    fn make_bed_fixture(seed: u64, c: usize, n_indiv: usize) -> Vec<u8> {
+        let bytes_per_snp = n_indiv.div_ceil(4);
+        let mut state = seed;
+        let mut raw = vec![0u8; c * bytes_per_snp];
+        for j in 0..c {
+            for b in 0..bytes_per_snp {
+                // Generate 4 codes; bias 0b01 (missing) to ~6 % so
+                // most SNPs have a sensible mean.
+                let mut byte = 0u8;
+                for slot in 0..4 {
+                    state = state.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+                    let r = (state >> 32) as u32;
+                    // 6 % missing, 31 % each of the three real codes.
+                    let code: u8 = match r % 100 {
+                        0..=5 => 0b01,
+                        6..=37 => 0b00,
+                        38..=69 => 0b10,
+                        _ => 0b11,
+                    };
+                    byte |= code << (2 * slot);
+                }
+                raw[j * bytes_per_snp + b] = byte;
+            }
+        }
+        raw
+    }
+
+    /// Decode a single individual's genotype out of `raw_bytes` for
+    /// SNP `j` (BED layout: 2 bits per individual, low-bit-first
+    /// inside each byte). Returns `None` for missing (0b01).
+    fn decode(raw_bytes: &[u8], bytes_per_snp: usize, j: usize, i: usize) -> Option<f64> {
+        let byte = raw_bytes[j * bytes_per_snp + i / 4];
+        let code = (byte >> ((i % 4) * 2)) & 0b11;
+        match code {
+            0b00 => Some(2.0),
+            0b01 => None,
+            0b10 => Some(1.0),
+            _ => Some(0.0), // 0b11
+        }
+    }
+
+    /// Reference implementation: same algorithm as
+    /// `scatter_one_column_f32` but written without the LUT (decode
+    /// directly + manual scatter-add). Operations are sequenced so the
+    /// LUT and non-LUT paths collapse to the same f32 round-trips.
+    fn scatter_one_column_f32_ref(
+        j: usize,
+        raw_bytes: &[u8],
+        bytes_per_snp: usize,
+        n_indiv: usize,
+        bucket: &[u32],
+        sign: &[f32],
+        mean: f32,
+        inv_std: f32,
+        n_norm: f64,
+        d: usize,
+    ) -> Vec<f32> {
+        let mut col = vec![0f32; d];
+        for i in 0..n_indiv {
+            let g = decode(raw_bytes, bytes_per_snp, j, i).unwrap_or(mean as f64);
+            // Match the LUT: compute (g - mean) * inv_std in f32, but
+            // missing maps to 0.0 directly (no centering needed since
+            // mean - mean = 0).
+            let val = match decode(raw_bytes, bytes_per_snp, j, i) {
+                None => 0.0f32,
+                Some(_) => (g as f32 - mean) * inv_std,
+            };
+            col[bucket[i] as usize] += sign[i] * val;
+        }
+        let mut nrm_sq = 0.0f64;
+        for &v in &col {
+            nrm_sq += (v as f64) * (v as f64);
+        }
+        if nrm_sq > 0.0 {
+            let scale = (n_norm / nrm_sq).sqrt() as f32;
+            for v in &mut col {
+                *v *= scale;
+            }
+        }
+        col
+    }
+
+    fn build_cs_bucket_sign(n_indiv: usize, d: usize, seed: u64) -> (Vec<u32>, Vec<f32>, Vec<f64>) {
+        let mut state = seed;
+        let bucket: Vec<u32> = (0..n_indiv)
+            .map(|_| {
+                state = state.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+                ((state >> 32) as u32) % d as u32
+            })
+            .collect();
+        let sign_f32: Vec<f32> = (0..n_indiv)
+            .map(|_| {
+                state = state.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+                if (state >> 63) & 1 == 0 { 1.0 } else { -1.0 }
+            })
+            .collect();
+        let sign_f64: Vec<f64> = sign_f32.iter().map(|&s| s as f64).collect();
+        (bucket, sign_f32, sign_f64)
+    }
+
+    #[test]
+    fn scatter_one_column_f32_matches_ref_all_iids() {
+        let c = 8;
+        let n_indiv = 503; // 1000G EUR sample size, exercises non-multiple-of-4 tail.
+        let d = 50;
+        let raw = make_bed_fixture(42, c, n_indiv);
+        let bytes_per_snp = n_indiv.div_ceil(4);
+        let (bucket, sign_f32, _) = build_cs_bucket_sign(n_indiv, d, 7);
+        let n_norm = n_indiv as f64;
+
+        // Compute per-SNP mean / inv_std the same way Pass 1 does.
+        let mut mean_buf = vec![0f32; c];
+        let mut inv_std_buf = vec![0f32; c];
+        for j in 0..c {
+            let mut sum = 0.0f64;
+            let mut sum_sq = 0.0f64;
+            let mut count = 0u64;
+            for i in 0..n_indiv {
+                if let Some(g) = decode(&raw, bytes_per_snp, j, i) {
+                    sum += g;
+                    sum_sq += g * g;
+                    count += 1;
+                }
+            }
+            let mean = if count > 0 { sum / count as f64 } else { 0.0 };
+            let centered = sum_sq - count as f64 * mean * mean;
+            let var = centered / n_indiv as f64;
+            mean_buf[j] = mean as f32;
+            inv_std_buf[j] = if var > 0.0 { (1.0 / var.sqrt()) as f32 } else { 0.0 };
+        }
+
+        // d × c output column-major Vec.
+        let mut out = vec![0f32; d * c];
+        for j in 0..c {
+            unsafe {
+                scatter_one_column_f32(
+                    j,
+                    raw.as_ptr(),
+                    bytes_per_snp,
+                    n_indiv,
+                    bucket.as_ptr(),
+                    sign_f32.as_ptr(),
+                    core::ptr::null::<IidPos>(),
+                    0,
+                    true, // all_iids
+                    mean_buf[j],
+                    inv_std_buf[j],
+                    n_norm,
+                    out.as_mut_ptr(),
+                    d as isize,
+                    d,
+                );
+            }
+            let expect = scatter_one_column_f32_ref(
+                j,
+                &raw,
+                bytes_per_snp,
+                n_indiv,
+                &bucket,
+                &sign_f32,
+                mean_buf[j],
+                inv_std_buf[j],
+                n_norm,
+                d,
+            );
+            for i in 0..d {
+                let got = out[j * d + i];
+                let exp = expect[i];
+                let diff = (got - exp).abs();
+                let denom = exp.abs().max(1e-6);
+                assert!(
+                    diff < 1e-4 || diff / denom < 1e-4,
+                    "f32 mismatch at (i={i},j={j}): got {got} expected {exp} diff {diff}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scatter_one_column_f64_matches_f32_to_tolerance() {
+        // f64 path should match the f32 reference within f32 precision.
+        let c = 4;
+        let n_indiv = 200;
+        let d = 32;
+        let raw = make_bed_fixture(13, c, n_indiv);
+        let bytes_per_snp = n_indiv.div_ceil(4);
+        let (bucket, sign_f32, sign_f64) = build_cs_bucket_sign(n_indiv, d, 11);
+        let n_norm = n_indiv as f64;
+
+        let mut mean_f32 = vec![0f32; c];
+        let mut inv_std_f32 = vec![0f32; c];
+        let mut mean_f64 = vec![0f64; c];
+        let mut inv_std_f64 = vec![0f64; c];
+        for j in 0..c {
+            let mut sum = 0.0f64;
+            let mut sum_sq = 0.0f64;
+            let mut count = 0u64;
+            for i in 0..n_indiv {
+                if let Some(g) = decode(&raw, bytes_per_snp, j, i) {
+                    sum += g;
+                    sum_sq += g * g;
+                    count += 1;
+                }
+            }
+            let mean = if count > 0 { sum / count as f64 } else { 0.0 };
+            let centered = sum_sq - count as f64 * mean * mean;
+            let var = centered / n_indiv as f64;
+            mean_f64[j] = mean;
+            mean_f32[j] = mean as f32;
+            inv_std_f64[j] = if var > 0.0 { 1.0 / var.sqrt() } else { 0.0 };
+            inv_std_f32[j] = inv_std_f64[j] as f32;
+        }
+
+        let mut out_f64 = vec![0f64; d * c];
+        let mut out_f32 = vec![0f32; d * c];
+        for j in 0..c {
+            unsafe {
+                scatter_one_column_f64(
+                    j,
+                    raw.as_ptr(),
+                    bytes_per_snp,
+                    n_indiv,
+                    bucket.as_ptr(),
+                    sign_f64.as_ptr(),
+                    core::ptr::null::<IidPos>(),
+                    0,
+                    true,
+                    mean_f64[j],
+                    inv_std_f64[j],
+                    n_norm,
+                    out_f64.as_mut_ptr(),
+                    d as isize,
+                    d,
+                );
+                scatter_one_column_f32(
+                    j,
+                    raw.as_ptr(),
+                    bytes_per_snp,
+                    n_indiv,
+                    bucket.as_ptr(),
+                    sign_f32.as_ptr(),
+                    core::ptr::null::<IidPos>(),
+                    0,
+                    true,
+                    mean_f32[j],
+                    inv_std_f32[j],
+                    n_norm,
+                    out_f32.as_mut_ptr(),
+                    d as isize,
+                    d,
+                );
+            }
+            for i in 0..d {
+                let g = out_f32[j * d + i];
+                let e = out_f64[j * d + i] as f32;
+                let diff = (g - e).abs();
+                let denom = e.abs().max(1e-6);
+                assert!(
+                    diff < 1e-3 || diff / denom < 1e-3,
+                    "f32 vs f64 mismatch at (i={i},j={j}): f32={g} f64={e} diff={diff}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scatter_one_column_f32_subsample_matches_all_iids_on_full_keep() {
+        // When iid_positions covers every individual (in order), the
+        // subsample path must produce the same column as the all_iids
+        // path. Catches off-by-one between byte/shift indexing and the
+        // 4-per-byte fast path.
+        let c = 3;
+        let n_indiv = 47;
+        let d = 16;
+        let raw = make_bed_fixture(99, c, n_indiv);
+        let bytes_per_snp = n_indiv.div_ceil(4);
+        let (bucket, sign_f32, _) = build_cs_bucket_sign(n_indiv, d, 5);
+        let n_norm = n_indiv as f64;
+
+        let iid_positions: Vec<IidPos> = (0..n_indiv)
+            .map(|i| IidPos {
+                byte_idx: i / 4,
+                shift: ((i % 4) * 2) as u8,
+            })
+            .collect();
+
+        let mut mean_buf = vec![0f32; c];
+        let mut inv_std_buf = vec![0f32; c];
+        for j in 0..c {
+            let mut sum = 0.0f64;
+            let mut sum_sq = 0.0f64;
+            let mut count = 0u64;
+            for i in 0..n_indiv {
+                if let Some(g) = decode(&raw, bytes_per_snp, j, i) {
+                    sum += g;
+                    sum_sq += g * g;
+                    count += 1;
+                }
+            }
+            let mean = if count > 0 { sum / count as f64 } else { 0.0 };
+            let centered = sum_sq - count as f64 * mean * mean;
+            let var = centered / n_indiv as f64;
+            mean_buf[j] = mean as f32;
+            inv_std_buf[j] = if var > 0.0 { (1.0 / var.sqrt()) as f32 } else { 0.0 };
+        }
+
+        let mut out_all = vec![0f32; d * c];
+        let mut out_sub = vec![0f32; d * c];
+        for j in 0..c {
+            unsafe {
+                scatter_one_column_f32(
+                    j,
+                    raw.as_ptr(),
+                    bytes_per_snp,
+                    n_indiv,
+                    bucket.as_ptr(),
+                    sign_f32.as_ptr(),
+                    core::ptr::null::<IidPos>(),
+                    0,
+                    true,
+                    mean_buf[j],
+                    inv_std_buf[j],
+                    n_norm,
+                    out_all.as_mut_ptr(),
+                    d as isize,
+                    d,
+                );
+                scatter_one_column_f32(
+                    j,
+                    raw.as_ptr(),
+                    bytes_per_snp,
+                    n_indiv,
+                    bucket.as_ptr(),
+                    sign_f32.as_ptr(),
+                    iid_positions.as_ptr(),
+                    iid_positions.len(),
+                    false,
+                    mean_buf[j],
+                    inv_std_buf[j],
+                    n_norm,
+                    out_sub.as_mut_ptr(),
+                    d as isize,
+                    d,
+                );
+            }
+            for i in 0..d {
+                let a = out_all[j * d + i];
+                let b = out_sub[j * d + i];
+                assert_eq!(
+                    a, b,
+                    "all_iids vs subsample mismatch at (i={i},j={j}): {a} vs {b}",
+                );
             }
         }
     }

@@ -476,7 +476,6 @@ pub fn worker_compute_l2_chrs(
     chrs_filter_json: String,
     config_json: String,
 ) -> Result<JsValue, JsError> {
-
     let chrs_filter: Vec<u8> = serde_json::from_str(&chrs_filter_json)
         .map_err(|e| JsError::new(&format!("chrs_filter JSON: {e}")))?;
     let chrs_set: Option<std::collections::HashSet<u8>> = if chrs_filter.is_empty() {

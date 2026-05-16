@@ -307,51 +307,10 @@ impl CountSketchProj {
 // Pass 2: tiled decode+normalize+project, accumulating into out[d×c].
 
 // BED decode LUT: bits → genotype value (or NaN for missing).
-
-/// Build a branchless 256-entry byte LUT for fused CountSketch scatter-add.
-/// For a given (mean, inv_std), each byte (4 genotypes) maps to 4 normalized f32 values.
-/// Missing genotypes map to 0.0 (impute to mean → center → 0), enabling unconditional scatter-add.
-fn build_norm_byte_lut_f32(mean: f32, inv_std: f32) -> [[f32; 4]; 256] {
-    // Pre-compute the 4 possible normalized values for each 2-bit code:
-    //   0b00 = hom A1 (geno=2) → (2 - mean) * inv_std
-    //   0b01 = missing         → 0.0
-    //   0b10 = het (geno=1)    → (1 - mean) * inv_std
-    //   0b11 = hom A2 (geno=0) → -mean * inv_std
-    let code_vals: [f32; 4] = [
-        (2.0 - mean) * inv_std,
-        0.0,
-        (1.0 - mean) * inv_std,
-        -mean * inv_std,
-    ];
-    std::array::from_fn(|b| {
-        let byte = b as u8;
-        [
-            code_vals[(byte & 0b11) as usize],
-            code_vals[((byte >> 2) & 0b11) as usize],
-            code_vals[((byte >> 4) & 0b11) as usize],
-            code_vals[((byte >> 6) & 0b11) as usize],
-        ]
-    })
-}
-
-/// f64 variant of the branchless byte LUT.
-fn build_norm_byte_lut_f64(mean: f64, inv_std: f64) -> [[f64; 4]; 256] {
-    let code_vals: [f64; 4] = [
-        (2.0 - mean) * inv_std,
-        0.0,
-        (1.0 - mean) * inv_std,
-        -mean * inv_std,
-    ];
-    std::array::from_fn(|b| {
-        let byte = b as u8;
-        [
-            code_vals[(byte & 0b11) as usize],
-            code_vals[((byte >> 2) & 0b11) as usize],
-            code_vals[((byte >> 4) & 0b11) as usize],
-            code_vals[((byte >> 6) & 0b11) as usize],
-        ]
-    })
-}
+// The per-(mean, inv_std) normalized-byte LUT builders used by the
+// fused CountSketch scatter live in `crate::wasm_simd::scatter` (so
+// the wasm SAB-pool dispatch can share them with the native rayon
+// path without a circular module dep).
 
 // Byte-level stats LUT: each of the 256 possible BED byte values encodes 4
 // genotypes; this LUT gives (sum, count, sum_sq) for the full byte.
@@ -708,6 +667,13 @@ fn countsketch_fused_project_f32(
         })
         .collect();
 
+    // Flat parallel-array views of stats[].mean / .inv_std so the wasm
+    // SAB-pool dispatch (which carries only raw pointers in `usize`)
+    // and the native rayon path can both index per-SNP scalars without
+    // touching the `SnpStats` Vec layout.
+    let mean_buf: Vec<f32> = stats.iter().map(|s| s.mean).collect();
+    let inv_std_buf: Vec<f32> = stats.iter().map(|s| s.inv_std).collect();
+
     for (j, s) in stats.iter().enumerate() {
         maf_out[j] = s.maf;
     }
@@ -722,75 +688,83 @@ fn countsketch_fused_project_f32(
     // individual's genotype, normalize, and scatter-add to out[bucket[i], j].
     let out_ptr = out.as_mut().as_ptr_mut();
     let out_col_stride = out.col_stride();
-    let out_send = SendPtr(out_ptr);
     let bucket = &cs.bucket;
     let sign = &cs.sign_f32;
 
-    (0..c).into_par_iter().for_each(|j| {
-        let snp_bytes = &raw_bytes[j * bytes_per_snp..(j + 1) * bytes_per_snp];
-        let mean = stats[j].mean;
-        let inv_std = stats[j].inv_std;
+    // On wasm32 with `+atomics`, rayon's `into_par_iter` is a no-op
+    // (runs serially on the calling thread — no spindle / atomic-wait
+    // integration). Dispatch through the manual SAB pool instead so
+    // the per-outer scatter splits across all inner Workers. The pool
+    // returns `false` (and we fall through) when it isn't initialised
+    // or N <= 1; in that case the rayon path below runs the scatter
+    // serially on the calling thread.
+    #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+    {
+        let args = crate::wasm_simd::pool::ScatterArgsF32 {
+            raw_bytes_ptr: raw_bytes.as_ptr() as usize,
+            bytes_per_snp,
+            n_indiv,
+            c,
+            bucket_ptr: bucket.as_ptr() as usize,
+            sign_ptr: sign.as_ptr() as usize,
+            iid_pos_ptr: iid_positions.as_ptr() as usize,
+            iid_pos_len: iid_positions.len(),
+            all_iids: if all_iids { 1 } else { 0 },
+            n_norm: n,
+            out_ptr: out_ptr as usize,
+            out_col_stride,
+            d,
+            mean_ptr: mean_buf.as_ptr() as usize,
+            inv_std_ptr: inv_std_buf.as_ptr() as usize,
+        };
+        // SAFETY: every slice we pulled `.as_ptr()` from above lives
+        // until this function returns (Vec / slice borrows owned by
+        // the calling stack frame). `parallel_scatter_f32` blocks
+        // until all inner Workers finish, so the references are still
+        // valid when the dispatch returns. `out` is exclusively owned
+        // by us via the `&mut MatF32` argument.
+        let dispatched = unsafe { crate::wasm_simd::pool::parallel_scatter_f32(args) };
+        if dispatched {
+            return;
+        }
+    }
 
-        // Safety: each thread writes to a disjoint column of out.
+    // Native rayon (or wasm without an initialised pool) path. Same
+    // per-column body as the wasm dispatch — both routes funnel
+    // through `scatter::scatter_one_column_f32` so the numerics are
+    // identical regardless of where the work runs.
+    let out_send = SendPtr(out_ptr);
+    let raw_ptr_us = raw_bytes.as_ptr() as usize;
+    let bucket_ptr_us = bucket.as_ptr() as usize;
+    let sign_ptr_us = sign.as_ptr() as usize;
+    let iid_pos_ptr_us = iid_positions.as_ptr() as usize;
+    let iid_pos_len = iid_positions.len();
+    let mean_ptr_us = mean_buf.as_ptr() as usize;
+    let inv_std_ptr_us = inv_std_buf.as_ptr() as usize;
+
+    (0..c).into_par_iter().for_each(|j| {
+        // SAFETY: rayon hands each `j` to one task; output column j
+        // is non-overlapping with other columns. All read-only views
+        // (raw_bytes / bucket / sign / iid_positions / mean_buf /
+        // inv_std_buf) outlive the join() implicit in for_each.
         unsafe {
-            let dst = std::slice::from_raw_parts_mut(
-                out_send.ptr().offset(j as isize * out_col_stride),
+            crate::wasm_simd::scatter::scatter_one_column_f32(
+                j,
+                raw_ptr_us as *const u8,
+                bytes_per_snp,
+                n_indiv,
+                bucket_ptr_us as *const u32,
+                sign_ptr_us as *const f32,
+                iid_pos_ptr_us as *const IidPos,
+                iid_pos_len,
+                all_iids,
+                *(mean_ptr_us as *const f32).add(j),
+                *(inv_std_ptr_us as *const f32).add(j),
+                n,
+                out_send.ptr(),
+                out_col_stride,
                 d,
             );
-
-            // Zero output column.
-            for v in dst.iter_mut() {
-                *v = 0.0;
-            }
-
-            // Branchless byte-level LUT: each byte → 4 normalized values
-            // Missing genotypes map to 0.0, so scatter-add is unconditional.
-            let norm_lut = build_norm_byte_lut_f32(mean, inv_std);
-
-            if all_iids {
-                // Process 4 individuals per byte (branchless)
-                let n_full_bytes = n_indiv / 4;
-                for byte_idx in 0..n_full_bytes {
-                    let vals = &norm_lut[snp_bytes[byte_idx] as usize];
-                    let base_i = byte_idx * 4;
-                    for (k, &val) in vals.iter().enumerate() {
-                        let i = base_i + k;
-                        *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
-                            *sign.get_unchecked(i) * val;
-                    }
-                }
-                // Remainder individuals in last partial byte
-                let rem_start = n_full_bytes * 4;
-                if rem_start < n_indiv {
-                    let vals = &norm_lut[snp_bytes[n_full_bytes] as usize];
-                    for (k, &val) in vals.iter().enumerate().take(n_indiv - rem_start) {
-                        let i = rem_start + k;
-                        *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
-                            *sign.get_unchecked(i) * val;
-                    }
-                }
-            } else {
-                // Branchless subsample: use norm_lut to get pre-normalized values.
-                // shift/2 maps byte shift (0,2,4,6) to LUT index (0,1,2,3).
-                for (i, pos) in iid_positions.iter().enumerate() {
-                    let vals = &norm_lut[snp_bytes[pos.byte_idx] as usize];
-                    let val = vals[(pos.shift / 2) as usize];
-                    *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
-                        *sign.get_unchecked(i) * val;
-                }
-            }
-
-            // Ratio estimator renorm: rescale so ||col||^2 = n (accumulate in f64)
-            let mut nrm_sq = 0.0f64;
-            for &v in dst.iter() {
-                nrm_sq += (v as f64) * (v as f64);
-            }
-            if nrm_sq > 0.0 {
-                let scale = (n / nrm_sq).sqrt() as f32;
-                for v in dst.iter_mut() {
-                    *v *= scale;
-                }
-            }
         }
     });
 }
@@ -863,6 +837,11 @@ fn countsketch_fused_project_f64(
         })
         .collect();
 
+    // Flat parallel-array views of stats[].mean / .inv_std for the
+    // pool / rayon dispatch. See the f32 counterpart for rationale.
+    let mean_buf: Vec<f64> = stats.iter().map(|s| s.mean).collect();
+    let inv_std_buf: Vec<f64> = stats.iter().map(|s| s.inv_std).collect();
+
     for (j, s) in stats.iter().enumerate() {
         maf_out[j] = s.maf;
     }
@@ -875,68 +854,64 @@ fn countsketch_fused_project_f64(
     // --- Pass 2: column-parallel fused decode + normalize + scatter-add ---
     let out_ptr = out.as_mut().as_ptr_mut();
     let out_col_stride = out.col_stride();
-    let out_send = SendPtr(out_ptr);
     let bucket = &cs.bucket;
     let sign = &cs.sign_f64;
 
-    (0..c).into_par_iter().for_each(|j| {
-        let snp_bytes = &raw_bytes[j * bytes_per_snp..(j + 1) * bytes_per_snp];
-        let mean = stats[j].mean;
-        let inv_std = stats[j].inv_std;
-
-        unsafe {
-            let dst = std::slice::from_raw_parts_mut(
-                out_send.ptr().offset(j as isize * out_col_stride),
-                d,
-            );
-
-            for v in dst.iter_mut() {
-                *v = 0.0;
-            }
-
-            let norm_lut = build_norm_byte_lut_f64(mean, inv_std);
-
-            if all_iids {
-                let n_full_bytes = n_indiv / 4;
-                for byte_idx in 0..n_full_bytes {
-                    let vals = &norm_lut[snp_bytes[byte_idx] as usize];
-                    let base_i = byte_idx * 4;
-                    for (k, &val) in vals.iter().enumerate() {
-                        let i = base_i + k;
-                        *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
-                            *sign.get_unchecked(i) * val;
-                    }
-                }
-                let rem_start = n_full_bytes * 4;
-                if rem_start < n_indiv {
-                    let vals = &norm_lut[snp_bytes[n_full_bytes] as usize];
-                    for (k, &val) in vals.iter().enumerate().take(n_indiv - rem_start) {
-                        let i = rem_start + k;
-                        *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
-                            *sign.get_unchecked(i) * val;
-                    }
-                }
-            } else {
-                for (i, pos) in iid_positions.iter().enumerate() {
-                    let vals = &norm_lut[snp_bytes[pos.byte_idx] as usize];
-                    let val = vals[(pos.shift / 2) as usize];
-                    *dst.get_unchecked_mut(*bucket.get_unchecked(i) as usize) +=
-                        *sign.get_unchecked(i) * val;
-                }
-            }
-
-            // Ratio estimator renorm
-            let mut nrm_sq = 0.0f64;
-            for &v in dst.iter() {
-                nrm_sq += v * v;
-            }
-            if nrm_sq > 0.0 {
-                let scale = (n / nrm_sq).sqrt();
-                for v in dst.iter_mut() {
-                    *v *= scale;
-                }
-            }
+    // wasm32+atomics: dispatch through the manual SAB pool. See the
+    // f32 sibling for the lifetime / safety reasoning — it applies
+    // verbatim here.
+    #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+    {
+        let args = crate::wasm_simd::pool::ScatterArgsF64 {
+            raw_bytes_ptr: raw_bytes.as_ptr() as usize,
+            bytes_per_snp,
+            n_indiv,
+            c,
+            bucket_ptr: bucket.as_ptr() as usize,
+            sign_ptr: sign.as_ptr() as usize,
+            iid_pos_ptr: iid_positions.as_ptr() as usize,
+            iid_pos_len: iid_positions.len(),
+            all_iids: if all_iids { 1 } else { 0 },
+            n_norm: n,
+            out_ptr: out_ptr as usize,
+            out_col_stride,
+            d,
+            mean_ptr: mean_buf.as_ptr() as usize,
+            inv_std_ptr: inv_std_buf.as_ptr() as usize,
+        };
+        let dispatched = unsafe { crate::wasm_simd::pool::parallel_scatter_f64(args) };
+        if dispatched {
+            return;
         }
+    }
+
+    let out_send = SendPtr(out_ptr);
+    let raw_ptr_us = raw_bytes.as_ptr() as usize;
+    let bucket_ptr_us = bucket.as_ptr() as usize;
+    let sign_ptr_us = sign.as_ptr() as usize;
+    let iid_pos_ptr_us = iid_positions.as_ptr() as usize;
+    let iid_pos_len = iid_positions.len();
+    let mean_ptr_us = mean_buf.as_ptr() as usize;
+    let inv_std_ptr_us = inv_std_buf.as_ptr() as usize;
+
+    (0..c).into_par_iter().for_each(|j| unsafe {
+        crate::wasm_simd::scatter::scatter_one_column_f64(
+            j,
+            raw_ptr_us as *const u8,
+            bytes_per_snp,
+            n_indiv,
+            bucket_ptr_us as *const u32,
+            sign_ptr_us as *const f64,
+            iid_pos_ptr_us as *const IidPos,
+            iid_pos_len,
+            all_iids,
+            *(mean_ptr_us as *const f64).add(j),
+            *(inv_std_ptr_us as *const f64).add(j),
+            n,
+            out_send.ptr(),
+            out_col_stride,
+            d,
+        );
     });
 }
 

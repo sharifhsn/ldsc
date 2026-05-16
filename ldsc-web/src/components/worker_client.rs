@@ -317,8 +317,8 @@ pub fn spawn_compute_l2_pool(
     let wasm_js_url_for_scan = wasm_js_url_abs.clone();
     let wasm_bg_url_for_scan = wasm_bg_url_abs.clone();
 
-    let scan_on_message: Closure<dyn FnMut(MessageEvent)> =
-        Closure::new(move |ev: MessageEvent| {
+    let scan_on_message: Closure<dyn FnMut(MessageEvent)> = Closure::new(
+        move |ev: MessageEvent| {
             let data = ev.data();
             let kind = string_field(&data, "kind");
             match kind.as_str() {
@@ -418,7 +418,8 @@ pub fn spawn_compute_l2_pool(
                     tracing::warn!("scan worker: unknown kind '{other}'");
                 }
             }
-        });
+        },
+    );
     scan_worker.set_onmessage(Some(scan_on_message.as_ref().unchecked_ref()));
     scan_on_message.forget();
 

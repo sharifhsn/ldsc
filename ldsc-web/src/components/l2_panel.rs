@@ -493,14 +493,15 @@ fn SketchSlider(sketch_d: RwSignal<u32>, fam: RwSignal<LoadedFile>) -> impl Into
     // the CLAUDE.md warning; going higher costs linearly with d
     // beyond the GEMM-vs-scatter crossover near d=500-1000.)
     let pick_d = |_n_indiv: usize| -> u32 { 200 };
-    let n_from_fam = |text: &str| -> usize {
-        text.lines().filter(|l| !l.trim().is_empty()).count()
-    };
+    let n_from_fam =
+        |text: &str| -> usize { text.lines().filter(|l| !l.trim().is_empty()).count() };
     let recommended = move || {
-        fam.with(|f| f.text.as_ref().map(|t| {
-            let n = n_from_fam(t);
-            (n, pick_d(n))
-        }))
+        fam.with(|f| {
+            f.text.as_ref().map(|t| {
+                let n = n_from_fam(t);
+                (n, pick_d(n))
+            })
+        })
     };
     view! {
         <div class="mt-2 mb-3" style="margin-left: 1.75rem;">
