@@ -40,11 +40,27 @@ use wasm_bindgen::prelude::*;
 use web_sys::{MessageEvent, Url, Worker, WorkerOptions, WorkerType};
 
 /// Hard cap on pool size, regardless of `navigator.hardwareConcurrency`.
-/// Each worker holds a chunk × N × precision genotype slab in wasm
-/// linear memory (~40 MB at biobank N=50K, chunk=200, f32) — 4 workers
-/// keeps that bounded around 160 MB renderer-side. Bump if profiling
-/// shows the chr-shard distribution is the bottleneck.
-const MAX_POOL: usize = 4;
+///
+/// Each outer worker is its own JS Web Worker with its own SAB-backed
+/// wasm linear memory (~150 MB at biobank N=50K, chunk=200, f32; less
+/// at 1000G scale). 8 outer × ~150 MB = ~1.2 GB renderer SAB total —
+/// fits comfortably under Chrome's per-page address-space budget but
+/// closer to it than the previous 4-worker cap.
+///
+/// Why bump it: the fused CountSketch scatter phase is **single-
+/// threaded per outer worker** (rayon is a no-op on wasm32 with our
+/// current toolchain — no spindle/atomic-wait), so each outer worker
+/// runs scatter serially across its chr-shard. On biobank d=200 the
+/// scatter is 60s/worker out of ~70s wall — 4× scatter parallelism
+/// hides 14 cores on M5 Pro. Bumping to 8 outers (2× more scatter
+/// parallelism) drops biobank wall by an estimated 25-30s without
+/// touching the kernel.
+///
+/// `inner_threads_for_pool` will reduce per-outer rayon threads to
+/// keep `outer × inner ≤ navigator.hardwareConcurrency` and avoid
+/// CPU oversubscription. On HC=18 (M5 Pro) with 8 outers, we get
+/// 2 inner threads each (16 total = no oversubscription).
+const MAX_POOL: usize = 8;
 
 /// Per-worker watchdog: if no progress / no done message arrives in
 /// this window, abort the pool. Catches hung workers (silent wasm
