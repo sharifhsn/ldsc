@@ -17,7 +17,7 @@ port    = 8080
 # GH Pages can't send these — `coi-serviceworker` polyfills them in
 # production — but the local dev server should hand them out
 # natively so we don't need to round-trip through the SW.
-headers = { "Cross-Origin-Opener-Policy" = "same-origin", "Cross-Origin-Embedder-Policy" = "require-corp" }
+headers = { "Cross-Origin-Opener-Policy" = "same-origin", "Cross-Origin-Embedder-Policy" = "require-corp", "Cross-Origin-Resource-Policy" = "same-origin" }
 
 [[hooks]]
 stage   = "post_build"

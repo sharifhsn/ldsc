@@ -1050,7 +1050,7 @@ pub(super) fn compute_ldscore_global(
     sketch_maf_aware: bool,
     snp_level_masking: bool,
     on_progress: &mut dyn FnMut(crate::l2::L2Progress),
-) -> Result<(MatF, Vec<f64>)> {
+) -> Result<(MatF, Vec<f64>, crate::l2::L2Perf)> {
     // chunk_c=0 makes `(0..m).step_by(chunk_c)` panic ("step must be
     // non-zero"). Catch the malformed-config case here with a real
     // error instead of a wasm `unreachable executed` trap. The
@@ -1069,7 +1069,15 @@ pub(super) fn compute_ldscore_global(
     let m = all_snps.len();
     if m == 0 {
         let n_annot = annot.map(|a| a.ncols()).unwrap_or(1);
-        return Ok((MatF::zeros(0, n_annot), vec![]));
+        return Ok((
+            MatF::zeros(0, n_annot),
+            vec![],
+            crate::l2::L2Perf {
+                m: 0,
+                n_indiv,
+                ..Default::default()
+            },
+        ));
     }
 
     // Compute block_left per chromosome (avoid cross-chromosome LD windows).
@@ -2415,28 +2423,50 @@ pub(super) fn compute_ldscore_global(
         });
     } // end for chunk_start
 
+    // Always populate the structured per-phase breakdown so callers
+    // (browser orchestrator, CLI's verbose_timing path, future
+    // benchmarks) can consume it programmatically. Cheap — just
+    // fields-from-Durations.
+    let perf = crate::l2::L2Perf {
+        m,
+        n_indiv,
+        bed_read_secs: t_bed_read.as_secs_f64(),
+        norm_secs: t_norm.as_secs_f64(),
+        sketch_secs: sketch_dim.map(|_| t_sketch.as_secs_f64()),
+        bb_dot_secs: t_bb_dot.as_secs_f64(),
+        ab_dot_secs: t_ab_dot.as_secs_f64(),
+        ring_store_secs: t_ring_store.as_secs_f64(),
+    };
+
     if verbose_timing {
-        if sketch_dim.is_some() {
+        // CLI-only eprintln. The wasm path collects via the L2Perf
+        // return value and routes through serde-wasm-bindgen →
+        // postMessage → main-thread tracing in worker_client.rs.
+        // We intentionally do NOT call `tracing::info!` here: the
+        // worker context lacks a tracing subscriber, and adding one
+        // (`tracing_wasm::set_as_global_default`) interacts badly
+        // with our multi-threaded WASM setup and traps at runtime.
+        if let Some(sketch_secs) = perf.sketch_secs {
             eprintln!(
                 "[perf] compute_ldscore: bed_read(stall)={:.3}s norm={:.3}s sketch={:.3}s bb_dot={:.3}s ab_dot={:.3}s ring_store={:.3}s",
-                t_bed_read.as_secs_f64(),
-                t_norm.as_secs_f64(),
-                t_sketch.as_secs_f64(),
-                t_bb_dot.as_secs_f64(),
-                t_ab_dot.as_secs_f64(),
-                t_ring_store.as_secs_f64(),
+                perf.bed_read_secs,
+                perf.norm_secs,
+                sketch_secs,
+                perf.bb_dot_secs,
+                perf.ab_dot_secs,
+                perf.ring_store_secs,
             );
         } else {
             eprintln!(
                 "[perf] compute_ldscore: bed_read(stall)={:.3}s norm={:.3}s bb_dot={:.3}s ab_dot={:.3}s ring_store={:.3}s",
-                t_bed_read.as_secs_f64(),
-                t_norm.as_secs_f64(),
-                t_bb_dot.as_secs_f64(),
-                t_ab_dot.as_secs_f64(),
-                t_ring_store.as_secs_f64(),
+                perf.bed_read_secs,
+                perf.norm_secs,
+                perf.bb_dot_secs,
+                perf.ab_dot_secs,
+                perf.ring_store_secs,
             );
         }
     }
 
-    Ok((l2, maf_per_snp))
+    Ok((l2, maf_per_snp, perf))
 }

@@ -446,7 +446,11 @@ pub fn run(args: L2Args) -> Result<()> {
         } else {
             None
         };
-        compute_ldscore_global(
+        // Third tuple element is `L2Perf` (always populated);
+        // verbose_timing already eprintln'd the breakdown above so
+        // the CLI discards the struct. Browser callers consume it
+        // via `compute_l2_from_bed_with_progress` → `L2Output.perf`.
+        let (l2_mat, maf_vec, _perf) = compute_ldscore_global(
             &all_snps,
             bed,
             mmap_bed,
@@ -468,7 +472,8 @@ pub fn run(args: L2Args) -> Result<()> {
             args.snp_level_masking,
             &mut |_| {}, // CLI: no per-chunk progress (terminal stdout would be too noisy)
         )
-        .context("computing LD scores")?
+        .context("computing LD scores")?;
+        (l2_mat, maf_vec)
     } else {
         // Per-chromosome parallel processing: split SNPs by chromosome,
         // compute each independently via rayon, then concatenate results.
@@ -494,7 +499,7 @@ pub fn run(args: L2Args) -> Result<()> {
 
         let bed_path_str = bed_path.as_str();
         let iid_slice = iid_indices.as_deref();
-        let results: Vec<(MatF, Vec<f64>)> = chr_groups
+        let results: Vec<(MatF, Vec<f64>, L2Perf)> = chr_groups
             .par_iter()
             .map(|&(_chr, start, end)| {
                 let chr_snps = &all_snps[start..end];
@@ -548,10 +553,17 @@ pub fn run(args: L2Args) -> Result<()> {
             .context("computing LD scores (per-chromosome)")?;
 
         // Concatenate per-chromosome results into global arrays.
+        // Per-chr L2Perf is dropped on the CLI rayon path
+        // (verbose_timing is suppressed per-chr above to avoid log
+        // noise; browser callers get the per-chr breakdown via the
+        // worker bridge).
         let n_annot = annot_ref.map(|a| a.ncols()).unwrap_or(1);
         let mut l2 = MatF::zeros(all_snps.len(), n_annot);
         let mut maf = vec![0.0f64; all_snps.len()];
-        for (&(_chr, start, _end), (chr_l2, chr_maf)) in chr_groups.iter().zip(results.iter()) {
+        for (&(_chr, start, _end), (chr_l2, chr_maf, _chr_perf)) in
+            chr_groups.iter().zip(results.iter())
+        {
+            let chr_l2: &MatF = chr_l2;
             for i in 0..chr_l2.nrows() {
                 for k in 0..n_annot {
                     l2[(start + i, k)] = chr_l2[(i, k)];
@@ -983,6 +995,42 @@ pub struct L2Output {
     pub l2: Vec<f64>,
     pub maf: Vec<f64>,
     pub wall_seconds: f64,
+    /// Per-phase wall-time breakdown of `compute_ldscore_global`.
+    /// Always populated, regardless of `verbose_timing`. Consumers
+    /// that don't want it can ignore the field.
+    pub perf: L2Perf,
+}
+
+/// Per-phase wall-time breakdown of one `compute_ldscore_global` call.
+///
+/// Phases run sequentially within each chunk and accumulate across
+/// chunks — they approximately sum to the call's overall wall time
+/// (`L2Output.wall_seconds`), modulo per-chunk loop overhead and the
+/// first-chunk normalize that doesn't go through the steady-state
+/// accumulators.
+///
+/// Serde-free intentionally — the lib crate doesn't depend on serde.
+/// `ldsc-web::worker::WireL2Perf` is the serde-derive mirror used to
+/// round-trip through `serde-wasm-bindgen` for the in-browser
+/// worker→main hop.
+#[derive(Debug, Clone, Default)]
+pub struct L2Perf {
+    /// SNP count of this `compute_ldscore_global` call.
+    pub m: usize,
+    /// Individual count.
+    pub n_indiv: usize,
+    /// Stall time on BED reads.
+    pub bed_read_secs: f64,
+    /// BED-decode → f32/f64 + impute-NaN→mean + center + unit-variance.
+    pub norm_secs: f64,
+    /// CountSketch projection (`None` when sketching is off).
+    pub sketch_secs: Option<f64>,
+    /// Within-chunk B^T·B GEMM.
+    pub bb_dot_secs: f64,
+    /// Cross-window A^T·B GEMM.
+    pub ab_dot_secs: f64,
+    /// Cross-window ring-buffer storage.
+    pub ring_store_secs: f64,
 }
 
 /// Compute LD scores from in-memory BED / BIM / FAM contents.
@@ -1083,7 +1131,7 @@ pub fn compute_l2_from_bed_with_progress(
     anyhow::ensure!(n_indiv > 0, "compute_l2_from_bed: FAM has zero individuals");
 
     let t0 = web_time::Instant::now();
-    let (l2_mat, maf) = compute_ldscore_global(
+    let (l2_mat, maf, perf) = compute_ldscore_global(
         &snps,
         bed,
         None, // mmap is unavailable / pointless in-browser
@@ -1116,6 +1164,7 @@ pub fn compute_l2_from_bed_with_progress(
         l2,
         maf,
         wall_seconds: t0.elapsed().as_secs_f64(),
+        perf,
     })
 }
 

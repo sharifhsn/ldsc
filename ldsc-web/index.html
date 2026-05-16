@@ -38,9 +38,21 @@
          suffixed by trunk so a hard-coded path would 404). -->
     <link data-trunk rel="copy-file" href="assets/worker.js" />
 
+    <!-- Inner Web Worker for the manual SAB-backed parallel GEMM
+         pool (workstream G). One nested Worker spawned per rayon
+         thread inside each outer compute Worker; shares the outer
+         Worker's wasm linear memory via SharedArrayBuffer. See
+         `assets/inner_worker.js` for the full lifecycle. -->
+    <link data-trunk rel="copy-file" href="assets/inner_worker.js" />
+
     <!-- Compile + bundle the ldsc-web crate. data-bin selects this
-         binary in case the workspace ever has more than one. -->
-    <link data-trunk rel="rust" data-bin="ldsc-web" data-wasm-opt="z" />
+         binary in case the workspace ever has more than one.
+         data-wasm-opt-params="--enable-threads" tells trunk's wasm-opt
+         invocation to permit `(memory ... shared)` and the atomic.*
+         opcodes (workstream G enables those via .cargo/config.toml).
+         Without it, wasm-opt rejects the build with `multivalue not
+         enabled` or `atomic instruction without --enable-threads`. -->
+    <link data-trunk rel="rust" data-bin="ldsc-web" data-wasm-opt="z" data-wasm-opt-params="--enable-threads" />
 </head>
 <body>
     <!-- Leptos mounts the entire UI here at startup. Until the wasm

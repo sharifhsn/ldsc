@@ -1,0 +1,38 @@
+# Standalone microbenchmark crate for the `wasm_simd` GEMM kernel.
+#
+# Outside the main `ldsc` workspace on purpose — we don't want
+# the bench to drag in the main crate's heavy native deps (polars,
+# faer's lapack), and we don't want changes here to perturb the
+# main crate's lockfile.
+#
+# Build + run:
+#
+#   cd wasm-bench
+#   PATH=/Users/sharif/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH \
+#     cargo build --release --target wasm32-wasip1
+#   wasmtime -W simd=y target/wasm32-wasip1/release/ldsc-wasm-bench.wasm
+#
+# Or via the wrapper script in `./bench.sh`.
+[package]
+name = "ldsc-wasm-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "ldsc-wasm-bench"
+path = "src/main.rs"
+
+[dependencies]
+# Same faer version the main crate uses so type signatures match.
+faer = { version = "0.24", default-features = false, features = ["std"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+incremental = false
+
+[workspace]
+# Self-contained workspace so we don't get pulled into ../Cargo.toml.

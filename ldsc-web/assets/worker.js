@@ -4,8 +4,17 @@
 // inbound messages to the appropriate wasm export. Three active
 // message kinds:
 //
-//   init         : { wasmJsUrl, wasmBgUrl }
-//                  → load wasm bundle, post { kind: 'ready' }
+//   init         : { wasmJsUrl, wasmBgUrl, innerThreads }
+//                  → load wasm bundle, init wasm-bindgen-rayon thread
+//                    pool with `innerThreads` rayon workers (skipped
+//                    when innerThreads ≤ 1), post { kind: 'ready' }.
+//                    The pool MUST be initialised here, inside the
+//                    Worker — initialising from main thread fails
+//                    silently when crossbeam mutex contention later
+//                    lowers to `Atomics.wait` (see plan workstream
+//                    C.3 retrospective). Each Worker has its own wasm
+//                    instance + memory + rayon pool; pools don't
+//                    share memory across outer Workers.
 //
 //   scan_bim     : { bimFile }
 //                  → call wasm.worker_scan_bim, post
@@ -54,18 +63,75 @@ self.onmessage = async (e) => {
 
     try {
         if (kind === 'init') {
-            // First message: load the wasm bundle. The main thread
-            // tells us where to find it (paths are hash-suffixed).
+            // First message: load the wasm bundle + init the rayon
+            // thread pool. The main thread tells us where to find the
+            // bundle (paths are hash-suffixed) and how many rayon
+            // workers to spawn inside this outer Worker.
+            //
             // If a previous init failed, `initPromise` is a rejected
             // Promise — resetting it on failure (in the catch below)
             // means the orchestrator can retry by sending another
-            // init without spawning a new worker.
-            const { wasmJsUrl, wasmBgUrl } = data;
+            // init without spawning a new outer worker.
+            const { wasmJsUrl, wasmBgUrl, innerThreads } = data;
             if (!initPromise) {
                 initPromise = (async () => {
                     const mod = await import(wasmJsUrl);
                     await mod.default(wasmBgUrl);
                     wasm = mod;
+                    // Manual SAB-backed parallel GEMM pool (workstream G):
+                    // spawn `innerThreads - 1` nested Workers (this outer
+                    // Worker counts as worker 0, hence the -1). Each
+                    // nested Worker shares this outer Worker's wasm
+                    // linear memory via SharedArrayBuffer (the
+                    // `--shared-memory --import-memory` link-args make
+                    // wasm.memory a SAB-backed WebAssembly.Memory; we
+                    // pass it to each inner Worker's wasm init below).
+                    //
+                    // After all inner Workers report `ready`, we tell
+                    // the wasm pool how many workers it has via
+                    // `init_inner_pool(N)`; subsequent dispatches in
+                    // `wasm_simd::pool::parallel_gemm_tn_f32` then
+                    // partition output cols across N total workers.
+                    if (typeof innerThreads === 'number' && innerThreads > 1) {
+                        const innerCount = innerThreads - 1;
+                        // Resolve inner_worker.js relative to OUR own
+                        // location (same dir, served by trunk under
+                        // /ldsc/).
+                        const innerJsUrl = new URL('./inner_worker.js', self.location.href).href;
+                        const innerWorkers = [];
+                        const readyPromises = [];
+                        for (let i = 0; i < innerCount; i++) {
+                            const w = new Worker(innerJsUrl, { type: 'module' });
+                            innerWorkers.push(w);
+                            const workerId = i + 1; // outer is worker 0
+                            readyPromises.push(new Promise((resolve, reject) => {
+                                w.onmessage = (e) => {
+                                    if (e.data?.kind === 'ready') {
+                                        resolve();
+                                    } else if (e.data?.kind === 'error') {
+                                        reject(new Error(`inner_worker[${workerId}]: ${e.data.error}`));
+                                    }
+                                };
+                                w.onerror = (ev) => {
+                                    reject(new Error(`inner_worker[${workerId}].onerror: ${ev.message || ev}`));
+                                };
+                            }));
+                            w.postMessage({
+                                kind: 'init',
+                                wasmJsUrl,
+                                wasmBgUrl,
+                                memory: mod.wasm_memory(),
+                                workerId,
+                            });
+                        }
+                        await Promise.all(readyPromises);
+                        // Pool is now ready: tell the wasm side.
+                        mod.init_inner_pool(innerThreads);
+                        // Keep references so they aren't GC'd. (See
+                        // wasm-bindgen-rayon's workerHelpers.js for
+                        // the same pattern + Firefox bug rationale.)
+                        self.__inner_workers = innerWorkers;
+                    }
                     self.postMessage({ kind: 'ready' });
                 })();
             }

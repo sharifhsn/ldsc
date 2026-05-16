@@ -52,15 +52,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Stable Rust + wasm32 target. Multi-threaded WASM (which would
-      # need nightly + build-std + RUSTFLAGS) was attempted in
-      # Workstream C.3 and reverted — see ldsc-web/src/main.rs doc
-      # comment for the spawn_local-from-event-handler bug. Stable
-      # is sufficient for the single-threaded v1.
-      - name: Install Rust (stable + wasm32 target)
-        uses: dtolnay/rust-toolchain@stable
+      # Nightly Rust required for `wasm-bindgen-rayon` (workstream G):
+      # `+atomics` is unstable and `[unstable] build-std` is unstable
+      # cargo. We pin the nightly date in `ldsc-web/rust-toolchain.toml`
+      # for reproducibility; bumping that file is a deliberate one-line
+      # change. dtolnay/rust-toolchain reads `rust-toolchain.toml`
+      # automatically when the toolchain is set to `none`, but we
+      # specify the channel explicitly here to make the workflow self-
+      # describing and to ensure `rust-src` is installed (without
+      # `rust-src`, `-Z build-std` fails).
+      - name: Install Rust (nightly + wasm32 target + rust-src)
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-05-13
           targets: wasm32-unknown-unknown
+          components: rust-src,clippy,rustfmt
 
       # Cache the wasm target dir separately from native CI; sharing
       # would corrupt either build's incremental state. Key includes

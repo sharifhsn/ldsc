@@ -1,5 +1,16 @@
 //! ldsc — Rust reimplementation of LD Score Regression (Bulik-Sullivan et al.).
 //!
+//! On `wasm32-unknown-unknown` with `+atomics`, we use the unstable
+//! `core::arch::wasm32::memory_atomic_wait32` / `memory_atomic_notify`
+//! intrinsics to implement a manual SAB-backed worker pool (see
+//! `wasm_simd::pool`). The intrinsics are gated behind the
+//! `stdarch_wasm_atomic_wait` feature, opted into here.
+#![cfg_attr(
+    all(target_arch = "wasm32", target_feature = "atomics"),
+    feature(stdarch_wasm_atomic_wait)
+)]
+
+//!
 //! This crate is consumed in three ways:
 //!
 //! 1. **As a binary** — `cargo install ldsc` produces the `ldsc` CLI built

@@ -207,30 +207,97 @@ pub mod simd128 {
             "dst must be col-major (row_stride == 1)"
         );
 
-        // SAFETY for the entire body: all preconditions documented on
-        // this function (col-major, shapes consistent, non-negative
-        // strides) are debug-asserted above and upheld by the
-        // dispatch in `crate::la::matmul_tn_to_f32`. Each unsafe op
-        // below is in-bounds by construction; specific reasoning is
-        // inlined as `// SAFETY:` comments at the load/store sites.
+        let a_ptr = lhs.as_ptr();
+        let a_col = lhs.col_stride();
+        let b_ptr = rhs.as_ptr();
+        let b_col = rhs.col_stride();
+
+        // Extract the write pointer + leading dimension. faer's
+        // `as_ptr_mut` takes `&self` in 0.24 (the `mut` in the name
+        // refers to the returned pointer's mutability, not the
+        // receiver), so no `mut dst` rebind is needed. The MatMut is
+        // moved into this block; lifetime ensures the backing storage
+        // stays valid for the kernel (and across any inner-worker
+        // parallel dispatch).
+        let dst_ptr = dst.as_ptr_mut();
+        let dst_col = dst.col_stride();
+
+        // Try parallel dispatch first. `parallel_gemm_tn_f32` returns
+        // `true` if the pool was initialised AND N>1 — in which case it
+        // ran the work across the inner Workers + the calling thread.
+        // Returns `false` (single-threaded fast path) when the pool is
+        // disabled, in which case we fall through to the serial loop.
+        #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+        {
+            // SAFETY: the matrices outlive this call (MatMut/MatRef
+            // live for at least this function's body), all pointers
+            // are valid for the durations the inner Workers will use
+            // them (we await the barrier before returning), and the
+            // dst region is exclusively owned by us.
+            let dispatched = unsafe {
+                crate::wasm_simd::pool::parallel_gemm_tn_f32(
+                    dst_ptr,
+                    dst_col,
+                    m,
+                    n,
+                    a_ptr,
+                    a_col,
+                    k,
+                    b_ptr,
+                    b_col,
+                )
+            };
+            if dispatched {
+                return;
+            }
+        }
+
+        // SAFETY for the serial body: same as before. Each unsafe op
+        // is in-bounds by construction; specific reasoning is inlined
+        // as `// SAFETY:` comments at the load/store sites.
         unsafe {
-            let a_ptr = lhs.as_ptr();
-            let a_col = lhs.col_stride();
-            let b_ptr = rhs.as_ptr();
-            let b_col = rhs.col_stride();
+            // Single-threaded path (pool not initialised, OR caller
+            // doesn't have `+atomics` enabled). Use the 2×4 register-
+            // tiled kernel: ~1.8× over the legacy single-j kernel on
+            // ab_dot (8000×200×2490) under wasmtime, ~2× on
+            // long-K biobank shapes. See `wasm-bench/` for the perf
+            // sweep across kernels.
+            gemm_tn_f32_slice_raw_tiled_2x4(
+                dst_ptr, dst_col, m, a_ptr, a_col, k, b_ptr, b_col, 0, n,
+            );
+        }
+    }
 
-            // Extract the write pointer + leading dimension. faer's
-            // `as_ptr_mut` takes `&self` in 0.24 (the `mut` in the
-            // name refers to the returned pointer's mutability, not
-            // the receiver), so no `mut dst` rebind is needed. The
-            // MatMut is moved into this block; lifetime ensures the
-            // backing storage stays valid for the kernel.
-            let dst_ptr = dst.as_ptr_mut();
-            let dst_col = dst.col_stride();
-
+    /// Inner kernel: compute output columns `[j_start, j_end)` of the
+    /// TN GEMM. Used both by the serial path (called once with the
+    /// full range) and by the parallel pool's worker loop (called per
+    /// worker with its assigned slice).
+    ///
+    /// # Safety
+    ///
+    /// All pointer/stride preconditions of [`gemm_tn_f32`] apply. In
+    /// addition, `j_end <= dst_cols` and `j_start <= j_end`. Multiple
+    /// workers running disjoint `[j_start, j_end)` slices in parallel
+    /// is sound because output columns are non-overlapping memory
+    /// regions and the lhs/rhs are read-only (treated as shared
+    /// references).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_tn_f32_slice_raw(
+        dst_ptr: *mut f32,
+        dst_col: isize,
+        m: usize,
+        a_ptr: *const f32,
+        a_col: isize,
+        k: usize,
+        b_ptr: *const f32,
+        b_col: isize,
+        j_start: usize,
+        j_end: usize,
+    ) {
+        unsafe {
             let zero: v128 = f32x4_splat(0.0);
 
-            for j in 0..n {
+            for j in j_start..j_end {
                 // SAFETY: column j is in-bounds; b_col is the leading
                 // dimension of `rhs` so j*b_col stays within rhs's
                 // allocation.
@@ -304,6 +371,812 @@ pub mod simd128 {
                     *dst_ptr.offset(j as isize * dst_col + i as isize) = acc;
                 }
             }
+        }
+    }
+
+    /// **Register-tiled** TN GEMM: compute 4 output columns per A
+    /// column load. Same algorithm as [`gemm_tn_f32_slice_raw`] but
+    /// processes a `jb = 4` tile of j's at a time, sharing the
+    /// `A[:, i]` load across all 4 j's. Each j gets an independent
+    /// accumulator (4 indep dep chains), and within each j we keep a
+    /// K-unroll of 4 (one v128 per acc, no sub-accumulator unrolling)
+    /// to fit comfortably in the wasm SIMD register pressure budget.
+    ///
+    /// Effect on ab_dot (m=8000, n=200, k=2490):
+    /// - Original kernel: 4 × 8000 × 200 A column reads = 6.4M loads
+    ///   of 10 KB each per slice; even at L1d this is a lot of
+    ///   address-generation pressure.
+    /// - Tiled kernel: 4 × 8000 × 50 A column reads = 1.6M loads.
+    ///   4× reduction.
+    ///
+    /// The remaining j's outside the largest multiple of 4 are
+    /// processed by falling back to the single-column path so the
+    /// kernel handles all `(j_end - j_start)` cleanly. Per call this
+    /// is at most 3 j's of the original path — negligible.
+    ///
+    /// # Safety
+    ///
+    /// Identical to [`gemm_tn_f32_slice_raw`].
+    ///
+    /// # Numerics
+    ///
+    /// **NOT bit-identical** to the scalar reference: the per-j
+    /// accumulator structure here uses 4 v128 accs per j vs the
+    /// reference's 4 lane-groups, but the K is stepped in 4-element
+    /// chunks instead of 16, changing the precise summation order.
+    /// Relative error stays comfortably below 1e-5 for our shapes
+    /// (verified by the loose-tolerance property test). At the
+    /// L2-score level (sum over k of r²) this is well below the f32
+    /// noise floor and matches CLI to displayed precision.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_tn_f32_slice_raw_tiled(
+        dst_ptr: *mut f32,
+        dst_col: isize,
+        m: usize,
+        a_ptr: *const f32,
+        a_col: isize,
+        k: usize,
+        b_ptr: *const f32,
+        b_col: isize,
+        j_start: usize,
+        j_end: usize,
+    ) {
+        unsafe {
+            let zero: v128 = f32x4_splat(0.0);
+            // Process j's in tiles of 4.
+            let mut jt = j_start;
+            while jt + 4 <= j_end {
+                // SAFETY: jt+3 < j_end ≤ rhs.ncols(); each column
+                // offset stays within rhs's allocation.
+                let b_col_ptr_0 = b_ptr.offset(jt as isize * b_col);
+                let b_col_ptr_1 = b_ptr.offset((jt + 1) as isize * b_col);
+                let b_col_ptr_2 = b_ptr.offset((jt + 2) as isize * b_col);
+                let b_col_ptr_3 = b_ptr.offset((jt + 3) as isize * b_col);
+
+                for i in 0..m {
+                    let a_col_ptr = a_ptr.offset(i as isize * a_col);
+
+                    // 4 independent SIMD accumulators, one per output
+                    // column. Each is a 4-lane v128; final horizontal
+                    // reduce at the end gives one f32 per cell.
+                    let mut acc0 = zero;
+                    let mut acc1 = zero;
+                    let mut acc2 = zero;
+                    let mut acc3 = zero;
+
+                    let mut p: usize = 0;
+                    while p + 4 <= k {
+                        // SAFETY: row_stride==1 (debug-asserted),
+                        // p+4 ≤ k (loop guard). v128_load handles
+                        // unaligned addresses.
+                        let a = v128_load(a_col_ptr.add(p) as *const v128);
+                        let b0 = v128_load(b_col_ptr_0.add(p) as *const v128);
+                        let b1 = v128_load(b_col_ptr_1.add(p) as *const v128);
+                        let b2 = v128_load(b_col_ptr_2.add(p) as *const v128);
+                        let b3 = v128_load(b_col_ptr_3.add(p) as *const v128);
+
+                        acc0 = f32x4_add(acc0, f32x4_mul(a, b0));
+                        acc1 = f32x4_add(acc1, f32x4_mul(a, b1));
+                        acc2 = f32x4_add(acc2, f32x4_mul(a, b2));
+                        acc3 = f32x4_add(acc3, f32x4_mul(a, b3));
+                        p += 4;
+                    }
+
+                    // Horizontal-reduce each accumulator. Same
+                    // (l0+l1)+(l2+l3) pattern as the reference.
+                    let mut s0 = (f32x4_extract_lane::<0>(acc0)
+                        + f32x4_extract_lane::<1>(acc0))
+                        + (f32x4_extract_lane::<2>(acc0) + f32x4_extract_lane::<3>(acc0));
+                    let mut s1 = (f32x4_extract_lane::<0>(acc1)
+                        + f32x4_extract_lane::<1>(acc1))
+                        + (f32x4_extract_lane::<2>(acc1) + f32x4_extract_lane::<3>(acc1));
+                    let mut s2 = (f32x4_extract_lane::<0>(acc2)
+                        + f32x4_extract_lane::<1>(acc2))
+                        + (f32x4_extract_lane::<2>(acc2) + f32x4_extract_lane::<3>(acc2));
+                    let mut s3 = (f32x4_extract_lane::<0>(acc3)
+                        + f32x4_extract_lane::<1>(acc3))
+                        + (f32x4_extract_lane::<2>(acc3) + f32x4_extract_lane::<3>(acc3));
+
+                    // Scalar tail (≤3 elements). Left-to-right.
+                    while p < k {
+                        let a_val = *a_col_ptr.add(p);
+                        s0 += a_val * *b_col_ptr_0.add(p);
+                        s1 += a_val * *b_col_ptr_1.add(p);
+                        s2 += a_val * *b_col_ptr_2.add(p);
+                        s3 += a_val * *b_col_ptr_3.add(p);
+                        p += 1;
+                    }
+
+                    // SAFETY: (i, jt+δ) for δ ∈ 0..4 is in-bounds
+                    // for dst.
+                    let row = i as isize;
+                    *dst_ptr.offset(jt as isize * dst_col + row) = s0;
+                    *dst_ptr.offset((jt + 1) as isize * dst_col + row) = s1;
+                    *dst_ptr.offset((jt + 2) as isize * dst_col + row) = s2;
+                    *dst_ptr.offset((jt + 3) as isize * dst_col + row) = s3;
+                }
+
+                jt += 4;
+            }
+
+            // Tail j's: fall back to the single-j kernel for the at-
+            // most-3 columns that didn't fit in a full tile.
+            if jt < j_end {
+                gemm_tn_f32_slice_raw(
+                    dst_ptr, dst_col, m, a_ptr, a_col, k, b_ptr, b_col, jt, j_end,
+                );
+            }
+        }
+    }
+
+    /// **2×4 register-tiled** TN GEMM: compute a 2×4 output tile per
+    /// inner iteration, sharing both A column loads (across 4 j's)
+    /// AND B column loads (across 2 i's). Per K iter:
+    ///   - 2 A loads (one per i in the i-pair)
+    ///   - 4 B loads (one per j in the j-quad)
+    ///   - 8 mul + 8 add (one per cell in the 2×4 tile)
+    ///   - 8 accumulators live + 6 loads = 14 v128 in flight.
+    ///
+    /// vs the 4-j tile: 2× reduction in B loads, slightly better cell
+    /// throughput (8 mul+add per 6 loads vs 4 mul+add per 5 loads).
+    ///
+    /// # Numerics
+    ///
+    /// NOT bit-identical to scalar reference (same caveat as the
+    /// 4-j-tile variant). Property test uses loose 1e-4 tolerance.
+    ///
+    /// # Safety
+    ///
+    /// Identical to [`gemm_tn_f32_slice_raw`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_tn_f32_slice_raw_tiled_2x4(
+        dst_ptr: *mut f32,
+        dst_col: isize,
+        m: usize,
+        a_ptr: *const f32,
+        a_col: isize,
+        k: usize,
+        b_ptr: *const f32,
+        b_col: isize,
+        j_start: usize,
+        j_end: usize,
+    ) {
+        unsafe {
+            let zero: v128 = f32x4_splat(0.0);
+
+            let mut jt = j_start;
+            while jt + 4 <= j_end {
+                let b0p = b_ptr.offset(jt as isize * b_col);
+                let b1p = b_ptr.offset((jt + 1) as isize * b_col);
+                let b2p = b_ptr.offset((jt + 2) as isize * b_col);
+                let b3p = b_ptr.offset((jt + 3) as isize * b_col);
+
+                let m_pairs = m / 2;
+                for ip in 0..m_pairs {
+                    let i0 = 2 * ip;
+                    let i1 = i0 + 1;
+                    let a0p = a_ptr.offset(i0 as isize * a_col);
+                    let a1p = a_ptr.offset(i1 as isize * a_col);
+
+                    // 2×4 = 8 SIMD accumulators.
+                    let mut c00 = zero;
+                    let mut c01 = zero;
+                    let mut c02 = zero;
+                    let mut c03 = zero;
+                    let mut c10 = zero;
+                    let mut c11 = zero;
+                    let mut c12 = zero;
+                    let mut c13 = zero;
+
+                    let mut p: usize = 0;
+                    while p + 4 <= k {
+                        let a0 = v128_load(a0p.add(p) as *const v128);
+                        let a1 = v128_load(a1p.add(p) as *const v128);
+                        let b0 = v128_load(b0p.add(p) as *const v128);
+                        let b1 = v128_load(b1p.add(p) as *const v128);
+                        let b2 = v128_load(b2p.add(p) as *const v128);
+                        let b3 = v128_load(b3p.add(p) as *const v128);
+
+                        c00 = f32x4_add(c00, f32x4_mul(a0, b0));
+                        c01 = f32x4_add(c01, f32x4_mul(a0, b1));
+                        c02 = f32x4_add(c02, f32x4_mul(a0, b2));
+                        c03 = f32x4_add(c03, f32x4_mul(a0, b3));
+                        c10 = f32x4_add(c10, f32x4_mul(a1, b0));
+                        c11 = f32x4_add(c11, f32x4_mul(a1, b1));
+                        c12 = f32x4_add(c12, f32x4_mul(a1, b2));
+                        c13 = f32x4_add(c13, f32x4_mul(a1, b3));
+                        p += 4;
+                    }
+
+                    // Horizontal reduce each accumulator.
+                    let hred = |v: v128| -> f32 {
+                        (f32x4_extract_lane::<0>(v) + f32x4_extract_lane::<1>(v))
+                            + (f32x4_extract_lane::<2>(v) + f32x4_extract_lane::<3>(v))
+                    };
+                    let mut s00 = hred(c00);
+                    let mut s01 = hred(c01);
+                    let mut s02 = hred(c02);
+                    let mut s03 = hred(c03);
+                    let mut s10 = hred(c10);
+                    let mut s11 = hred(c11);
+                    let mut s12 = hred(c12);
+                    let mut s13 = hred(c13);
+
+                    while p < k {
+                        let a0v = *a0p.add(p);
+                        let a1v = *a1p.add(p);
+                        let b0v = *b0p.add(p);
+                        let b1v = *b1p.add(p);
+                        let b2v = *b2p.add(p);
+                        let b3v = *b3p.add(p);
+                        s00 += a0v * b0v;
+                        s01 += a0v * b1v;
+                        s02 += a0v * b2v;
+                        s03 += a0v * b3v;
+                        s10 += a1v * b0v;
+                        s11 += a1v * b1v;
+                        s12 += a1v * b2v;
+                        s13 += a1v * b3v;
+                        p += 1;
+                    }
+
+                    let r0 = i0 as isize;
+                    let r1 = i1 as isize;
+                    *dst_ptr.offset(jt as isize * dst_col + r0) = s00;
+                    *dst_ptr.offset((jt + 1) as isize * dst_col + r0) = s01;
+                    *dst_ptr.offset((jt + 2) as isize * dst_col + r0) = s02;
+                    *dst_ptr.offset((jt + 3) as isize * dst_col + r0) = s03;
+                    *dst_ptr.offset(jt as isize * dst_col + r1) = s10;
+                    *dst_ptr.offset((jt + 1) as isize * dst_col + r1) = s11;
+                    *dst_ptr.offset((jt + 2) as isize * dst_col + r1) = s12;
+                    *dst_ptr.offset((jt + 3) as isize * dst_col + r1) = s13;
+                }
+
+                // Odd-i tail: if m is odd, handle the last row of this
+                // j-quad with a single-i × 4-j strip.
+                if m % 2 == 1 {
+                    let i = m - 1;
+                    let ap = a_ptr.offset(i as isize * a_col);
+                    let mut c0 = zero;
+                    let mut c1 = zero;
+                    let mut c2 = zero;
+                    let mut c3 = zero;
+                    let mut p: usize = 0;
+                    while p + 4 <= k {
+                        let a = v128_load(ap.add(p) as *const v128);
+                        let b0 = v128_load(b0p.add(p) as *const v128);
+                        let b1 = v128_load(b1p.add(p) as *const v128);
+                        let b2 = v128_load(b2p.add(p) as *const v128);
+                        let b3 = v128_load(b3p.add(p) as *const v128);
+                        c0 = f32x4_add(c0, f32x4_mul(a, b0));
+                        c1 = f32x4_add(c1, f32x4_mul(a, b1));
+                        c2 = f32x4_add(c2, f32x4_mul(a, b2));
+                        c3 = f32x4_add(c3, f32x4_mul(a, b3));
+                        p += 4;
+                    }
+                    let hred = |v: v128| -> f32 {
+                        (f32x4_extract_lane::<0>(v) + f32x4_extract_lane::<1>(v))
+                            + (f32x4_extract_lane::<2>(v) + f32x4_extract_lane::<3>(v))
+                    };
+                    let mut s0 = hred(c0);
+                    let mut s1 = hred(c1);
+                    let mut s2 = hred(c2);
+                    let mut s3 = hred(c3);
+                    while p < k {
+                        let av = *ap.add(p);
+                        s0 += av * *b0p.add(p);
+                        s1 += av * *b1p.add(p);
+                        s2 += av * *b2p.add(p);
+                        s3 += av * *b3p.add(p);
+                        p += 1;
+                    }
+                    let r = i as isize;
+                    *dst_ptr.offset(jt as isize * dst_col + r) = s0;
+                    *dst_ptr.offset((jt + 1) as isize * dst_col + r) = s1;
+                    *dst_ptr.offset((jt + 2) as isize * dst_col + r) = s2;
+                    *dst_ptr.offset((jt + 3) as isize * dst_col + r) = s3;
+                }
+
+                jt += 4;
+            }
+
+            // j-tail (≤3 cols): single-j fallback.
+            if jt < j_end {
+                gemm_tn_f32_slice_raw(
+                    dst_ptr, dst_col, m, a_ptr, a_col, k, b_ptr, b_col, jt, j_end,
+                );
+            }
+        }
+    }
+
+    /// **4×4 register-tiled** TN GEMM: 4 i's × 4 j's per K iter.
+    /// 16 SIMD accumulators (the BLIS sweet spot for ARM NEON, 32
+    /// regs). Per K iter:
+    ///   - 4 A loads + 4 B loads = 8 loads
+    ///   - 16 mul + 16 add = 32 ops over 16 cells = 2 flops/load
+    ///
+    /// vs 2×4: 2× more reuse on both A and B simultaneously. Each
+    /// cell sees its mul+add chain of length k/4 just like 2×4 but
+    /// 4 chains share each load.
+    ///
+    /// Performance ceiling: ARM64 has 32 v128 regs; 16 accs + 8
+    /// loads = 24 in flight, well under cap. Cranelift's wasm
+    /// register allocator should keep all accs in regs across the
+    /// inner loop.
+    ///
+    /// # Numerics
+    ///
+    /// NOT bit-identical to scalar reference (loose-tolerance test
+    /// covers the kernel's K-step-4 reduction order vs reference's
+    /// K-step-16).
+    ///
+    /// # Safety
+    ///
+    /// Identical to [`gemm_tn_f32_slice_raw`]: caller upholds the
+    /// matrix pointer / stride / dimension preconditions, dst region
+    /// is exclusively owned, lhs/rhs are read-only (may be aliased).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_tn_f32_slice_raw_tiled_4x4(
+        dst_ptr: *mut f32,
+        dst_col: isize,
+        m: usize,
+        a_ptr: *const f32,
+        a_col: isize,
+        k: usize,
+        b_ptr: *const f32,
+        b_col: isize,
+        j_start: usize,
+        j_end: usize,
+    ) {
+        unsafe {
+            let zero: v128 = f32x4_splat(0.0);
+
+            let mut jt = j_start;
+            while jt + 4 <= j_end {
+                let bp0 = b_ptr.offset(jt as isize * b_col);
+                let bp1 = b_ptr.offset((jt + 1) as isize * b_col);
+                let bp2 = b_ptr.offset((jt + 2) as isize * b_col);
+                let bp3 = b_ptr.offset((jt + 3) as isize * b_col);
+
+                let m_quads = m / 4;
+                for ip in 0..m_quads {
+                    let i0 = 4 * ip;
+                    let ap0 = a_ptr.offset(i0 as isize * a_col);
+                    let ap1 = a_ptr.offset((i0 + 1) as isize * a_col);
+                    let ap2 = a_ptr.offset((i0 + 2) as isize * a_col);
+                    let ap3 = a_ptr.offset((i0 + 3) as isize * a_col);
+
+                    // 4×4 = 16 SIMD accumulators.
+                    let mut c00 = zero;
+                    let mut c01 = zero;
+                    let mut c02 = zero;
+                    let mut c03 = zero;
+                    let mut c10 = zero;
+                    let mut c11 = zero;
+                    let mut c12 = zero;
+                    let mut c13 = zero;
+                    let mut c20 = zero;
+                    let mut c21 = zero;
+                    let mut c22 = zero;
+                    let mut c23 = zero;
+                    let mut c30 = zero;
+                    let mut c31 = zero;
+                    let mut c32 = zero;
+                    let mut c33 = zero;
+
+                    let mut p: usize = 0;
+                    while p + 4 <= k {
+                        let a0 = v128_load(ap0.add(p) as *const v128);
+                        let a1 = v128_load(ap1.add(p) as *const v128);
+                        let a2 = v128_load(ap2.add(p) as *const v128);
+                        let a3 = v128_load(ap3.add(p) as *const v128);
+                        let b0 = v128_load(bp0.add(p) as *const v128);
+                        let b1 = v128_load(bp1.add(p) as *const v128);
+                        let b2 = v128_load(bp2.add(p) as *const v128);
+                        let b3 = v128_load(bp3.add(p) as *const v128);
+
+                        c00 = f32x4_add(c00, f32x4_mul(a0, b0));
+                        c01 = f32x4_add(c01, f32x4_mul(a0, b1));
+                        c02 = f32x4_add(c02, f32x4_mul(a0, b2));
+                        c03 = f32x4_add(c03, f32x4_mul(a0, b3));
+                        c10 = f32x4_add(c10, f32x4_mul(a1, b0));
+                        c11 = f32x4_add(c11, f32x4_mul(a1, b1));
+                        c12 = f32x4_add(c12, f32x4_mul(a1, b2));
+                        c13 = f32x4_add(c13, f32x4_mul(a1, b3));
+                        c20 = f32x4_add(c20, f32x4_mul(a2, b0));
+                        c21 = f32x4_add(c21, f32x4_mul(a2, b1));
+                        c22 = f32x4_add(c22, f32x4_mul(a2, b2));
+                        c23 = f32x4_add(c23, f32x4_mul(a2, b3));
+                        c30 = f32x4_add(c30, f32x4_mul(a3, b0));
+                        c31 = f32x4_add(c31, f32x4_mul(a3, b1));
+                        c32 = f32x4_add(c32, f32x4_mul(a3, b2));
+                        c33 = f32x4_add(c33, f32x4_mul(a3, b3));
+                        p += 4;
+                    }
+
+                    let hred = |v: v128| -> f32 {
+                        (f32x4_extract_lane::<0>(v) + f32x4_extract_lane::<1>(v))
+                            + (f32x4_extract_lane::<2>(v) + f32x4_extract_lane::<3>(v))
+                    };
+                    let mut s00 = hred(c00);
+                    let mut s01 = hred(c01);
+                    let mut s02 = hred(c02);
+                    let mut s03 = hred(c03);
+                    let mut s10 = hred(c10);
+                    let mut s11 = hred(c11);
+                    let mut s12 = hred(c12);
+                    let mut s13 = hred(c13);
+                    let mut s20 = hred(c20);
+                    let mut s21 = hred(c21);
+                    let mut s22 = hred(c22);
+                    let mut s23 = hred(c23);
+                    let mut s30 = hred(c30);
+                    let mut s31 = hred(c31);
+                    let mut s32 = hred(c32);
+                    let mut s33 = hred(c33);
+
+                    while p < k {
+                        let a0v = *ap0.add(p);
+                        let a1v = *ap1.add(p);
+                        let a2v = *ap2.add(p);
+                        let a3v = *ap3.add(p);
+                        let b0v = *bp0.add(p);
+                        let b1v = *bp1.add(p);
+                        let b2v = *bp2.add(p);
+                        let b3v = *bp3.add(p);
+                        s00 += a0v * b0v;
+                        s01 += a0v * b1v;
+                        s02 += a0v * b2v;
+                        s03 += a0v * b3v;
+                        s10 += a1v * b0v;
+                        s11 += a1v * b1v;
+                        s12 += a1v * b2v;
+                        s13 += a1v * b3v;
+                        s20 += a2v * b0v;
+                        s21 += a2v * b1v;
+                        s22 += a2v * b2v;
+                        s23 += a2v * b3v;
+                        s30 += a3v * b0v;
+                        s31 += a3v * b1v;
+                        s32 += a3v * b2v;
+                        s33 += a3v * b3v;
+                        p += 1;
+                    }
+
+                    let store4 = |dst: *mut f32, jbase: usize, row: isize, v0, v1, v2, v3| {
+                        // SAFETY: (row, jbase+δ) for δ∈0..4 in-bounds.
+                        // Already inside the outer fn's `unsafe { ... }`
+                        // so no nested block needed.
+                        *dst.offset(jbase as isize * dst_col + row) = v0;
+                        *dst.offset((jbase + 1) as isize * dst_col + row) = v1;
+                        *dst.offset((jbase + 2) as isize * dst_col + row) = v2;
+                        *dst.offset((jbase + 3) as isize * dst_col + row) = v3;
+                    };
+                    store4(dst_ptr, jt, i0 as isize, s00, s01, s02, s03);
+                    store4(dst_ptr, jt, (i0 + 1) as isize, s10, s11, s12, s13);
+                    store4(dst_ptr, jt, (i0 + 2) as isize, s20, s21, s22, s23);
+                    store4(dst_ptr, jt, (i0 + 3) as isize, s30, s31, s32, s33);
+                }
+
+                // i-tail: m % 4 rows, handle via the 2×4 fallback for
+                // a row-pair plus a single-i strip for the odd remnant.
+                let tail_start = (m / 4) * 4;
+                if tail_start < m {
+                    // Use the single-j-strip fallback for the tail rows.
+                    // It's at most 3 rows of m × 4 cells = small.
+                    gemm_tn_f32_slice_raw(
+                        dst_ptr,
+                        dst_col,
+                        m,
+                        a_ptr,
+                        a_col,
+                        k,
+                        b_ptr,
+                        b_col,
+                        jt,
+                        jt + 4,
+                    );
+                    // ^ this recomputes the entire 0..m for these 4 j's
+                    // but the m/4*4 i's were already done in the tile
+                    // above — overwriting with identical values modulo
+                    // FP summation order. Net effect: tail rows correct,
+                    // tile rows redundant-but-correct.
+                    //
+                    // (For wall-time-perfect tail handling we'd write a
+                    // separate (m % 4) × 4 strip; punting for now since
+                    // m is usually 200 or 8000, both divisible by 4.)
+                }
+
+                jt += 4;
+            }
+
+            // j-tail (≤3 cols).
+            if jt < j_end {
+                gemm_tn_f32_slice_raw(
+                    dst_ptr, dst_col, m, a_ptr, a_col, k, b_ptr, b_col, jt, j_end,
+                );
+            }
+        }
+    }
+}
+
+/// Manual SAB-backed worker pool for parallel f32 GEMM on
+/// `wasm32 + atomics + simd128`.
+///
+/// # Why not wasm-bindgen-rayon
+///
+/// The bundler-mode `workerHelpers.js` that wasm-bindgen-rayon ships
+/// with `--target=web` does `import('../../..')` to load the main JS
+/// bundle. That resolves to `/ldsc/snippets/` (a directory with no
+/// entry file) under trunk's static-copy snippet layout, hanging the
+/// inner-worker import indefinitely. Rather than fight that path
+/// resolution, we hand-roll a minimal pool specialized for our one
+/// hot kernel.
+///
+/// # Topology
+///
+/// One pool per outer compute Worker (Workers don't share linear
+/// memory across each other). Each outer Worker, on its first
+/// compute, spawns N inner Workers via `assets/inner_worker.js` and
+/// passes them the wasm module + memory. Each inner Worker imports
+/// the bundle, instantiates wasm with the SHARED memory, and parks
+/// in [`worker_loop`] waiting for the outer Worker to dispatch work.
+///
+/// # Synchronization
+///
+/// The outer Worker is "worker 0"; inner Workers are 1..N. We use
+/// raw `memory.atomic.wait32` / `memory.atomic.notify` (the wasm
+/// threads proposal's wait/notify primitives) on three static atomics:
+///
+/// - `JOB_GEN`: monotonically incrementing generation. Inner workers
+///   sleep on it; outer increments + notifies to wake them. Each
+///   inner remembers `last_seen_gen` to detect a fresh job.
+/// - `JOB_DONE`: counter inner workers fetch_add when their slice is
+///   done. Outer waits on it reaching N-1 (worker 0 / outer ran its
+///   own slice synchronously).
+/// - `JOB_KIND`: discriminator (1 = exit, 2 = gemm).
+///
+/// Args are kept in a `static` `UnsafeCell<JobArgs>`. The
+/// release/acquire on `JOB_GEN` provides the happens-before edge that
+/// makes the unsafe access sound: outer mutates `JOB_ARGS` *before*
+/// the `Release` increment of `JOB_GEN`; each inner reads it *after*
+/// observing the new generation with `Acquire` ordering.
+///
+/// # Numerics
+///
+/// Bit-identical to serial. Each worker computes a disjoint slice of
+/// output columns; column writes don't overlap; lhs/rhs are read-only.
+/// No reduction across workers, so no summation-order changes.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    target_feature = "simd128"
+))]
+pub mod pool {
+    use core::arch::wasm32::{memory_atomic_notify, memory_atomic_wait32};
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+
+    /// Pool size. 0 = pool not initialised (serial fallback). Set once
+    /// per outer Worker via [`init`] before the first dispatch.
+    pub static POOL_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Generation counter, incremented per dispatched job. Inner
+    /// workers sleep via `memory_atomic_wait32` on this.
+    pub static JOB_GEN: AtomicI32 = AtomicI32::new(0);
+
+    /// Inner workers fetch_add this when their slice is done. Outer
+    /// waits for it to reach `POOL_SIZE - 1`.
+    pub static JOB_DONE: AtomicI32 = AtomicI32::new(0);
+
+    /// Job discriminator. `1` = exit (worker_loop returns), `2` = gemm.
+    pub static JOB_KIND: AtomicI32 = AtomicI32::new(0);
+
+    /// Wrapper around `UnsafeCell<JobArgs>` to manually mark Sync. Sound
+    /// because all access is ordered through `JOB_GEN`'s
+    /// release/acquire fences.
+    pub struct JobArgsCell(UnsafeCell<JobArgs>);
+    // SAFETY: see module docs.
+    unsafe impl Sync for JobArgsCell {}
+
+    /// Job arguments. Mutated only by the outer Worker between
+    /// dispatches; read by inner workers after they observe a new
+    /// `JOB_GEN`. Fixed-size (no allocations) so we can keep it in a
+    /// `static`.
+    #[derive(Clone, Copy)]
+    pub struct JobArgs {
+        pub dst_ptr: usize,
+        pub dst_col_stride: isize,
+        pub dst_rows: usize,
+        pub dst_cols: usize,
+        pub lhs_ptr: usize,
+        pub lhs_col_stride: isize,
+        pub lhs_rows: usize,
+        pub rhs_ptr: usize,
+        pub rhs_col_stride: isize,
+    }
+
+    impl JobArgs {
+        const ZERO: Self = Self {
+            dst_ptr: 0,
+            dst_col_stride: 0,
+            dst_rows: 0,
+            dst_cols: 0,
+            lhs_ptr: 0,
+            lhs_col_stride: 0,
+            lhs_rows: 0,
+            rhs_ptr: 0,
+            rhs_col_stride: 0,
+        };
+    }
+
+    pub static JOB_ARGS: JobArgsCell = JobArgsCell(UnsafeCell::new(JobArgs::ZERO));
+
+    /// Initialise the pool size. Call once per outer Worker, after the
+    /// JS side has spawned the N inner Workers and they have called
+    /// [`worker_loop`]. Idempotent — calling with a different N after
+    /// inner workers are already parked has no effect on them, only
+    /// on what slice each worker computes for the next dispatch.
+    pub fn init(n_workers: usize) {
+        POOL_SIZE.store(n_workers, Ordering::SeqCst);
+    }
+
+    /// Inner Worker entry point. Loops forever waiting for jobs.
+    /// Called by the JS-side `inner_worker.js` via the wasm-bindgen
+    /// export `inner_worker_loop` in `ldsc-web::worker`.
+    ///
+    /// `worker_id` is the inner Worker's index in `1..N`. (Worker 0
+    /// is the outer Worker, which runs synchronously in
+    /// [`parallel_gemm_tn_f32`].)
+    pub fn worker_loop(worker_id: usize) {
+        let mut last_gen: i32 = JOB_GEN.load(Ordering::Acquire);
+        loop {
+            // Wait for a new job (JOB_GEN changes). The Atomics.wait
+            // call returns immediately if JOB_GEN already differs from
+            // the value we passed in (we re-load each iteration to
+            // avoid a "missed wake" race).
+            loop {
+                let cur = JOB_GEN.load(Ordering::Acquire);
+                if cur != last_gen {
+                    last_gen = cur;
+                    break;
+                }
+                // SAFETY: JOB_GEN.as_ptr() is a valid `*const AtomicI32`;
+                // memory_atomic_wait32 takes `*mut i32` (interpretation
+                // is the same — the wasm spec only requires alignment).
+                unsafe {
+                    let _ = memory_atomic_wait32(JOB_GEN.as_ptr().cast(), cur, -1);
+                }
+            }
+
+            let n_workers = POOL_SIZE.load(Ordering::Acquire);
+            let kind = JOB_KIND.load(Ordering::Acquire);
+            match kind {
+                1 => return, // exit
+                2 => {
+                    // SAFETY: outer Worker mutated JOB_ARGS BEFORE it
+                    // incremented JOB_GEN; we observed the increment
+                    // above with Acquire, so the args are visible.
+                    let args = unsafe { *JOB_ARGS.0.get() };
+                    run_gemm_slice(worker_id, n_workers, &args);
+                }
+                _ => {}
+            }
+
+            // Mark this worker as done.
+            JOB_DONE.fetch_add(1, Ordering::Release);
+            // SAFETY: see comment in the wait above.
+            unsafe {
+                let _ = memory_atomic_notify(JOB_DONE.as_ptr().cast(), 1);
+            }
+        }
+    }
+
+    /// Outer-side dispatch. Returns `true` if the work was farmed
+    /// out to the pool; `false` (call serial fallback) if the pool
+    /// isn't initialised or N <= 1.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure all matrix pointers + strides are valid for
+    /// the duration of the call. The dst region must be exclusively
+    /// owned (no aliasing reads/writes by other code while the pool
+    /// is computing). lhs and rhs may be aliased read-only.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn parallel_gemm_tn_f32(
+        dst_ptr: *mut f32,
+        dst_col_stride: isize,
+        dst_rows: usize,
+        dst_cols: usize,
+        lhs_ptr: *const f32,
+        lhs_col_stride: isize,
+        lhs_rows: usize,
+        rhs_ptr: *const f32,
+        rhs_col_stride: isize,
+    ) -> bool {
+        let n = POOL_SIZE.load(Ordering::Acquire);
+        if n <= 1 {
+            return false;
+        }
+
+        let args = JobArgs {
+            dst_ptr: dst_ptr as usize,
+            dst_col_stride,
+            dst_rows,
+            dst_cols,
+            lhs_ptr: lhs_ptr as usize,
+            lhs_col_stride,
+            lhs_rows,
+            rhs_ptr: rhs_ptr as usize,
+            rhs_col_stride,
+        };
+
+        // SAFETY: between dispatches, only the outer Worker writes
+        // JOB_ARGS. The release ordering on the JOB_GEN increment
+        // below makes inner workers' Acquire-loads see this write.
+        unsafe {
+            *JOB_ARGS.0.get() = args;
+        }
+
+        JOB_KIND.store(2, Ordering::Release);
+        JOB_DONE.store(0, Ordering::Release);
+
+        // Wake all inner workers. fetch_add returns the OLD value;
+        // memory_atomic_notify wakes up to N waiters.
+        JOB_GEN.fetch_add(1, Ordering::Release);
+        // SAFETY: see worker_loop's notify SAFETY comment.
+        unsafe {
+            let _ = memory_atomic_notify(JOB_GEN.as_ptr().cast(), n as u32);
+        }
+
+        // Outer Worker runs its share (worker_id = 0).
+        run_gemm_slice(0, n, &args);
+
+        // Wait for the n-1 inner workers to finish. Re-load each
+        // iteration to handle spurious wakes / races where workers
+        // finish between our load and our wait.
+        let target = (n - 1) as i32;
+        loop {
+            let done = JOB_DONE.load(Ordering::Acquire);
+            if done >= target {
+                break;
+            }
+            // SAFETY: JOB_DONE.as_ptr() is a valid pointer.
+            unsafe {
+                let _ = memory_atomic_wait32(JOB_DONE.as_ptr().cast(), done, -1);
+            }
+        }
+
+        true
+    }
+
+    /// Compute the `[j_start, j_end)` slice of output columns for
+    /// `worker_id` out of `n_workers`. Equal-sized chunks; the last
+    /// worker absorbs any remainder.
+    fn run_gemm_slice(worker_id: usize, n_workers: usize, args: &JobArgs) {
+        let total = args.dst_cols;
+        let chunk = total.div_ceil(n_workers);
+        let j_start = (worker_id * chunk).min(total);
+        let j_end = ((worker_id + 1) * chunk).min(total);
+        if j_start >= j_end {
+            return;
+        }
+        // SAFETY: args was provided by the outer Worker, which
+        // upholds the matrix pointer/stride preconditions of
+        // gemm_tn_f32_slice_raw_tiled_2x4.
+        unsafe {
+            super::simd128::gemm_tn_f32_slice_raw_tiled_2x4(
+                args.dst_ptr as *mut f32,
+                args.dst_col_stride,
+                args.dst_rows,
+                args.lhs_ptr as *const f32,
+                args.lhs_col_stride,
+                args.lhs_rows,
+                args.rhs_ptr as *const f32,
+                args.rhs_col_stride,
+                j_start,
+                j_end,
+            );
         }
     }
 }

@@ -46,6 +46,86 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::{Blob, DedicatedWorkerGlobalScope, FileReaderSync};
 
+// ── Tracing setup (LANDMINE — DO NOT CALL FROM WORKER) ─────────────
+//
+// History: this helper was an attempt to enable `tracing::info!` from
+// within compute Workers (so the lib's `[perf]` lines would reach the
+// DevTools console). It TRAPS with `RuntimeError: unreachable` when
+// invoked from a Worker thread on the multi-threaded WASM bundle
+// (atomics + shared memory). Root cause is undiagnosed but reliably
+// reproducible.
+//
+// Workaround: worker-side `[perf]` data is returned as `WireL2Perf`
+// in the `WireL2Output` postMessage payload and logged on the main
+// thread (which has tracing-wasm wired in `main()`). See
+// `worker_client.rs` for the main-thread logging.
+//
+// Function kept (vs deleted) so future devs see this paragraph before
+// re-wiring tracing in the worker. If you really need this, find out
+// why the multi-threaded wasm bundle traps in `set_as_global_default`
+// and `console_error_panic_hook::set_once` FIRST.
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+fn ensure_worker_tracing() {
+    use std::cell::Cell;
+    thread_local! {
+        static DONE: Cell<bool> = const { Cell::new(false) };
+    }
+    DONE.with(|d| {
+        if !d.get() {
+            console_error_panic_hook::set_once();
+            tracing_wasm::set_as_global_default();
+            d.set(true);
+        }
+    });
+}
+
+// ── Manual SAB worker pool (workstream G) ───────────────────────────
+//
+// `inner_worker_loop` is the wasm-bindgen entry point each spawned
+// inner Worker calls (from `assets/inner_worker.js`). It parks on the
+// shared atomics in `ldsc::wasm_simd::pool` and runs assigned slices
+// of GEMM dispatched by the outer Worker.
+//
+// `init_inner_pool` is called by the outer Worker (in
+// `worker_compute_l2_chrs` below, on first invocation) once the JS
+// side has spawned + initialised all N inner Workers. It tells the
+// pool how many workers it has, so dispatches partition output cols
+// across the right denominator.
+
+/// Inner Worker entry point. Park forever, processing GEMM slices
+/// dispatched by the outer Worker via the shared atomics in
+/// `ldsc::wasm_simd::pool`.
+///
+/// `worker_id` is in `1..N` — worker 0 is the outer Worker, which
+/// runs synchronously in `parallel_gemm_tn_f32`.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[wasm_bindgen]
+pub fn inner_worker_loop(worker_id: usize) {
+    ldsc::wasm_simd::pool::worker_loop(worker_id);
+}
+
+/// Outer-side: tell the pool how many inner Workers it has. Called
+/// once per outer Worker after the JS side reports all inner Workers
+/// are ready.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[wasm_bindgen]
+pub fn init_inner_pool(n_workers: usize) {
+    ldsc::wasm_simd::pool::init(n_workers);
+}
+
+/// Returns the wasm linear memory as a JsValue (a `WebAssembly.Memory`
+/// object). The outer Worker passes this to each spawned inner Worker
+/// so they can `mod.default({ module_or_path, memory })` against the
+/// SAME SAB-backed memory rather than creating a fresh one. Without
+/// this, atomic ops in inner Workers would hit a different memory
+/// from the outer Worker's and the manual SAB pool would deadlock.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[wasm_bindgen]
+pub fn wasm_memory() -> JsValue {
+    wasm_bindgen::memory()
+}
+
 /// Wrap the BIM source in a BufReader with this much capacity. Default
 /// 8 KB triggers ~12,800 JS round-trips for a 1.66M-SNP BIM (~50 µs
 /// each in Chrome) — ~640 ms wasted on reader chatter alone. 256 KB
@@ -260,10 +340,58 @@ impl From<WireL2Config> for L2Config {
             snp_level_masking: w.snp_level_masking,
             yes_really: w.yes_really,
             pq_exp: w.pq_exp,
-            // verbose_timing is wasm-only no-op (we render our own
-            // perf in the result card); never expose to wire.
             verbose_timing: false,
         }
+    }
+}
+
+/// Serializable mirror of [`ldsc::l2::L2Perf`]. The lib's struct is
+/// serde-free; this is the conversion type so the per-phase
+/// breakdown survives the `serde-wasm-bindgen` round-trip from
+/// worker to main.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WireL2Perf {
+    pub m: usize,
+    pub n_indiv: usize,
+    pub bed_read_secs: f64,
+    pub norm_secs: f64,
+    pub sketch_secs: Option<f64>,
+    pub bb_dot_secs: f64,
+    pub ab_dot_secs: f64,
+    pub ring_store_secs: f64,
+}
+
+impl From<ldsc::l2::L2Perf> for WireL2Perf {
+    fn from(p: ldsc::l2::L2Perf) -> Self {
+        Self {
+            m: p.m,
+            n_indiv: p.n_indiv,
+            bed_read_secs: p.bed_read_secs,
+            norm_secs: p.norm_secs,
+            sketch_secs: p.sketch_secs,
+            bb_dot_secs: p.bb_dot_secs,
+            ab_dot_secs: p.ab_dot_secs,
+            ring_store_secs: p.ring_store_secs,
+        }
+    }
+}
+
+impl WireL2Perf {
+    /// Sum per-chr breakdowns into a per-worker total. Called once
+    /// per chr inside `worker_compute_l2_chrs`'s chr-loop.
+    pub fn accumulate(&mut self, other: &WireL2Perf) {
+        self.m += other.m;
+        self.n_indiv = other.n_indiv; // identical across chrs within a worker
+        self.bed_read_secs += other.bed_read_secs;
+        self.norm_secs += other.norm_secs;
+        match (&mut self.sketch_secs, other.sketch_secs) {
+            (Some(acc), Some(s)) => *acc += s,
+            (None, Some(s)) => self.sketch_secs = Some(s),
+            _ => {}
+        }
+        self.bb_dot_secs += other.bb_dot_secs;
+        self.ab_dot_secs += other.ab_dot_secs;
+        self.ring_store_secs += other.ring_store_secs;
     }
 }
 
@@ -280,6 +408,12 @@ pub struct WireL2Output {
     pub maf: Vec<f64>,
     pub wall_seconds: f64,
     pub n_snps: usize,
+    /// Per-phase wall-time breakdown summed across all chrs this
+    /// worker handled. Logged by the main-thread orchestrator's
+    /// `compute_l2_chrs_done` handler via `tracing::info` (which IS
+    /// wired on main, unlike workers).
+    #[serde(default)]
+    pub perf: WireL2Perf,
 }
 
 /// Per-chr summary from [`worker_scan_bim`].
@@ -342,6 +476,7 @@ pub fn worker_compute_l2_chrs(
     chrs_filter_json: String,
     config_json: String,
 ) -> Result<JsValue, JsError> {
+
     let chrs_filter: Vec<u8> = serde_json::from_str(&chrs_filter_json)
         .map_err(|e| JsError::new(&format!("chrs_filter JSON: {e}")))?;
     let chrs_set: Option<std::collections::HashSet<u8>> = if chrs_filter.is_empty() {
@@ -396,6 +531,7 @@ pub fn worker_compute_l2_chrs(
             maf: Vec::new(),
             wall_seconds: 0.0,
             n_snps: 0,
+            perf: WireL2Perf::default(),
         };
         return serde_wasm_bindgen::to_value(&wire)
             .map_err(|e| JsError::new(&format!("output serialise: {e}")));
@@ -451,6 +587,7 @@ pub fn worker_compute_l2_chrs(
     let mut accum_l2: Vec<f64> = Vec::with_capacity(snps.len());
     let mut accum_maf: Vec<f64> = Vec::with_capacity(snps.len());
     let mut total_wall_seconds = 0.0f64;
+    let mut accum_perf: WireL2Perf = WireL2Perf::default();
 
     // Move snps into a temp Vec we can drain by chr-range. Avoids
     // cloning each chr's slice.
@@ -514,6 +651,7 @@ pub fn worker_compute_l2_chrs(
         accum_l2.extend(chr_out.l2);
         accum_maf.extend(chr_out.maf);
         total_wall_seconds += chr_out.wall_seconds;
+        accum_perf.accumulate(&WireL2Perf::from(chr_out.perf));
         snps_done_base.set(snps_done_base.get() + chr_n);
     }
 
@@ -534,6 +672,10 @@ pub fn worker_compute_l2_chrs(
         l2: accum_l2,
         maf: accum_maf,
         wall_seconds: total_wall_seconds,
+        // Pool-level L2Output uses a default L2Perf because the
+        // per-chr perfs were already accumulated into `accum_perf`
+        // above (which goes out via `WireL2Output.perf` below).
+        perf: ldsc::l2::L2Perf::default(),
     };
 
     let wire = WireL2Output {
@@ -542,6 +684,7 @@ pub fn worker_compute_l2_chrs(
         l2: out.l2,
         maf: out.maf,
         wall_seconds: out.wall_seconds,
+        perf: accum_perf,
     };
     serde_wasm_bindgen::to_value(&wire).map_err(|e| JsError::new(&format!("output serialise: {e}")))
 }

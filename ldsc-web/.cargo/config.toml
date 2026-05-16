@@ -1,27 +1,110 @@
-# Enable wasm32-simd128 for the in-browser ldsc-web build.
+# Multi-threaded WASM build config for ldsc-web (workstream G).
 #
-# This config is discovered by trunk (which runs `cargo build` from
-# `ldsc-web/`, the directory containing Trunk.toml) and by manual
-# `cd ldsc-web && cargo build --target wasm32-unknown-unknown`. Cargo
-# also walks upward and merges the workspace root's `.cargo/config.toml`,
-# whose existing AVX2/FMA flags are scoped to x86_64 targets and so do
-# not interact with this section.
+# Discovery: trunk runs `cargo build` from `ldsc-web/` (the directory
+# containing Trunk.toml) and so finds this config. Cargo also walks
+# upward and merges the workspace-root `.cargo/config.toml`, whose
+# existing AVX2/FMA flags are scoped to x86_64 targets and so do not
+# interact with this section. Manual `cd ldsc-web && cargo build` also
+# works. Manual `cd <root> && cargo build -p ldsc-web` does NOT pick
+# this up — use trunk or `cd ldsc-web` for the wasm build.
 #
-# `+simd128` enables the v128 instruction set for wasm32-unknown-unknown
-# (Chrome 91+, Firefox 89+, Safari 16.4+, Node 16+). Our hand-rolled
-# GEMM microkernel in `crate::wasm_simd::simd128` requires this feature
-# to compile. The dispatch in `crate::la::matmul_tn_to_f32` is gated on
-# `cfg(all(target_arch = "wasm32", target_feature = "simd128"))`, so
-# without this flag the wasm build silently falls back to faer's scalar
-# GEMM (which is correct but ~30-50× slower than native).
+# # Target features
 #
-# We do NOT use `+relaxed-simd` (gives FMA but introduces 1 ULP
-# nondeterminism, breaking browser-vs-CLI bit-identity); see workstream
-# F's "out of scope" notes in the plan file.
+# - `+simd128`: v128 / f32x4 instruction set. Required by our hand-
+#   rolled GEMM microkernel in `crate::wasm_simd::simd128`. (Chrome
+#   91+, Firefox 89+, Safari 16.4+, Node 16+.)
 #
-# We do NOT use `+atomics`/`+bulk-memory`/`+mutable-globals` here. Those
-# are required for `wasm-bindgen-rayon` (workstream G) and would force
-# a nightly toolchain plus `-Zbuild-std`. F is independent of G.
+# - `+atomics`: `i32.atomic.*` instruction set. Required by
+#   `wasm-bindgen-rayon` for the SAB-backed thread pool's
+#   synchronisation primitives.
+#
+# - `+bulk-memory`: `memory.fill`, `memory.copy`. Used by atomics-
+#   enabled std builds (some std intrinsics rely on bulk-memory ops).
+#
+# We do NOT use `+mutable-globals` explicitly — it's implied by
+# +atomics on modern rustc/llvm and doesn't need to be listed.
+#
+# We do NOT use `+relaxed-simd` (would give FMA but breaks browser-
+# vs-CLI bit-identity due to 1 ULP nondeterminism).
+#
+# # Link args (multi-threaded WASM specifically)
+#
+# - `--shared-memory`: emit the wasm `(memory ... shared)` declaration
+#   so the linear memory is constructed as a SharedArrayBuffer and can
+#   be sent across the postMessage boundary to nested rayon Workers.
+#
+# - `--max-memory=4294967296` (4 GB): ceiling for `memory.grow`. The
+#   wasm-bindgen-rayon README's example uses 1 GB, but biobank-scale
+#   compute (chunk + L2 array + ring buffer) needs ~120 MB per outer
+#   worker today and we want headroom for h2/rg in the future. 4 GB
+#   matches the wasm32-unknown-unknown architectural maximum.
+#
+# - `--import-memory`: required when `--shared-memory` is set. The
+#   memory is created on the JS side (by wasm-bindgen-rayon's glue)
+#   and imported into the wasm instance, rather than declared by wasm
+#   itself. This lets the wasm-bindgen-rayon JS glue construct the
+#   memory with `{shared: true, maximum: ...}` and pass it to all
+#   workers in the pool.
+#
+# - `--export=__wasm_init_tls` / `--export=__tls_size` /
+#   `--export=__tls_align` / `--export=__tls_base`: thread-local
+#   storage hooks that wasm-bindgen-rayon's worker bootstrap calls to
+#   initialise per-thread state on each spawned Worker.
+#
+# # `[unstable] build-std`
+#
+# Rebuild std with the +atomics target feature. The precompiled
+# wasm32-unknown-unknown std doesn't include atomics support
+# (rustup's policy is "maximum portability" which means
+# single-threaded). Without this, `std::sync::Mutex` etc. compile to
+# stubs that panic at runtime when used by rayon. Requires
+# `rust-src` component (pinned in `rust-toolchain.toml`) and the
+# nightly toolchain (also pinned there).
 
 [target.wasm32-unknown-unknown]
-rustflags = ["-C", "target-feature=+simd128"]
+# Why these link-args (in addition to +atomics,+bulk-memory):
+#
+#   --shared-memory       — emit `(memory ... shared)` so the wasm
+#                           linear memory can be a SharedArrayBuffer.
+#                           Without this, runtime atomic ops crash with
+#                           `[object Int32Array] is not a shared typed
+#                           array` when the std lib lowers e.g.
+#                           `Atomics.waitAsync` on its parking-lot.
+#   --import-memory       — required by lld when `--shared-memory` is
+#                           set. Memory is created on the JS side
+#                           (wasm-bindgen-rayon's glue, or our
+#                           worker.js) with `{shared: true, maximum: ...}`
+#                           and imported into the wasm instance.
+#   --max-memory=4 GB     — ceiling for memory.grow. wasm-bindgen-rayon's
+#                           README example uses 1 GB, but biobank-scale
+#                           compute (BED chunk + L2 array + ring buffer)
+#                           wants ≥120 MB per outer worker today and we
+#                           need headroom for h2/rg in the future. 4 GB
+#                           is the wasm32 architectural maximum.
+#
+# The TLS exports (`--export=__wasm_init_tls` etc.) that the
+# wasm-bindgen-rayon README mentions are emitted automatically by lld
+# on `+atomics` builds — adding them explicitly triggered
+# wasm-bindgen-cli's "failed to find __heap_base for injecting thread
+# id" error in our setup, presumably because the explicit list shadowed
+# lld's default export set.
+rustflags = [
+    "-C", "target-feature=+simd128,+atomics,+bulk-memory",
+    "-C", "link-arg=--shared-memory",
+    "-C", "link-arg=--import-memory",
+    "-C", "link-arg=--max-memory=4294967296",
+    # `__heap_base` and the TLS init hooks aren't in lld's default-export
+    # set on wasm32-unknown-unknown when --shared-memory is enabled.
+    # wasm-bindgen-cli needs all of them to inject per-thread state during
+    # module instantiation. Without these, wasm-bindgen errors out with
+    # "failed to find __heap_base for injecting thread id" /
+    # "failed to find __wasm_init_tls".
+    "-C", "link-arg=--export=__heap_base",
+    "-C", "link-arg=--export=__wasm_init_tls",
+    "-C", "link-arg=--export=__tls_size",
+    "-C", "link-arg=--export=__tls_align",
+    "-C", "link-arg=--export=__tls_base",
+]
+
+[unstable]
+build-std = ["panic_abort", "std"]

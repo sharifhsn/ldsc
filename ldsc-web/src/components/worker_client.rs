@@ -130,6 +130,31 @@ fn pool_cap() -> usize {
     nav_hwc.clamp(1, MAX_POOL)
 }
 
+/// Hard cap on rayon threads inside each compute Worker. 4 because
+/// the wasm32-simd128 GEMM kernel saturates IPC on a single core
+/// pretty quickly, and the marginal value of the 5th+ rayon thread
+/// is below the cost of one more nested Web Worker (each carries a
+/// SAB-shared wasm linear memory + JS heap).
+const MAX_INNER_THREADS: usize = 4;
+
+/// Returns the number of rayon threads to spawn inside each compute
+/// Worker. Total active cores = `outer_pool_size * inner_threads`,
+/// which we cap at the device's `navigator.hardwareConcurrency` to
+/// avoid CPU oversubscription (the OS scheduler handles minor
+/// over-spawn fine, but pinning all cores hurts UI responsiveness).
+///
+/// Examples (assuming MAX_POOL=4, MAX_INNER_THREADS=4):
+///   HC=2  → outer=2, inner=1, total=2
+///   HC=4  → outer=4, inner=1, total=4
+///   HC=8  → outer=4, inner=2, total=8
+///   HC=16 → outer=4, inner=4, total=16
+fn inner_threads_for_pool(outer_pool_size: usize) -> usize {
+    let nav_hwc = web_sys::window()
+        .map(|w| w.navigator().hardware_concurrency() as usize)
+        .unwrap_or(2);
+    (nav_hwc / outer_pool_size.max(1)).clamp(1, MAX_INNER_THREADS)
+}
+
 /// Partition `(chr, snp_count)` pairs across at most `n_workers`
 /// non-empty buckets, largest-first / smallest-residual. Returns
 /// only the buckets that received at least one chr; the orchestrator
@@ -140,7 +165,10 @@ fn pool_cap() -> usize {
 fn partition_chrs(summaries: &[(u8, usize)], n_workers: usize) -> Vec<Vec<u8>> {
     let n_workers = n_workers.max(1).min(summaries.len().max(1));
     let mut indexed: Vec<(u8, usize)> = summaries.to_vec();
-    indexed.sort_by(|a, b| b.1.cmp(&a.1));
+    // Sort by SNP count descending — std::cmp::Reverse turns the
+    // ascending sort_by_key into a descending one and silences the
+    // newer nightly's `clippy::unnecessary_sort_by` lint.
+    indexed.sort_by_key(|t| std::cmp::Reverse(t.1));
 
     let mut buckets: Vec<(usize, Vec<u8>)> = (0..n_workers).map(|_| (0, Vec::new())).collect();
     for (chr, n) in indexed {
@@ -314,10 +342,9 @@ pub fn spawn_compute_l2_pool(
                         summaries.iter().map(|s| (s.chr, s.snp_count)).collect();
                     let assignments = partition_chrs(&pairs, n_workers_max);
                     let n_workers = assignments.len();
+                    let inner_threads = inner_threads_for_pool(n_workers);
                     tracing::info!(
-                        "Spawning {} compute workers; assignments = {:?}",
-                        n_workers,
-                        assignments
+                        "Spawning {n_workers} compute workers × {inner_threads} rayon threads; assignments = {assignments:?}"
                     );
 
                     *partials_for_scan.borrow_mut() = vec![None; n_workers];
@@ -342,6 +369,7 @@ pub fn spawn_compute_l2_pool(
                         if let Err(e) = spawn_compute_worker(
                             worker_idx,
                             chrs,
+                            inner_threads,
                             wasm_js_url_for_scan.clone(),
                             wasm_bg_url_for_scan.clone(),
                             bed_file_for_scan.clone(),
@@ -385,8 +413,10 @@ pub fn spawn_compute_l2_pool(
     scan_worker.set_onerror(Some(scan_on_err.as_ref().unchecked_ref()));
     scan_on_err.forget();
 
-    // Init + scan messages to the scan worker.
-    post_init(&scan_worker, &wasm_js_url_abs, &wasm_bg_url_abs)?;
+    // Init + scan messages to the scan worker. The scan worker just
+    // streams BIM and returns the chr summary — no GEMM, so no rayon
+    // pool needed (innerThreads = 1 → worker.js skips initThreadPool).
+    post_init(&scan_worker, &wasm_js_url_abs, &wasm_bg_url_abs, 1)?;
     let scan_msg = js_sys::Object::new();
     Reflect::set(&scan_msg, &"kind".into(), &"scan_bim".into())?;
     Reflect::set(&scan_msg, &"bimFile".into(), file_jsvalue(&bim_file))?;
@@ -399,6 +429,7 @@ pub fn spawn_compute_l2_pool(
 fn spawn_compute_worker(
     worker_idx: usize,
     chrs: Vec<u8>,
+    inner_threads: usize,
     wasm_js_url: JsValue,
     wasm_bg_url: JsValue,
     bed_file: Rc<send_wrapper::SendWrapper<web_sys::File>>,
@@ -484,6 +515,29 @@ fn spawn_compute_worker(
                 wall_for_handler.borrow_mut()[worker_idx] = partial.wall_seconds;
                 snps_done_for_handler.borrow_mut()[worker_idx] = partial.n_snps;
                 activity_for_handler.borrow_mut()[worker_idx] = js_sys::Date::now();
+                // Per-worker [perf] breakdown via main-thread tracing.
+                // Compute workers themselves can't safely use
+                // tracing-wasm or console_error_panic_hook (they trap
+                // at runtime in our multi-threaded WASM setup), so we
+                // route per-phase totals back through the postMessage
+                // result and log them here on main where the tracing
+                // subscriber from `main()` is installed.
+                let p = &partial.perf;
+                let sketch_blurb = match p.sketch_secs {
+                    Some(s) => format!(" sketch={s:.3}s"),
+                    None => String::new(),
+                };
+                tracing::info!(
+                    "[perf] worker[{worker_idx}] m={} n_indiv={} wall={:.3}s bed_read(stall)={:.3}s norm={:.3}s{sketch_blurb} bb_dot={:.3}s ab_dot={:.3}s ring_store={:.3}s",
+                    p.m,
+                    p.n_indiv,
+                    partial.wall_seconds,
+                    p.bed_read_secs,
+                    p.norm_secs,
+                    p.bb_dot_secs,
+                    p.ab_dot_secs,
+                    p.ring_store_secs,
+                );
                 partials_for_handler.borrow_mut()[worker_idx] = Some(partial);
                 terminate_worker(&worker_for_handler);
 
@@ -535,8 +589,10 @@ fn spawn_compute_worker(
     worker.set_onerror(Some(on_err.as_ref().unchecked_ref()));
     on_err.forget();
 
-    // Init + compute messages.
-    post_init(&worker, &wasm_js_url, &wasm_bg_url)?;
+    // Init + compute messages. Compute workers each spawn
+    // `inner_threads` rayon workers (via wasm-bindgen-rayon's
+    // `initThreadPool`) before processing their assigned chr-shard.
+    post_init(&worker, &wasm_js_url, &wasm_bg_url, inner_threads)?;
     let compute_msg = js_sys::Object::new();
     Reflect::set(&compute_msg, &"kind".into(), &"compute_l2_chrs".into())?;
     Reflect::set(&compute_msg, &"bedFile".into(), file_jsvalue(&bed_file))?;
@@ -668,11 +724,23 @@ fn terminate_pool(pool: &Rc<RefCell<Vec<Rc<Worker>>>>) {
     }
 }
 
-fn post_init(worker: &Worker, wasm_js_url: &JsValue, wasm_bg_url: &JsValue) -> Result<(), JsValue> {
+fn post_init(
+    worker: &Worker,
+    wasm_js_url: &JsValue,
+    wasm_bg_url: &JsValue,
+    inner_threads: usize,
+) -> Result<(), JsValue> {
     let init = js_sys::Object::new();
     Reflect::set(&init, &"kind".into(), &"init".into())?;
     Reflect::set(&init, &"wasmJsUrl".into(), wasm_js_url)?;
     Reflect::set(&init, &"wasmBgUrl".into(), wasm_bg_url)?;
+    // worker.js will skip pool init if `innerThreads <= 1` (the scan
+    // worker, and any single-core fallback).
+    Reflect::set(
+        &init,
+        &"innerThreads".into(),
+        &JsValue::from_f64(inner_threads as f64),
+    )?;
     worker.post_message(&init)?;
     Ok(())
 }

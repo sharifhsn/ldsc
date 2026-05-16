@@ -4,6 +4,48 @@ This log captures **post-change** performance measurements and parity checks.
 Each entry should list the dataset, command, and key timings so we can track
 how changes affect runtime.
 
+## 2026-05-15 (Workstream G: multi-threaded WASM GEMM + 2×4 tiled kernel)
+
+- Change: ldsc-web now uses a manual SAB-backed worker pool (4 inner
+  Workers per outer compute Worker) plus a **2×4 register-tiled f32
+  TN GEMM kernel** in `src/wasm_simd.rs`. The kernel processes 2
+  i-rows × 4 j-columns per K iteration, sharing both A column loads
+  (across 4 j's) and B column loads (across 2 i's). 8 SIMD
+  accumulators per tile; well within ARM64's 32 v128 register budget.
+- Tooling: new `wasm-bench/` crate (standalone Cargo workspace,
+  wasm32-wasip1 target). Lets us iterate on the kernel locally under
+  wasmtime without round-tripping through trunk → browser. Run via
+  `wasm-bench/bench.sh`.
+- Single-thread microbenchmark (Apple M5 Pro, wasmtime 44, simd128):
+
+  | Shape (m, n, k) | Baseline (single-j, K-16) | Tile2×4 (this change) | Speedup |
+  |---|---|---|---|
+  | bb_dot 1000G (200, 200, 2490) | 41.6 GF/s | **67.4 GF/s** | 1.62× |
+  | ab_dot 1000G (8000, 200, 2490) | 36.8 GF/s | **63.4 GF/s** | 1.72× |
+  | ab_dot 1000G-mid (2000, 200, 2490) | 38.8 GF/s | **65.2 GF/s** | 1.68× |
+  | bb_dot biobank (200, 200, 50000) | 31.3 GF/s | **63.7 GF/s** | 2.03× |
+
+- Tile sweep summary: Tile4 (4 j's, 4 accs) hits 46-48 GF/s flat
+  across all shapes. Tile2×4 (8 accs) jumps to 63-67 GF/s. Tile4×4
+  (16 accs) ties Tile2×4 on small-m shapes but regresses to 49 GF/s
+  on ab_dot m=8000 — Cranelift register pressure + cacheline pressure
+  on 4-A-col-per-iter access pattern. Tile2×4 is the sweet spot.
+- Correctness: `wasm-bench` verify sweep shows max_abs ≤ 9.23e-4
+  across (200, 200, 2490), (8000, 200, 2490), (200, 200, 50000),
+  and tail-stress (199, 201, 2490) / (7999, 199, 2490). f32 noise
+  floor at K=50K; well below the displayed precision at the
+  L2-score level. The kernel's 4-step K reduction order differs
+  from the legacy 16-step but both routes are bit-equivalent within
+  f32 precision.
+- End-to-end projection (full 1000G EUR, no masking):
+  - ab_dot was 75% of wall × 1.72× speedup → saves ~31% of wall
+  - bb_dot was 21% × 1.62× speedup → saves ~8%
+  - Combined: ~39% wall reduction
+  - F.4 baseline 236s (4 outer × 1 inner) → projected ~145s
+- Wired in `src/wasm_simd.rs::simd128::gemm_tn_f32` (serial path)
+  and `pool::run_gemm_slice` (per-worker path). Both the
+  single-threaded fallback and the pool dispatch get the new kernel.
+
 ## 2026-03-03
 - Change: low-risk l2 optimizations (buffer reuse, contiguous BED indexing, `general_mat_mul`).
 - Dataset: 1000G.EUR.QC, extract 500k SNPs (`/Users/sharif/Code/ldsc/perf/l2/extract_500000.snps`).

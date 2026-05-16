@@ -1,0 +1,29 @@
+# Nightly toolchain pin for the ldsc-web crate.
+#
+# Why per-crate (not workspace-root): the native CLI builds with stable.
+# Only the wasm bundle needs nightly, and only because:
+#
+#   - `wasm-bindgen-rayon` requires `-Z build-std` to recompile std with
+#     +atomics support (the precompiled wasm32-unknown-unknown std is
+#     built without thread support to maximise portability).
+#   - `[unstable] build-std` in `.cargo/config.toml` is unstable cargo
+#     and refuses to compile under stable.
+#
+# Cargo discovers this file by walking up from cwd, so trunk (which
+# runs `cargo build` from `ldsc-web/`) picks it up; native CLI builds
+# run from the workspace root and don't see this file, staying on
+# stable.
+#
+# Date pin rationale: pin to whatever's known-good when this lands.
+# 2026-05-13 is what's locally installed at time of writing; the
+# wasm-bindgen-rayon README documents nightly-2024-08-02 as tested
+# but newer nightlies have been working in the wider Rust+WASM
+# ecosystem. If this pin ICEs at some point, bump to the next known-
+# good nightly (`rustup toolchain install nightly-YYYY-MM-DD`) and
+# update this file. Do NOT auto-bump to "nightly" unpinned — that
+# breaks reproducibility.
+
+[toolchain]
+channel    = "nightly-2026-05-13"
+components = ["rust-src", "clippy", "rustfmt"]
+targets    = ["wasm32-unknown-unknown"]

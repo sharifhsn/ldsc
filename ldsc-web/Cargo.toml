@@ -3,9 +3,9 @@
 # Deploys to https://sharifhsn.github.io/ldsc/ as a GitHub Pages
 # project page. Built with `trunk build --release --public-url /ldsc/`.
 #
-# Single-threaded for v1; wasm-bindgen-rayon thread-pool init lands
-# in Workstream C.3 once `coi-serviceworker` is wired up for the
-# COOP/COEP polyfill that SharedArrayBuffer needs under GH Pages.
+# Multi-threaded WASM via wasm-bindgen-rayon (workstream G).
+# coi-serviceworker provides the COOP/COEP polyfill that
+# SharedArrayBuffer needs under GH Pages.
 
 [package]
 name        = "ldsc-web"
@@ -95,3 +95,12 @@ plotters-canvas = "0.3"
 
 # Error helper consistent with the lib crate.
 anyhow = "1"
+
+# Multi-threaded GEMM (workstream G — manual SAB worker pool).
+# wasm-bindgen-rayon was attempted but the bundler-mode
+# `workerHelpers.js` ships an `import('../../..')` that resolves to
+# `/ldsc/snippets/` (a directory with no index entry) under trunk's
+# static-copy snippet layout, hanging the inner worker import. We
+# instead spawn our own inner workers from `assets/inner_worker.js`
+# and coordinate via raw Atomics on SAB-backed wasm linear memory.
+# See `src/wasm_simd.rs::pool` for the implementation.
