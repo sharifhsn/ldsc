@@ -13,6 +13,7 @@ cargo build --release --target wasm32-wasip1 -q
 
 wasmtime run \
     -W simd=y \
+    -W relaxed-simd=y \
     -W bulk-memory=y \
     -W max-memory-size=4294967296 \
     target/wasm32-wasip1/release/ldsc-wasm-bench.wasm "$@"

@@ -4,6 +4,59 @@ This log captures **post-change** performance measurements and parity checks.
 Each entry should list the dataset, command, and key timings so we can track
 how changes affect runtime.
 
+## 2026-05-15 (Aggressive GEMM: relaxed-SIMD FMA + cache-block loop reorder)
+
+- Change: stacked two more optimizations on top of the morning's
+  Tile2×4 baseline:
+  1. **`f32x4_relaxed_madd` (relaxed-SIMD FMA)** — fuses each
+     `mul + add` pair into a single instruction. Lowers to FMLA
+     on ARM64 NEON / `vfmadd231ps` on x86 AVX+FMA. ~1 ULP
+     nondeterminism allowed per the wasm spec; for LD-score
+     summation over K terms, residual error is O(√K · ULP) ≈ 1e-5
+     at K=2490 — far below the 4-sig-fig precision used to report
+     mean L2. CLI bit-parity isn't strict (the wasm path is already
+     f32, not f64).
+  2. **4×4 register tile with `ip-outer, jt-inner` cache-block
+     loop order** — was previously `jt-outer, ip-inner` so A (the
+     larger dim, 80 MB on ab_dot m=8000) was streamed from DRAM
+     50× per call = 4 GB DRAM. Swap: A's 40 KB i-strip stays in
+     L1d across all jt-tiles; B (smaller, 2 MB) is streamed from
+     L2 across ip iters. 4 GB DRAM → 80 MB DRAM + 4 GB L2. Memory
+     cost drops from ~50 ms to ~14 ms on ab_dot.
+- Tooling: `wasm-bench` + wasmtime (`-W relaxed-simd=y`). Two new
+  kernels in `src/wasm_simd.rs`:
+  `gemm_tn_f32_slice_raw_tiled_4x4_fma` (FMA only) and
+  `gemm_tn_f32_slice_raw_tiled_4x4_fma_block` (FMA + cache-block).
+  The `_block` variant is the universal default — even on small-m
+  shapes where the loop reorder is neutral, it's the same speed.
+- Single-thread microbenchmark (Apple M5 Pro, wasmtime 44,
+  `+simd128,+relaxed-simd`):
+
+  | Shape (m, n, k) | Baseline | Tile2×4 | Tile4×4-FMA | **4×4-FMA-block** | Total vs baseline |
+  |---|---|---|---|---|---|
+  | bb_dot 1000G (200, 200, 2490) | 41.7 GF/s | 67.4 | 119 | **123** | **2.95×** |
+  | ab_dot 1000G (8000, 200, 2490) | 36.8 GF/s | 63.4 | 65 | **116** | **3.15×** |
+  | ab_dot 1000G-mid (2000, 200, 2490) | 38.8 GF/s | 65.2 | 98 | **121** | **3.12×** |
+  | bb_dot biobank (200, 200, 50000) | 31.3 GF/s | 63.7 | 103 | **108** | **3.45×** |
+
+- Key data point: ab_dot 4×4-FMA (jt-outer) hit only 65 GF/s
+  because DRAM streaming of 80 MB A panel was the bottleneck. The
+  loop reorder (`_block` variant) lifted it to 116 GF/s on the
+  same kernel body — **a pure data-motion win, no extra compute**.
+- Correctness: verify sweep against the baseline kernel passes on
+  all 5 shapes (small/large m, K=2490 and K=50K, odd m/n tails).
+  Max abs error 9.23e-4 at K=50K = f32 noise floor; below the
+  displayed precision of mean L2.
+- End-to-end projection (full 1000G EUR, no masking):
+  - ab_dot 75% × 3.15× → 24% of baseline wall
+  - bb_dot 21% × 2.95× → 7% of baseline wall
+  - other 4% unchanged
+  - Combined: ~35% of baseline = **~2.9× single-thread speedup**
+  - F.4 baseline 236s (4 outer × 1 inner) → projected **~82s**
+- Files: `src/wasm_simd.rs` (two new fma kernels + dispatch),
+  `ldsc-web/.cargo/config.toml` (+relaxed-simd rustflag),
+  `ldsc-web/index.html` (`--enable-relaxed-simd` wasm-opt param).
+
 ## 2026-05-15 (Workstream G: multi-threaded WASM GEMM + 2×4 tiled kernel)
 
 - Change: ldsc-web now uses a manual SAB-backed worker pool (4 inner

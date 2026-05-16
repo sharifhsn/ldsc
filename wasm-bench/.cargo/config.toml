@@ -1,5 +1,5 @@
 [target.wasm32-wasip1]
-rustflags = ["-C", "target-feature=+simd128"]
+rustflags = ["-C", "target-feature=+simd128,+relaxed-simd"]
 
 [target.wasm32-wasip1-threads]
-rustflags = ["-C", "target-feature=+simd128,+atomics,+bulk-memory"]
+rustflags = ["-C", "target-feature=+simd128,+relaxed-simd,+atomics,+bulk-memory"]

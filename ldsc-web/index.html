@@ -47,12 +47,17 @@
 
     <!-- Compile + bundle the ldsc-web crate. data-bin selects this
          binary in case the workspace ever has more than one.
-         data-wasm-opt-params="--enable-threads" tells trunk's wasm-opt
-         invocation to permit `(memory ... shared)` and the atomic.*
-         opcodes (workstream G enables those via .cargo/config.toml).
-         Without it, wasm-opt rejects the build with `multivalue not
-         enabled` or `atomic instruction without --enable-threads`. -->
-    <link data-trunk rel="rust" data-bin="ldsc-web" data-wasm-opt="z" data-wasm-opt-params="--enable-threads" />
+         data-wasm-opt-params:
+         - --enable-threads: permits `(memory ... shared)` and the
+           atomic.* opcodes (workstream G enables those via
+           .cargo/config.toml).
+         - --enable-simd: required even though +simd128 is in
+           rustflags — wasm-opt won't lower v128 ops without it.
+         - --enable-relaxed-simd: permits `f32x4.relaxed_madd` (FMA
+           used by our 4×4 GEMM microkernel for ~1.6× speedup on
+           small-m shapes). Without this, wasm-opt strips relaxed
+           ops and the kernel falls back to scalar tail. -->
+    <link data-trunk rel="rust" data-bin="ldsc-web" data-wasm-opt="z" data-wasm-opt-params="--enable-threads --enable-simd --enable-relaxed-simd" />
 </head>
 <body>
     <!-- Leptos mounts the entire UI here at startup. Until the wasm

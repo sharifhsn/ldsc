@@ -24,8 +24,17 @@
 # We do NOT use `+mutable-globals` explicitly — it's implied by
 # +atomics on modern rustc/llvm and doesn't need to be listed.
 #
-# We do NOT use `+relaxed-simd` (would give FMA but breaks browser-
-# vs-CLI bit-identity due to 1 ULP nondeterminism).
+# - `+relaxed-simd`: enables `f32x4_relaxed_madd` (FMA) in our GEMM
+#   kernel. ~1.6× speedup on small-m shapes (bb_dot 200×200: 67
+#   GF/s without FMA → 119 GF/s with FMA), ~1.1× on memory-bound
+#   ab_dot at biobank scale. Per the wasm spec, relaxed-SIMD ops
+#   may differ by up to 1 ULP across implementations (the platform
+#   chooses fused vs unfused). For LD scores summed over K terms,
+#   the per-cell error is O(√K · ULP) ≈ 1e-5 at K=2490 — far below
+#   the 4-sig-fig precision used to report mean L2. CLI bit-parity
+#   isn't strict (the lib already computes f32 not f64 in the wasm
+#   path) and the wasmtime correctness sweep shows max_abs ≤ 9.2e-4
+#   on K=50K. (Chrome 114+, Firefox 132+, Safari TP / 18+.)
 #
 # # Link args (multi-threaded WASM specifically)
 #
@@ -89,7 +98,7 @@
 # id" error in our setup, presumably because the explicit list shadowed
 # lld's default export set.
 rustflags = [
-    "-C", "target-feature=+simd128,+atomics,+bulk-memory",
+    "-C", "target-feature=+simd128,+relaxed-simd,+atomics,+bulk-memory",
     "-C", "link-arg=--shared-memory",
     "-C", "link-arg=--import-memory",
     "-C", "link-arg=--max-memory=4294967296",

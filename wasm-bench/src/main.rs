@@ -48,6 +48,9 @@ enum Kernel {
     Tiled4,
     Tiled2x4,
     Tiled4x4,
+    Tiled2x4Fma,
+    Tiled4x4Fma,
+    Tiled4x4FmaBlock,
 }
 
 impl Kernel {
@@ -57,6 +60,9 @@ impl Kernel {
             Kernel::Tiled4 => "tile4",
             Kernel::Tiled2x4 => "tile2x4",
             Kernel::Tiled4x4 => "tile4x4",
+            Kernel::Tiled2x4Fma => "2x4_fma",
+            Kernel::Tiled4x4Fma => "4x4_fma",
+            Kernel::Tiled4x4FmaBlock => "4x4_fma_blk",
         }
     }
 }
@@ -96,6 +102,24 @@ fn bench_one(dst: &mut Mat<f32>, lhs: &Mat<f32>, rhs: &Mat<f32>, kernel: Kernel)
             Kernel::Tiled4x4 => wasm_simd::simd128::gemm_tn_f32_slice_raw_tiled_4x4(
                 dst_ptr, dst_col, m, a_ptr, a_col, k, b_ptr, b_col, 0, n,
             ),
+            #[cfg(target_feature = "relaxed-simd")]
+            Kernel::Tiled2x4Fma => wasm_simd::simd128::gemm_tn_f32_slice_raw_tiled_2x4_fma(
+                dst_ptr, dst_col, m, a_ptr, a_col, k, b_ptr, b_col, 0, n,
+            ),
+            #[cfg(target_feature = "relaxed-simd")]
+            Kernel::Tiled4x4Fma => wasm_simd::simd128::gemm_tn_f32_slice_raw_tiled_4x4_fma(
+                dst_ptr, dst_col, m, a_ptr, a_col, k, b_ptr, b_col, 0, n,
+            ),
+            #[cfg(target_feature = "relaxed-simd")]
+            Kernel::Tiled4x4FmaBlock => {
+                wasm_simd::simd128::gemm_tn_f32_slice_raw_tiled_4x4_fma_block(
+                    dst_ptr, dst_col, m, a_ptr, a_col, k, b_ptr, b_col, 0, n,
+                )
+            }
+            #[cfg(not(target_feature = "relaxed-simd"))]
+            Kernel::Tiled2x4Fma | Kernel::Tiled4x4Fma | Kernel::Tiled4x4FmaBlock => {
+                panic!("FMA variants need +relaxed-simd")
+            }
         }
     }
     #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
@@ -229,6 +253,17 @@ fn main() {
     println!("\n-- tiled 4x4 kernel (4 i's × 4 j's per K iter, 16 accs) --");
     run_all_shapes(Kernel::Tiled4x4);
 
+    if cfg!(target_feature = "relaxed-simd") {
+        println!("\n-- 2x4 + relaxed-SIMD FMA (1 op vs mul+add pair) --");
+        run_all_shapes(Kernel::Tiled2x4Fma);
+
+        println!("\n-- 4x4 + relaxed-SIMD FMA (16 accs, fused) --");
+        run_all_shapes(Kernel::Tiled4x4Fma);
+
+        println!("\n-- 4x4 FMA + ip-outer cache-block (better for big m) --");
+        run_all_shapes(Kernel::Tiled4x4FmaBlock);
+    }
+
     println!("\n-- correctness sweep (tile2x4 vs baseline) --");
     verify_against_baseline(Kernel::Tiled2x4, 200, 200, 2490);
     verify_against_baseline(Kernel::Tiled2x4, 8000, 200, 2490);
@@ -236,6 +271,20 @@ fn main() {
     // Stress shapes: odd j-tail and odd i-tail.
     verify_against_baseline(Kernel::Tiled2x4, 199, 201, 2490);
     verify_against_baseline(Kernel::Tiled2x4, 7999, 199, 2490);
+
+    if cfg!(target_feature = "relaxed-simd") {
+        println!("\n-- correctness sweep (2x4 FMA vs baseline) --");
+        verify_against_baseline(Kernel::Tiled2x4Fma, 200, 200, 2490);
+        verify_against_baseline(Kernel::Tiled2x4Fma, 8000, 200, 2490);
+        verify_against_baseline(Kernel::Tiled2x4Fma, 200, 200, 50000);
+        verify_against_baseline(Kernel::Tiled4x4Fma, 8000, 200, 2490);
+        verify_against_baseline(Kernel::Tiled4x4Fma, 200, 200, 50000);
+        verify_against_baseline(Kernel::Tiled4x4FmaBlock, 200, 200, 2490);
+        verify_against_baseline(Kernel::Tiled4x4FmaBlock, 8000, 200, 2490);
+        verify_against_baseline(Kernel::Tiled4x4FmaBlock, 200, 200, 50000);
+        verify_against_baseline(Kernel::Tiled4x4FmaBlock, 199, 201, 2490);
+        verify_against_baseline(Kernel::Tiled4x4FmaBlock, 7999, 199, 2490);
+    }
 
     println!("\n== done ==");
 }
