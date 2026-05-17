@@ -90,6 +90,18 @@ pub struct WorkerComputeResult {
     /// user-perceived elapsed compute, not the sum of CPU work).
     pub wall_seconds: f64,
     pub n_snps: usize,
+    /// Per-outer-worker timing breakdown, in worker index order
+    /// (`worker[0]`, `worker[1]`, …). Used by the L2 panel's results
+    /// card to surface the I/O / sketch / GEMM split without having
+    /// to dig into DevTools. Same data the worker_client.rs
+    /// `tracing::info!` line logs to console — both are derived
+    /// from each worker's `WireL2Output.perf`.
+    pub per_worker_perf: Vec<crate::worker::WireL2Perf>,
+    /// Each outer worker's `wall_seconds` (max-of-chrs inside that
+    /// worker), in the same order as `per_worker_perf`. The pool
+    /// wall is `max(per_worker_wall_seconds)`; per-worker numbers
+    /// expose the long-tail (typically chr1's outer).
+    pub per_worker_wall_seconds: Vec<f64>,
 }
 
 /// Mid-compute progress event aggregated across the pool.
@@ -566,16 +578,33 @@ fn spawn_compute_worker(
                     }
                     clear_watchdog(&watchdog_for_handler);
                     let assembled = assemble_partials(&partials_for_handler.borrow());
-                    let max_wall = wall_for_handler
-                        .borrow()
+                    let per_worker_wall_seconds: Vec<f64> =
+                        wall_for_handler.borrow().clone();
+                    let max_wall = per_worker_wall_seconds
                         .iter()
                         .copied()
                         .fold(0.0f64, f64::max);
+                    // Snapshot each worker's perf in worker-index
+                    // order. Workers that didn't report (shouldn't
+                    // happen at this point — `all_done` checked
+                    // above) get a default zero-filled WireL2Perf.
+                    let per_worker_perf: Vec<crate::worker::WireL2Perf> =
+                        partials_for_handler
+                            .borrow()
+                            .iter()
+                            .map(|opt| {
+                                opt.as_ref()
+                                    .map(|o| o.perf.clone())
+                                    .unwrap_or_default()
+                            })
+                            .collect();
                     let result = WorkerComputeResult {
                         l2: assembled.0,
                         maf: assembled.1,
                         wall_seconds: max_wall,
                         n_snps: assembled.2,
+                        per_worker_perf,
+                        per_worker_wall_seconds,
                     };
                     // Defensive teardown of any stragglers (already
                     // terminated above) + drop on_error so the

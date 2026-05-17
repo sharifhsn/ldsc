@@ -386,6 +386,7 @@ pub fn L2Panel() -> impl IntoView {
         // ── Results card ───────────────────────────────────────────────
         {move || result.get().map(|out| {
             let stats = RunStats::from_output(&out);
+            let perf_view = perf_breakdown_view(&out);
             view! {
                 <div class="card">
                     <div class="card-header">"Results"</div>
@@ -421,6 +422,8 @@ pub fn L2Panel() -> impl IntoView {
                             </div>
                         </div>
 
+                        {perf_view}
+
                         <canvas id="chart-hist" class="chart" width="880" height="320"></canvas>
                         <canvas id="chart-scatter" class="chart" width="880" height="320"></canvas>
                     </div>
@@ -428,6 +431,110 @@ pub fn L2Panel() -> impl IntoView {
             }
         })}
     }
+}
+
+/// Per-phase wall-time breakdown for the long-tail outer (the worker
+/// whose `wall_seconds` matches the overall pool wall). Pre-H this
+/// is dominated by `bed_read(stall)`; Workstream H+ should shift the
+/// dominant phase toward `sketch` / GEMM. Surfaces the data the
+/// `[perf]` console log already prints, so users can see where the
+/// wall is going without opening DevTools.
+fn perf_breakdown_view(out: &WorkerComputeResult) -> impl IntoView + use<> {
+    if out.per_worker_perf.is_empty() {
+        return view! { <div></div> }.into_any();
+    }
+    // Find the long-tail worker (max wall) and use it for the
+    // breakdown. This is the worker that defines the overall pool
+    // wall, so its phases are the ones that matter for optimisation.
+    let (long_tail_idx, long_tail_wall) = out
+        .per_worker_wall_seconds
+        .iter()
+        .copied()
+        .enumerate()
+        .fold(
+            (0usize, 0.0f64),
+            |acc, (i, w)| if w > acc.1 { (i, w) } else { acc },
+        );
+    let p = &out.per_worker_perf[long_tail_idx];
+
+    // Each row: (label, seconds, css-class). Display only non-zero
+    // rows so sketch-only runs don't show empty GEMM rows.
+    let mut rows: Vec<(String, f64, &'static str)> = Vec::new();
+    rows.push((
+        "BED read (FileReaderSync stall)".to_string(),
+        p.bed_read_secs,
+        "phase-io",
+    ));
+    rows.push(("Normalize".to_string(), p.norm_secs, "phase-cpu"));
+    if let Some(s) = p.sketch_secs {
+        rows.push(("Sketch (scatter-add)".to_string(), s, "phase-cpu"));
+    }
+    if p.bb_dot_secs > 0.0 {
+        rows.push(("GEMM B^T·B (within-chunk)".to_string(), p.bb_dot_secs, "phase-cpu"));
+    }
+    if p.ab_dot_secs > 0.0 {
+        rows.push(("GEMM A^T·B (cross-window)".to_string(), p.ab_dot_secs, "phase-cpu"));
+    }
+    if p.ring_store_secs > 0.0 {
+        rows.push(("Ring buffer".to_string(), p.ring_store_secs, "phase-cpu"));
+    }
+
+    // Bar widths normalised to the long-tail worker's wall.
+    let max_bar = long_tail_wall.max(1e-6);
+    let total_accounted: f64 = rows.iter().map(|r| r.1).sum();
+    let other = (long_tail_wall - total_accounted).max(0.0);
+    if other > 0.01 {
+        rows.push(("Other / dispatch".to_string(), other, "phase-other"));
+    }
+
+    let n_workers = out.per_worker_wall_seconds.len();
+    let row_views = rows
+        .into_iter()
+        .map(|(label, secs, css)| {
+            let pct = (secs / max_bar * 100.0).clamp(0.0, 100.0);
+            let bar_color = match css {
+                "phase-io" => "#d97706",   // amber — I/O stall
+                "phase-cpu" => "#2a71a5",  // blue — CPU work
+                _ => "#9ca3af",            // grey — other
+            };
+            view! {
+                <div class="perf-row">
+                    <div class="perf-label">{label}</div>
+                    <div class="perf-bar-wrap">
+                        <div class="perf-bar"
+                             style=format!("width: {:.1}%; background-color: {};",
+                                           pct, bar_color)>
+                        </div>
+                    </div>
+                    <div class="perf-value">
+                        {format!("{:.2} s ({:.0}%)", secs, secs / max_bar * 100.0)}
+                    </div>
+                </div>
+            }
+        })
+        .collect::<Vec<_>>();
+
+    view! {
+        <div class="perf-breakdown mt-4">
+            <div class="perf-header">
+                <strong>"Where the wall went — worker[" {long_tail_idx} "] (long tail of "
+                {n_workers} ", chr handled = " {p.m} " SNPs)"</strong>
+                <span class="text-muted ms-2" style="font-size: 0.825rem;">
+                    "Pool wall = max across workers = "
+                    {format!("{:.2}s", out.wall_seconds)}
+                </span>
+            </div>
+            <div class="perf-rows mt-2">
+                {row_views}
+            </div>
+            <div class="text-muted mt-1" style="font-size: 0.75rem;">
+                "Amber = I/O stall (FileReaderSync bandwidth-bound). "
+                "Blue = CPU work (SIMD compute). "
+                "If amber dominates, the wall is I/O-bound — see plan workstream notes."
+            </div>
+        </div>
+    }
+    .into_any()
 }
 
 #[component]

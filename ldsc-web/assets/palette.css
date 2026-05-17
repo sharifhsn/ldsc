@@ -198,6 +198,58 @@ canvas.chart {
     margin-top: 0.75rem;
 }
 
+/* ── Perf breakdown table ──────────────────────────────────────── */
+.perf-breakdown {
+    border: 1px solid var(--bs-border-color);
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    background: #fafbfc;
+}
+.perf-breakdown .perf-header { color: #133a55; }
+.perf-breakdown .perf-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+}
+.perf-breakdown .perf-row {
+    display: grid;
+    grid-template-columns: minmax(180px, 220px) 1fr minmax(120px, 160px);
+    align-items: center;
+    gap: 0.75rem;
+    font-size: 0.875rem;
+}
+.perf-breakdown .perf-label {
+    color: #344056;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.perf-breakdown .perf-bar-wrap {
+    background: #e5e7eb;
+    height: 0.85rem;
+    border-radius: 4px;
+    overflow: hidden;
+}
+.perf-breakdown .perf-bar {
+    height: 100%;
+    min-width: 1px;
+    transition: width 0.2s ease;
+}
+.perf-breakdown .perf-value {
+    color: #133a55;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    font-size: 0.825rem;
+}
+
+@media (prefers-color-scheme: dark) {
+    .perf-breakdown { background: #1c1c1f; }
+    .perf-breakdown .perf-header { color: #7eaee0; }
+    .perf-breakdown .perf-label { color: #d4d4d4; }
+    .perf-breakdown .perf-value { color: #7eaee0; }
+    .perf-breakdown .perf-bar-wrap { background: #2a2a2f; }
+}
+
 .error-box {
     color: #842029;
     background: #f8d7da;
