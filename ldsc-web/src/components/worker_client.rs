@@ -578,8 +578,7 @@ fn spawn_compute_worker(
                     }
                     clear_watchdog(&watchdog_for_handler);
                     let assembled = assemble_partials(&partials_for_handler.borrow());
-                    let per_worker_wall_seconds: Vec<f64> =
-                        wall_for_handler.borrow().clone();
+                    let per_worker_wall_seconds: Vec<f64> = wall_for_handler.borrow().clone();
                     let max_wall = per_worker_wall_seconds
                         .iter()
                         .copied()
@@ -588,16 +587,11 @@ fn spawn_compute_worker(
                     // order. Workers that didn't report (shouldn't
                     // happen at this point — `all_done` checked
                     // above) get a default zero-filled WireL2Perf.
-                    let per_worker_perf: Vec<crate::worker::WireL2Perf> =
-                        partials_for_handler
-                            .borrow()
-                            .iter()
-                            .map(|opt| {
-                                opt.as_ref()
-                                    .map(|o| o.perf.clone())
-                                    .unwrap_or_default()
-                            })
-                            .collect();
+                    let per_worker_perf: Vec<crate::worker::WireL2Perf> = partials_for_handler
+                        .borrow()
+                        .iter()
+                        .map(|opt| opt.as_ref().map(|o| o.perf.clone()).unwrap_or_default())
+                        .collect();
                     let result = WorkerComputeResult {
                         l2: assembled.0,
                         maf: assembled.1,

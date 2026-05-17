@@ -470,10 +470,18 @@ fn perf_breakdown_view(out: &WorkerComputeResult) -> impl IntoView + use<> {
         rows.push(("Sketch (scatter-add)".to_string(), s, "phase-cpu"));
     }
     if p.bb_dot_secs > 0.0 {
-        rows.push(("GEMM B^T·B (within-chunk)".to_string(), p.bb_dot_secs, "phase-cpu"));
+        rows.push((
+            "GEMM B^T·B (within-chunk)".to_string(),
+            p.bb_dot_secs,
+            "phase-cpu",
+        ));
     }
     if p.ab_dot_secs > 0.0 {
-        rows.push(("GEMM A^T·B (cross-window)".to_string(), p.ab_dot_secs, "phase-cpu"));
+        rows.push((
+            "GEMM A^T·B (cross-window)".to_string(),
+            p.ab_dot_secs,
+            "phase-cpu",
+        ));
     }
     if p.ring_store_secs > 0.0 {
         rows.push(("Ring buffer".to_string(), p.ring_store_secs, "phase-cpu"));
@@ -493,9 +501,9 @@ fn perf_breakdown_view(out: &WorkerComputeResult) -> impl IntoView + use<> {
         .map(|(label, secs, css)| {
             let pct = (secs / max_bar * 100.0).clamp(0.0, 100.0);
             let bar_color = match css {
-                "phase-io" => "#d97706",   // amber — I/O stall
-                "phase-cpu" => "#2a71a5",  // blue — CPU work
-                _ => "#9ca3af",            // grey — other
+                "phase-io" => "#d97706",  // amber — I/O stall
+                "phase-cpu" => "#2a71a5", // blue — CPU work
+                _ => "#9ca3af",           // grey — other
             };
             view! {
                 <div class="perf-row">

@@ -2636,7 +2636,11 @@ mod tests {
             let centered = sum_sq - count as f64 * mean * mean;
             let var = centered / n_indiv as f64;
             mean_buf[j] = mean as f32;
-            inv_std_buf[j] = if var > 0.0 { (1.0 / var.sqrt()) as f32 } else { 0.0 };
+            inv_std_buf[j] = if var > 0.0 {
+                (1.0 / var.sqrt()) as f32
+            } else {
+                0.0
+            };
         }
 
         // d × c output column-major Vec.
@@ -2811,7 +2815,11 @@ mod tests {
             let centered = sum_sq - count as f64 * mean * mean;
             let var = centered / n_indiv as f64;
             mean_buf[j] = mean as f32;
-            inv_std_buf[j] = if var > 0.0 { (1.0 / var.sqrt()) as f32 } else { 0.0 };
+            inv_std_buf[j] = if var > 0.0 {
+                (1.0 / var.sqrt()) as f32
+            } else {
+                0.0
+            };
         }
 
         let mut out_all = vec![0f32; d * c];
