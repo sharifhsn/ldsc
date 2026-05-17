@@ -246,21 +246,13 @@ fn verify_against_baseline(kernel: Kernel, m: usize, n: usize, k: usize) {
     );
 }
 
-// ── Scatter parallelism microbench ───────────────────────────────────
+// ── Scatter microbench (Workstream H/J) ──────────────────────────────
 //
-// Measures the per-chunk wall of `wasm_simd::scatter::scatter_one_column_f32`
-// — the fused CountSketch (BED-decode → normalize → scatter-add →
-// renorm) hot path that Workstream H parallelised in the browser.
-// Single-threaded under wasmtime gives us the SERIAL per-chunk cost
-// so we can extrapolate the post-H per-outer-Worker wall as roughly
-// `serial_per_chunk × chunks_per_chr / inner_workers`.
-//
-// Splits c columns evenly across `n_workers` *sequential* slices to
-// also measure dispatch overhead — when n_workers=1 this is just a
-// straight serial run. Above 1, this approximates what one outer
-// Worker's pool dispatches will look like if all inner Workers
-// ran on the SAME core in sequence (so it's a *lower-bound* model
-// of wall reduction; actual cores will overlap).
+// Measures per-chunk wall of `wasm_simd::scatter::scatter_one_column_f32`,
+// the fused CountSketch (BED-decode → normalize → scatter-add → renorm)
+// hot path. Single-threaded under wasmtime; the SIMD-vs-scalar
+// comparison (added in J) drives the gate decision on shipping the
+// SIMD kernel. `n_workers=4` is the perfect-parallel ceiling.
 
 /// Deterministic synthetic BED packed bytes for `c` SNPs × `n_indiv`
 /// individuals. Same statistical character as `make_bed_fixture` in
@@ -481,21 +473,12 @@ fn bench_scatter_one(
     t
 }
 
-/// Sweep `n_workers` ∈ {1, 4} for a single (n_indiv, c, d) shape.
-/// `n_workers=1` is the pre-H per-chunk wall (one outer doing the
-/// whole scatter); `n_workers=4` is the post-H ceiling on a 4-inner
-/// pool when all slices run on the same physical core in sequence.
-///
-/// Notes:
-/// - Wasmtime is single-threaded, so this can't measure actual
-///   parallel speedup — only the SERIAL cost of c columns. The
-///   reported per-slice time at `n_workers=4` is wall/4 (the time
-///   each inner Worker would spend if perfectly load-balanced and
-///   the kernel scales linearly with cores).
-/// - Real-world speedup will land *below* this ceiling because of
-///   shared L2/L3 bandwidth contention. The Workstream H expected
-///   per-outer speedup is ~3-3.5× on 4 cores, so use that as the
-///   realistic target instead.
+/// Bench both kernels (scalar + dispatcher) at `n_workers ∈ {1, 4}`
+/// for a single (n_indiv, c, d) shape; print rows + a final speedup
+/// verdict. wasmtime is single-threaded so the `n_workers=4` row is
+/// a perfect-parallel ceiling, not actual parallelism — real
+/// in-browser speedups will land below due to L2/L3 contention
+/// across the 16 concurrent threads.
 fn bench_scatter_shape(
     label: &str,
     n_indiv: usize,
@@ -508,11 +491,8 @@ fn bench_scatter_shape(
     let cs = make_cs_proj(7, n_indiv, d);
     let (mean_buf, inv_std_buf) = compute_stats(&raw, c, n_indiv);
 
-    // Per-kernel min times so we can report SIMD/scalar speedup at
-    // the end. Bench scalar AND the dispatcher (SIMD on +simd128
-    // builds, scalar otherwise — the dispatch lookup is constant-
-    // folded by the optimiser since `target_feature` is a build-time
-    // cfg).
+    // Bench both kernels; the dispatcher picks SIMD at compile time
+    // on +simd128 builds (the gate is `cfg(target_feature)`).
     let kernels = [ScatterKernel::Scalar, ScatterKernel::Dispatch];
     let mut min_times: [(ScatterKernel, f64); 2] = [
         (ScatterKernel::Scalar, f64::INFINITY),

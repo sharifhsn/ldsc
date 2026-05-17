@@ -1783,39 +1783,30 @@ pub(crate) mod scatter {
         }
     }
 
-    /// Multi-lane scatter kernel using wasm32-simd128. Only available
-    /// for the all_iids fast path (the dominant case in browser sketch
-    /// runs — full genome compute with no `--keep` filter).
+    /// Multi-lane scatter kernel for the wasm32+simd128 / all_iids
+    /// fast path (the dominant case in browser sketch runs — full
+    /// genome compute with no `--keep` filter).
     ///
-    /// **The mechanism is the lane-decorrelation trick, not the SIMD
-    /// ops themselves.** Maintain K=4 independent scatter buffers
-    /// (`dst_lanes[0..4]`) and distribute the 4 individuals packed in
-    /// each BED byte 1:1 onto lanes 0..3. This breaks the serial
-    /// dependency chain on the indirect `dst[bucket[i]] +=` store —
-    /// the CPU can keep 4 scatter streams in flight concurrently
-    /// because they target disjoint memory. After the inner loop, fold
-    /// the 4 lanes into the final `dst` column with f32x4 SIMD adds.
-    ///
-    /// f32x4 SIMD ops apply only to (a) the 4 mul ops on the
-    /// `sign[i] * val[i]` per-byte step (1 vector mul replaces 4 scalar
-    /// muls), (b) the K-way lane fold, and (c) the renorm tail
-    /// (sum-of-squares + scale). The scatter-add itself is necessarily
-    /// scalar (wasm has no native gather/scatter).
+    /// Key trick is lane decorrelation, not SIMD ops: K=4 independent
+    /// scatter buffers (`lane0..lane3`) receive the 4 individuals
+    /// packed in each BED byte 1:1, breaking the serial dep chain on
+    /// the indirect `dst[bucket[i]] +=` store. The lanes are folded
+    /// into the final `dst` column with f32x4 SIMD adds. SIMD also
+    /// applies to the 4 per-byte `sign * val` muls and the renorm
+    /// tail; the scatter-add itself stays scalar (wasm has no
+    /// gather/scatter).
     ///
     /// # Numerics
     ///
-    /// Reduction order changes from "single-stream left-to-right" to
-    /// "4 independent streams folded at the end". For f32 accumulation
-    /// this introduces relative error bounded by `~ε·sqrt(K)` ≈ 3e-7
-    /// at K=4 — well inside f32 precision. The renorm `nrm_sq` is
-    /// accumulated in `f64x2` SIMD lanes then folded in f64, matching
-    /// the scalar reference's "accumulate in f64" intent.
+    /// Reduction order changes from single-stream to K=4 streams
+    /// folded at the end. f32 error bound `~ε·sqrt(K)` ≈ 3e-7 at K=4.
+    /// `nrm_sq` is accumulated in `f64x2` lanes then folded in f64,
+    /// matching the scalar reference's f64-accumulation intent.
     ///
     /// # Safety
     ///
-    /// Same preconditions as [`scatter_one_column_f32`]. Additionally
-    /// requires `all_iids == true` (caller's responsibility — the
-    /// dispatcher gates on this).
+    /// Same as [`scatter_one_column_f32`]; additionally requires
+    /// `all_iids == true` (dispatcher gates on this).
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn scatter_one_column_f32_simd128(
@@ -1842,15 +1833,11 @@ pub(crate) mod scatter {
         let bucket_slice = unsafe { core::slice::from_raw_parts(bucket, n_indiv) };
         let sign_slice = unsafe { core::slice::from_raw_parts(sign, n_indiv) };
 
-        // K=4 lane buffers, allocated on the wasm stack (per inner
-        // worker; 2 MB TLS region). At d=200 → 4 × 200 × 4 = 3.2 KB,
-        // fits L1d trivially.
-        //
-        // We bound the on-stack size statically with `MAX_D` so the
-        // compiler can elide bounds checks; if a caller passes d >
-        // MAX_D we fall back to scalar (defensive — the dispatcher
-        // doesn't currently enforce this, and `d=200` is the speed-
-        // optimize default; the sketch slider's max is 3200).
+        // K=4 lane buffers, stack-allocated in the inner worker's
+        // 2 MB TLS region. At d=200 → 4 × 200 × 4 = 3.2 KB (L1-fit).
+        // MAX_D bounds the stack reservation so bounds checks elide;
+        // d > MAX_D falls back to scalar (defensive — sketch slider
+        // max is 3200).
         const MAX_D: usize = 4096;
         if d > MAX_D {
             unsafe {
@@ -1874,14 +1861,13 @@ pub(crate) mod scatter {
             }
             return;
         }
-        // Use `MaybeUninit` + manual zero of the `d`-sized prefix to
-        // avoid paying for a 4 × MAX_D × 4 = 64 KB stack memset on
-        // every call (the literal `[0.0f32; MAX_D]` form would force
-        // that). At d=200 we only pay for 4 × 200 × 4 = 3.2 KB of
-        // zeroing — a 20× cut. Bench numbers (wasmtime 2026-05-17)
-        // showed the 64 KB memset version regressed 1000G N=2490 by
-        // 12 % vs scalar; this fix takes the SIMD path back into the
-        // win column at small N.
+        // `MaybeUninit` + zero only the `d`-sized prefix instead of
+        // the full MAX_D (literal `[0.0; MAX_D]` forces a 64 KB
+        // memset per call; at small N that init dominates and the
+        // SIMD path goes from 1.43× → 0.88× scalar — verified on the
+        // wasm-bench scatter sweep). SAFETY: every read/write below
+        // is bounded by `d` (via `bucket[i] < d` from CountSketchProj
+        // construction), so the uninit tail is never touched.
         let mut lane0_uninit: [core::mem::MaybeUninit<f32>; MAX_D] =
             [core::mem::MaybeUninit::uninit(); MAX_D];
         let mut lane1_uninit: [core::mem::MaybeUninit<f32>; MAX_D] =
@@ -1890,51 +1876,32 @@ pub(crate) mod scatter {
             [core::mem::MaybeUninit::uninit(); MAX_D];
         let mut lane3_uninit: [core::mem::MaybeUninit<f32>; MAX_D] =
             [core::mem::MaybeUninit::uninit(); MAX_D];
-        // SAFETY: zeroing exactly the [..d] prefix; later reads/writes
-        // are bounded to [..d] by the loops below, so the uninit tail
-        // is never touched.
         unsafe {
             core::ptr::write_bytes(lane0_uninit.as_mut_ptr() as *mut f32, 0, d);
             core::ptr::write_bytes(lane1_uninit.as_mut_ptr() as *mut f32, 0, d);
             core::ptr::write_bytes(lane2_uninit.as_mut_ptr() as *mut f32, 0, d);
             core::ptr::write_bytes(lane3_uninit.as_mut_ptr() as *mut f32, 0, d);
         }
-        // SAFETY: the [..d] prefix is now initialised. Reinterpret
-        // the whole array as `[f32; MAX_D]` because the existing code
-        // below indexes via `get_unchecked` bounded by `d` and `bucket
-        // [i] < d`; the uninit tail is never read.
         let lane0 = unsafe { &mut *(&mut lane0_uninit as *mut _ as *mut [f32; MAX_D]) };
         let lane1 = unsafe { &mut *(&mut lane1_uninit as *mut _ as *mut [f32; MAX_D]) };
         let lane2 = unsafe { &mut *(&mut lane2_uninit as *mut _ as *mut [f32; MAX_D]) };
         let lane3 = unsafe { &mut *(&mut lane3_uninit as *mut _ as *mut [f32; MAX_D]) };
 
-        // Per-byte LUT: same shape as the scalar path — each of the
-        // 256 byte values maps to 4 normalized f32s (missing → 0.0).
         let norm_lut = build_norm_byte_lut_f32(mean, inv_std);
-
         let n_full_bytes = n_indiv / 4;
-        // SAFETY: `bucket[i] < d` by construction (rng.u32(..d) in
-        // CountSketchProj::new); `sign[i]` is ±1 by construction;
-        // both are read-only here. `lane[k].get_unchecked_mut` is
-        // bounded by `d ≤ MAX_D`.
+        // SAFETY: bucket[i] < d ≤ MAX_D by CountSketchProj construction;
+        // snp_bytes/sign/bucket reads are bounded by n_indiv.
         unsafe {
             for byte_idx in 0..n_full_bytes {
                 let byte = *snp_bytes.get_unchecked(byte_idx);
-                // 4 normalized vals (one per packed individual).
-                // The LUT entry is `[f32; 4]` aligned to 16 bytes by
-                // chance of `from_fn`'s array layout; use `v128_load`
-                // semantics via raw transmute.
-                let vals_arr = &norm_lut[byte as usize];
-                let vals_v = v128_load(vals_arr.as_ptr() as *const v128);
+                let vals_v = v128_load(norm_lut[byte as usize].as_ptr() as *const v128);
                 let base_i = byte_idx * 4;
-                // Load 4 contiguous signs as a v128.
                 let signs_v = v128_load(sign_slice.as_ptr().add(base_i) as *const v128);
-                // f32x4 multiply: scaled[k] = signs[k] * vals[k].
+                // 1 vector mul replaces 4 scalar muls; the 4 lane
+                // scatter-adds below are independent (disjoint
+                // `laneN` buffers) so the CPU can keep them in flight
+                // concurrently, breaking the dep chain.
                 let scaled_v = f32x4_mul(vals_v, signs_v);
-                // Extract 4 scaled values back to scalars for the
-                // per-lane indirect store. wasm has no
-                // gather/scatter, so this is unavoidable; the win
-                // is the dep-chain break across lanes.
                 let s0 = f32x4_extract_lane::<0>(scaled_v);
                 let s1 = f32x4_extract_lane::<1>(scaled_v);
                 let s2 = f32x4_extract_lane::<2>(scaled_v);
@@ -1950,14 +1917,11 @@ pub(crate) mod scatter {
             }
         }
 
-        // Remainder individuals (n_indiv % 4 ∈ {0, 1, 2, 3}). Distribute
-        // 1:1 onto lanes 0..(rem-1).
+        // Remainder individuals (n_indiv % 4 ∈ {1, 2, 3}) onto lanes
+        // 0..rem-1. Reborrow lanes so they stay usable for the fold.
         let rem_start = n_full_bytes * 4;
         let rem = n_indiv - rem_start;
         if rem > 0 {
-            // SAFETY: rem ∈ {1, 2, 3}; lane writes are bounded by d.
-            // Reborrow lane0..lane3 (via `&mut *`) so they stay
-            // usable for the fold below.
             unsafe {
                 let vals_arr = &norm_lut[*snp_bytes.get_unchecked(n_full_bytes) as usize];
                 let lanes: [&mut [f32; MAX_D]; 4] =
@@ -1992,21 +1956,18 @@ pub(crate) mod scatter {
             }
         }
 
-        // Renorm tail in f64 (for parity with the scalar reference's
-        // f64 accumulation). f64x2 SIMD: 2 parallel squared-sum accs
-        // per vector, 2 vectors = 4 independent f64 streams to break
-        // the dep chain on the running sum.
+        // Renorm tail: ||dst||^2 in 4 parallel f64 accs (2 × f64x2)
+        // to break the dep chain, then scale dst by sqrt(n_norm/ssq).
+        // SAFETY: dst.len() == d ≤ MAX_D; all loads in range.
         let mut ssq_a = f64x2_splat(0.0);
         let mut ssq_b = f64x2_splat(0.0);
-        // SAFETY: dst.len() == d ≤ MAX_D; all loads in range.
         unsafe {
             let mut j = 0usize;
-            // Stride 4 f32s per iter (= 4 f64s after widening).
             while j + 4 <= d {
                 let v = v128_load(dst.as_ptr().add(j) as *const v128);
-                // Widen lo/hi 2 f32s to 2 f64s each. Use the wasm
-                // f64x2_promote_low_f32x4 intrinsic; for the high
-                // pair, shuffle the high 2 lanes down first.
+                // Widen lo/hi pairs of f32 → f64 (the wasm intrinsic
+                // only promotes the low 2 lanes, so shuffle high
+                // first for the hi pair).
                 let v_hi_lo = i32x4_shuffle::<2, 3, 0, 0>(v, v);
                 let lo64 = f64x2_promote_low_f32x4(v);
                 let hi64 = f64x2_promote_low_f32x4(v_hi_lo);
@@ -2014,10 +1975,8 @@ pub(crate) mod scatter {
                 ssq_b = f64x2_add(ssq_b, f64x2_mul(hi64, hi64));
                 j += 4;
             }
-            // Reduce 4 f64 accs to one scalar.
             let acc = f64x2_add(ssq_a, ssq_b);
             let mut nrm_sq = f64x2_extract_lane::<0>(acc) + f64x2_extract_lane::<1>(acc);
-            // Scalar tail (d % 4 ∈ {0, 1, 2, 3}).
             while j < d {
                 let v = *dst.get_unchecked(j) as f64;
                 nrm_sq += v * v;
@@ -2029,8 +1988,7 @@ pub(crate) mod scatter {
                 let mut j2 = 0usize;
                 while j2 + 4 <= d {
                     let v = v128_load(dst.as_ptr().add(j2) as *const v128);
-                    let scaled = f32x4_mul(v, scale_v);
-                    v128_store(dst.as_mut_ptr().add(j2) as *mut v128, scaled);
+                    v128_store(dst.as_mut_ptr().add(j2) as *mut v128, f32x4_mul(v, scale_v));
                     j2 += 4;
                 }
                 while j2 < d {

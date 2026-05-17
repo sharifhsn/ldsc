@@ -337,26 +337,15 @@ bottleneck shift across each workstream:
 - Post-I: scatter dominant on each worker
 - Post-J: scatter ↓ ~18 %; bottleneck now run-to-run I/O variance
 
-### What's next (when worth it)
+### What's next
 
-Likely diminishing returns from further scatter work. Headroom
-candidates if wall reduction is still desired:
-- **L2 cache locality** on scatter — current K=4 lanes touch
-  3.2 KB each = 12.8 KB per thread total. At 16 concurrent
-  threads on M5 Pro's shared 18 MB L2, this is well under
-  contention. Probably not the bottleneck.
-- **I/O bandwidth** — FRS still costs ~3 s per long-tail worker.
-  OPFS sync-handles could halve this, but the 20-30 s upfront
-  copy makes it net-negative for the single-run flow (revisit
-  if multi-run flows land).
-- **Better load balancing** — chr partition is LPT; the
-  long-tail worker now varies run-to-run by ±2 s. Could
-  reshuffle chrs across runs for more consistent walls.
-
-None of these are clear-win opportunities. **The current state
-(post-J) appears to be near the practical floor** for browser
-LD-score compute on biobank-scale data with the FRS-based I/O
-path.
+Diminishing returns from further scatter work. Possible levers
+if wall is ever a priority again: OPFS sync-handles (saves
+~2-3 s but eats a 20-30 s upfront copy — net-negative for our
+single-run flow); chr partition reshuffling (reduce run-to-run
+±2 s variance); BIM/FAM micro-opts. **Post-J appears to be
+near the practical floor** for browser LD-score compute on
+biobank-scale data with FRS-based I/O.
 
 ## 2026-05-16 (Speed-optimize button + browser sketch sweep)
 

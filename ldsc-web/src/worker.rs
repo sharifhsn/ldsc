@@ -229,45 +229,26 @@ impl Seek for BlobBedSource {
     }
 }
 
-/// `Read + Seek` shim that serves a single contiguous chromosome's
-/// BED bytes from a pre-loaded `Vec<u8>` cached in wasm linear
-/// memory. Plus the 3-byte BED magic header at offset `[0, 3)` so
-/// `Bed::from_source`'s validation passes without touching the
-/// underlying Blob a second time.
+/// `Read + Seek` shim serving one chromosome's BED bytes from a
+/// pre-loaded `Vec<u8>` in wasm memory, plus the 3-byte BED magic
+/// header so `Bed::from_source` validation passes.
 ///
-/// # Why it exists
+/// Workstream I attack on the I/O bottleneck: one `await
+/// blob.slice(chr_start, chr_end).arrayBuffer()` upfront replaces
+/// the N (50-200) `FileReaderSync.readAsArrayBuffer` calls the
+/// streaming path would issue during compute. Per the [Emscripten
+/// WORKERFS perf issue], `Blob.slice() + readAsArrayBuffer()` has
+/// 50-100× overhead vs a typed-array cache on Chrome (per-call
+/// Mojo data-pipe copy, browser process → renderer).
 ///
-/// Workstream I (async pre-load) attacks the I/O bottleneck the
-/// post-H scatter parallelism could only partially hide. Pre-H, the
-/// compute path read each 2.5 MB chunk on demand via
-/// `FileReaderSync.readAsArrayBuffer(blob.slice(...))` from inside
-/// the outer Worker. At biobank N=50K that's 8,324 chunks × ~30-100
-/// ms each (8 MB BufReader amortizes the call latency but not the
-/// per-call Mojo data-pipe copy from browser process → renderer);
-/// per the [Emscripten WORKERFS perf issue][1] and the [Chrome blob
-/// storage notes][2], FileReaderSync of `Blob.slice()` has 50-100×
-/// overhead vs typed-array cache on Chrome.
+/// File-relative offsets are preserved (`file_len` is the FULL BED
+/// length, not the shard) so we don't have to translate `bed_idx`
+/// downstream. Reads outside `[chr_data_start, chr_data_start +
+/// chr_bytes.len())` error — the per-chr BIM slice fed to compute
+/// only references `bed_idx` in this chr's range, so the
+/// downstream `ChunkReader` should never seek there.
 ///
-/// Replacing the streaming source with one big `Promise<ArrayBuffer>`
-/// upfront (`blob.slice(chr_start, chr_end).arrayBuffer().await`)
-/// collapses N FileReaderSync calls per chr into ONE call that the
-/// browser can serve as a single contiguous Mojo copy. The compute
-/// path then reads from RAM, eliminating per-chunk JS↔wasm dispatch.
-///
-/// [1]: https://github.com/emscripten-core/emscripten/issues/6955
-/// [2]: https://chromium.googlesource.com/chromium/src/+/HEAD/storage/browser/blob/README.md
-///
-/// # Layout
-///
-/// The wrapped `Bed::from_source` validates a 3-byte BED magic
-/// header at offset 0 and computes `expected_len = 3 + sid_count *
-/// bytes_per_snp`, comparing to the supplied `file_len`. We pass
-/// the FULL file length (not the chr-shard's bytes) so this check
-/// passes; reads at offsets outside `[chr_data_start,
-/// chr_data_start + chr_bytes.len())` return an error because the
-/// caller (downstream `ChunkReader`) should never seek there: the
-/// per-chr BIM slice we feed compute only references SNPs with
-/// `bed_idx` in this chr's range.
+/// [Emscripten WORKERFS perf issue]: https://github.com/emscripten-core/emscripten/issues/6955
 pub struct PreloadedShardSource {
     /// `[0x6c, 0x1b, 0x01]` — the BED magic + SNP-major mode bytes.
     /// Served by `read` when `offset < 3`.
@@ -296,14 +277,10 @@ impl PreloadedShardSource {
         }
     }
 
-    /// Async-load a chr-shard byte range from a JS `Blob` via
-    /// `await blob.slice(start, end).arrayBuffer()`. Returns the
-    /// raw bytes in a `Vec<u8>` ready to hand to
-    /// [`PreloadedShardSource::new`].
-    ///
-    /// This is the single FRS-equivalent call per chr that replaces
-    /// the N (typically 50-200) FileReaderSync reads the streaming
-    /// path would issue.
+    /// Async-load a byte range from a JS `Blob` into a `Vec<u8>` via
+    /// `await blob.slice(start, end).arrayBuffer()`. One JS↔wasm
+    /// round-trip per chr instead of the 50-200 FRS calls the
+    /// streaming path would issue.
     pub async fn load_blob_range(
         blob: &Blob,
         start_byte: u64,

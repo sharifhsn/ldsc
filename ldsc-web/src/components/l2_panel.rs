@@ -536,9 +536,7 @@ fn perf_breakdown_view(out: &WorkerComputeResult) -> impl IntoView + use<> {
                 {row_views}
             </div>
             <div class="text-muted mt-1" style="font-size: 0.75rem;">
-                "Amber = I/O stall (FileReaderSync bandwidth-bound). "
-                "Blue = CPU work (SIMD compute). "
-                "If amber dominates, the wall is I/O-bound — see plan workstream notes."
+                "Amber = file I/O stall. Blue = CPU work (SIMD compute)."
             </div>
         </div>
     }
