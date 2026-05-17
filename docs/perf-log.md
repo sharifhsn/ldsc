@@ -173,17 +173,88 @@ copies. Either way, the change is foundational: subsequent
 attacks (OPFS, ring-buffer prefetch) build on this shape.
 
 **Verification:** Native gates clean (cargo check/test/clippy/fmt
-+ 20 tests pass). Wasm clippy + trunk build clean. **Browser
-smoke pending** — needs foregrounded Chrome tab. Look for:
++ 20 tests pass). Wasm clippy + trunk build clean.
 
-1. **Attack A**: the new "Where the wall went" card in the
-   L2 results, showing per-phase breakdown.
-2. **Attack B**: `bed_read(stall)` should drop substantially
-   vs pre-I; total wall should drop on biobank d=200.
+### Browser bench (foregrounded Chrome, M5 Pro, 18 cores, warm OS cache)
 
-If post-I `bed_read` is still &gt;30% of wall, the next attack
-is OPFS + `FileSystemSyncAccessHandle` (research recommends as
-the second-strongest play after async pre-load).
+Biobank-50K, full genome (1.66M SNPs), `--sketch 200
+--snp-level-masking --fast-f32 --ld-wind-kb 1000`. 8 outer × 2
+inner pool (auto-sized for `hardware_concurrency=18`). Biobank
+BED served via local CORS HTTP server (port 8081) then fetched
+into a JS File via `fetch(...).blob()` (8.5 s; this warms
+Chrome's blob storage + the OS page cache for subsequent FRS
+reads).
+
+**Apples-to-apples (both warm cache):**
+
+| | Wall | Mean L2 | Median | Max | MAF/L2 r |
+|---|---|---|---|---|---|
+| **CLI** `ldsc l2 --sketch 200 --snp-level-masking` | **7.70 s** | 22.5728 | 18.8751 | 305.4550 | 0.4085 |
+| **Browser run 1** | **9.61 s** | 22.573 | 18.875 | 305.45 | 0.409 |
+| **Browser run 2** | **10.61 s** | 22.573 | 18.875 | 305.45 | 0.409 |
+
+L2 output **bit-identical** to CLI to displayed precision. The
+browser/CLI walltime ratio is **1.25-1.38×** — was an estimated
+3-9× gap before Attack B.
+
+**Per-phase breakdown** (long-tail worker on run 1, chr1's
+worker, m=191,706 SNPs; pool wall = max across 8 workers = 9.61
+s):
+
+| Phase | Time | % |
+|---|---|---|
+| BED read (FRS stall) | **3.28 s** | 34% |
+| Normalize | 0.00 s | 0% |
+| **Sketch (scatter-add)** | **4.96 s** | **52%** |
+| GEMM B^T·B (within-chunk) | 0.21 s | 2% |
+| GEMM A^T·B (cross-window) | 0.68 s | 7% |
+| Ring buffer | 0.01 s | 0% |
+| Other / dispatch | 0.47 s | 5% |
+
+**Per-worker spread** across 8 outer workers (m=190K-220K SNPs
+each): walls 7.56-9.61 s, bed_read 0.92-3.43 s, sketch
+4.91-5.70 s. The LPT chr-shard partition is well-balanced;
+wall variance is dominated by which worker drew chr1.
+
+### Interpretation
+
+**Attack B (async pre-load) was the right play.** Pre-I the
+predicted bottleneck was per-chunk FileReaderSync overhead
+inflating `bed_read`; the wasmtime extrapolation suggested
+scatter parallelism alone would only save ~2 s on the chr1
+outer. Post-I, `bed_read` is 34% of the long-tail wall (was an
+estimated ~70% pre-I), and **scatter is now the dominant phase
+at 52%**. The bottleneck **shifted from I/O to compute**, which
+is exactly the inversion Workstream I was aiming for.
+
+The 1.25× browser/CLI ratio on warm cache is the new floor for
+this configuration. To narrow it further:
+
+1. **Scatter SIMD** (50% of wall) — `scatter_one_column_f32` is
+   currently scalar adds. A wasm32-simd128 path (e.g. f32x4
+   lanes with fused mul-add, processing 4 individuals per step)
+   could plausibly halve the sketch phase. wasm32 lacks native
+   gather but a 4-wide scalar-fused approach should help.
+2. **OPFS + sync handles** — for the I/O 34%, OPFS would convert
+   FRS to "near-native" reads at ~1 GB/s. Would save ~2-3 s on
+   the 9.6 s wall (browser/CLI ratio → ~1.0×), but the upfront
+   20-30 s OPFS copy is a hard UX cost. Bounded payoff; probably
+   not worth it given the user only sees one compute run per
+   upload.
+3. **Cold-cache verification** — couldn't drop OS cache without
+   `sudo purge`; the cold-cache CLI baseline of 24.9 s (from
+   earlier sessions) suggests the cold-vs-warm CLI delta is
+   ~17 s, dominated by 20.81 GB of mmap reads at SSD bandwidth.
+   The browser's cold-cache wall would presumably scale similarly
+   (~26 s if I/O scales 1:1, but Attack B's contiguous-blob
+   `arrayBuffer()` call may benefit from prefetch). Worth
+   measuring on a future cold-cache session.
+
+**Net of workstreams H + I**: pre-H predicted biobank wall was
+~70 s (background-tab estimate); landed at **9.61 s in the
+browser, 1.25× of warm-cache CLI**. Cumulative wall reduction
+from H+I ≈ **6-7×**, vs the planned ~2× from scatter
+parallelism alone. Async pre-load was the unforeseen big win.
 
 ## 2026-05-16 (Speed-optimize button + browser sketch sweep)
 
