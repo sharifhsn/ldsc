@@ -1,72 +1,13 @@
-//! Plotters charts rendered into a `<canvas>` via the
-//! `plotters-canvas` `CanvasBackend`.
-//!
-//! Two charts: the LD-score histogram and the L2-vs-MAF scatter.
-//! Both take pre-computed Vec<f64> buffers and render synchronously.
+//! Plotters chart rendered into a `<canvas>` via the
+//! `plotters-canvas` `CanvasBackend`. The L2-vs-MAF scatter is the
+//! one plot LDSC researchers actually use for QC (positive r ≈ 0.27
+//! expected in EUR panels per the LDSC wiki). The histogram was
+//! dropped in workstream K — never published, percentiles in the
+//! stat grid carry the same information.
 
 use anyhow::{Context, Result};
 use plotters::prelude::*;
 use plotters_canvas::CanvasBackend;
-
-/// Render an LD-score histogram into the canvas with id `canvas_id`.
-/// 50 evenly-spaced bins from 0 to the 99th percentile (clipping the
-/// long tail so the bulk of the distribution is readable).
-pub fn render_l2_histogram(canvas_id: &str, l2: &[f64]) -> Result<()> {
-    let backend =
-        CanvasBackend::new(canvas_id).context("CanvasBackend::new — canvas element not found")?;
-    let root = backend.into_drawing_area();
-    root.fill(&WHITE).map_err(to_anyhow)?;
-
-    if l2.is_empty() {
-        return Ok(());
-    }
-
-    let p99 = percentile(l2, 0.99).unwrap_or(0.0).max(1.0);
-    let bins = 50usize;
-    let mut counts = vec![0u32; bins];
-    for &v in l2 {
-        if v < 0.0 || !v.is_finite() {
-            continue;
-        }
-        let bin = ((v / p99) * bins as f64).floor() as usize;
-        let bin = bin.min(bins - 1);
-        counts[bin] += 1;
-    }
-    let max_count = counts.iter().copied().max().unwrap_or(1).max(1);
-
-    let mut chart = ChartBuilder::on(&root)
-        .margin(20)
-        .x_label_area_size(40)
-        .y_label_area_size(50)
-        .caption(
-            format!("LD-score histogram (50 bins, 0 → P99 = {:.1})", p99),
-            ("Arial", 16, &BLACK),
-        )
-        .build_cartesian_2d(0f64..p99, 0u32..(max_count + max_count / 8 + 1))
-        .map_err(to_anyhow)?;
-
-    chart
-        .configure_mesh()
-        .x_desc("LD score (ℓ_j)")
-        .y_desc("count")
-        .axis_desc_style(("Arial", 13, &BLACK))
-        .label_style(("Arial", 11, &BLACK))
-        .draw()
-        .map_err(to_anyhow)?;
-
-    let bin_w = p99 / bins as f64;
-    let blue = RGBColor(42, 113, 165); // matches LDLink primary
-    chart
-        .draw_series(counts.iter().enumerate().map(|(i, &c)| {
-            let x0 = i as f64 * bin_w;
-            let x1 = x0 + bin_w;
-            Rectangle::new([(x0, 0u32), (x1, c)], blue.filled())
-        }))
-        .map_err(to_anyhow)?;
-
-    root.present().map_err(to_anyhow)?;
-    Ok(())
-}
 
 /// Render an L2-vs-MAF scatter (one point per SNP).
 pub fn render_l2_vs_maf(canvas_id: &str, maf: &[f64], l2: &[f64]) -> Result<()> {

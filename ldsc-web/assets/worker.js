@@ -28,6 +28,11 @@
 //                    DedicatedWorkerGlobalScope.postMessage. We
 //                    don't intercept those — they flow straight through.
 //
+// (h² runs on the MAIN thread now, not in a worker — the
+// multi-threaded wasm bundle's allocator hits an `unreachable`
+// trap on the first `passArrayF64ToWasm0` malloc from a worker.
+// See `ldsc-web/src/worker.rs::compute_h2_demo` doc-comment.)
+//
 // Unknown / typo'd `kind` values short-circuit to a structured
 // error rather than silent drop.
 //
@@ -171,6 +176,7 @@ self.onmessage = async (e) => {
             self.postMessage({ kind: 'compute_l2_chrs_done', result, wallSecondsJs: dt / 1000 });
             return;
         }
+
 
         // Unreachable — KNOWN_KINDS guard above ensures we never
         // get here, but keep a defensive postMessage in case the

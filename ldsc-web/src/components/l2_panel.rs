@@ -15,7 +15,7 @@
 use leptos::ev::MouseEvent;
 use leptos::prelude::*;
 
-use super::charts::{percentile, render_l2_histogram, render_l2_vs_maf};
+use super::charts::render_l2_vs_maf;
 use super::file_upload::{FileUploadRow, LoadedFile, ReadAs};
 use super::worker_client::{PoolProgress, WorkerComputeResult, spawn_compute_l2_pool};
 use crate::worker::{WireL2Config, WireWindowMode};
@@ -72,28 +72,16 @@ impl ModePreset {
 struct RunStats {
     n_snps: usize,
     mean_l2: f64,
-    median_l2: f64,
-    max_l2: f64,
-    mean_maf: f64,
     maf_l2_corr: f64,
     wall_seconds: f64,
 }
 
 impl RunStats {
     fn from_output(out: &WorkerComputeResult) -> Self {
-        let n_snps = out.l2.len();
-        let mean_l2 = mean(&out.l2);
-        let median_l2 = percentile(&out.l2, 0.5).unwrap_or(0.0);
-        let max_l2 = out.l2.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let mean_maf = mean(&out.maf);
-        let maf_l2_corr = pearson(&out.maf, &out.l2);
         Self {
-            n_snps,
-            mean_l2,
-            median_l2,
-            max_l2,
-            mean_maf,
-            maf_l2_corr,
+            n_snps: out.l2.len(),
+            mean_l2: mean(&out.l2),
+            maf_l2_corr: pearson(&out.maf, &out.l2),
             wall_seconds: out.wall_seconds,
         }
     }
@@ -127,24 +115,23 @@ pub fn L2Panel() -> impl IntoView {
     // progress messages from each per-chr worker.
     let progress: RwSignal<(usize, usize)> = RwSignal::new((0, 0));
 
-    // Re-render charts whenever a new result lands.
+    // Re-render the MAF/L2 scatter whenever a new L2 result lands.
+    // The histogram was dropped as part of the demo refocus
+    // (Workstream K — geneticists never publish L2 histograms; the
+    // percentiles in the stat grid already convey the distribution
+    // shape, and the MAF/L2 scatter is the one plot with documented
+    // diagnostic precedent in the LDSC ecosystem).
     Effect::new(move |_| {
         if let Some(out) = result.get() {
-            // Defer one tick so the canvas elements exist in the DOM.
-            // Guard against the canvases having been detached (user
-            // switched modules / navigated mid-render); without the
-            // guard, plotters tries to paint to a missing element
-            // and the render functions log a confusing error.
+            // Defer one tick so the canvas element exists in the DOM.
+            // Guard against detachment (user switched modules / route
+            // mid-render); the canvas may be gone by the time the
+            // closure runs.
             request_animation_frame(move || {
                 let doc = match web_sys::window().and_then(|w| w.document()) {
                     Some(d) => d,
                     None => return,
                 };
-                if doc.get_element_by_id("chart-hist").is_some()
-                    && let Err(e) = render_l2_histogram("chart-hist", &out.l2)
-                {
-                    tracing::error!("histogram render: {e:?}");
-                }
                 if doc.get_element_by_id("chart-scatter").is_some()
                     && let Err(e) = render_l2_vs_maf("chart-scatter", &out.maf, &out.l2)
                 {
@@ -387,10 +374,16 @@ pub fn L2Panel() -> impl IntoView {
         {move || result.get().map(|out| {
             let stats = RunStats::from_output(&out);
             let perf_view = perf_breakdown_view(&out);
+            let (corr_class, corr_note) = classify_maf_l2_corr(stats.maf_l2_corr);
             view! {
                 <div class="card">
-                    <div class="card-header">"Results"</div>
+                    <div class="card-header">"L2 — LD Scores"</div>
                     <div class="card-body">
+                        // Tight stat grid: the four numbers Python LDSC's
+                        // CLI summary actually prints (wall, SNPs, mean L2,
+                        // MAF/L2 r). Median / max / mean MAF dropped — the
+                        // research summary in docs/perf-log.md notes only
+                        // mean L2 + MAF/L2 r are routinely cited.
                         <div class="stat-grid">
                             <div class="stat">
                                 <div class="label">"Wall time"</div>
@@ -405,31 +398,43 @@ pub fn L2Panel() -> impl IntoView {
                                 <div class="value">{format!("{:.3}", stats.mean_l2)}</div>
                             </div>
                             <div class="stat">
-                                <div class="label">"Median L2"</div>
-                                <div class="value">{format!("{:.3}", stats.median_l2)}</div>
-                            </div>
-                            <div class="stat">
-                                <div class="label">"Max L2"</div>
-                                <div class="value">{format!("{:.2}", stats.max_l2)}</div>
-                            </div>
-                            <div class="stat">
-                                <div class="label">"Mean MAF"</div>
-                                <div class="value">{format!("{:.3}", stats.mean_maf)}</div>
-                            </div>
-                            <div class="stat">
                                 <div class="label">"MAF / L2 r"</div>
                                 <div class="value">{format!("{:.3}", stats.maf_l2_corr)}</div>
+                                <div class=corr_class style="font-size: 0.7rem; margin-top: 0.15rem;">
+                                    {corr_note}
+                                </div>
                             </div>
                         </div>
 
-                        {perf_view}
-
-                        <canvas id="chart-hist" class="chart" width="880" height="320"></canvas>
                         <canvas id="chart-scatter" class="chart" width="880" height="320"></canvas>
+                        <p class="text-muted mt-1 mb-0" style="font-size: 0.75rem;">
+                            "QC: MAF and L2 should be positively correlated (LDSC wiki: r ≈ 0.27 in EUR panels). \
+                             Negative r → check for MAF filter / panel issues."
+                        </p>
+
+                        <details class="mt-3">
+                            <summary class="text-muted" style="font-size: 0.825rem;">
+                                "Compute timing breakdown (where the wall went)"
+                            </summary>
+                            <div class="mt-2">{perf_view}</div>
+                        </details>
                     </div>
                 </div>
             }
         })}
+    }
+}
+
+/// Categorise the MAF/L2 Pearson correlation against the LDSC
+/// wiki's expectation (positive, r ≈ 0.27 in EUR panels). Returns
+/// (css-class, short-note) for the UI badge under the stat tile.
+fn classify_maf_l2_corr(r: f64) -> (&'static str, &'static str) {
+    if r >= 0.10 {
+        ("h2-good", "✓ positive (typical EUR ≈ 0.27)")
+    } else if r >= 0.0 {
+        ("h2-warn", "weak (typical EUR ≈ 0.27)")
+    } else {
+        ("h2-bad", "⚠ negative — check MAF filter / panel")
     }
 }
 

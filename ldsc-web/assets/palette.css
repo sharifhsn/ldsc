@@ -250,6 +250,27 @@ canvas.chart {
     .perf-breakdown .perf-bar-wrap { background: #2a2a2f; }
 }
 
+/* ── h² / QC badges (used by MAF/L2 r + h² agreement) ────────── */
+.h2-good { color: #198754; }
+.h2-warn { color: #b97a04; }
+.h2-bad  { color: #842029; font-weight: 500; }
+@media (prefers-color-scheme: dark) {
+    .h2-good { color: #6db988; }
+    .h2-warn { color: #d4a14a; }
+    .h2-bad  { color: #e08494; }
+}
+
+/* ── Card header subtitle (used by the h² demo card) ────────── */
+.card-header .subtitle {
+    color: rgba(255, 255, 255, 0.7);
+    font-weight: 400;
+    font-size: 0.85rem;
+    margin-left: 0.5rem;
+}
+@media (prefers-color-scheme: dark) {
+    .card-header .subtitle { color: rgba(255, 255, 255, 0.6); }
+}
+
 .error-box {
     color: #842029;
     background: #f8d7da;
