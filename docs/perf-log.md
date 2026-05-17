@@ -81,6 +81,110 @@ how changes affect runtime.
   attack vector should be the I/O path, not further scatter
   parallelism.
 
+## 2026-05-17 (Workstream I: I/O attack — research, telemetry UI, async pre-load)
+
+Followup to Workstream H's discovery that scatter parallelism only
+saves ~2 s of wall (per the wasmtime extrapolation). The residual
+~40+ s browser-vs-CLI gap on biobank d=200 is presumed to be
+dominated by `FileReaderSync` bandwidth — this entry lands the
+verification machinery + the first concrete I/O attack.
+
+### Research summary (sources in commit message)
+
+Surveyed browser file I/O patterns for the 20.81 GB BED case:
+
+- **Emscripten WORKERFS issue #6955** documents 50-100× Chrome
+  slowdown for `Blob.slice() + readAsArrayBuffer()` per-call vs
+  caching the whole file into a typed array. Per-call overhead,
+  not bandwidth, is the dominant cost at small chunk sizes.
+- **Chrome blob storage README**: blob bytes live in the *browser*
+  process; each read is a Mojo data-pipe copy (browser →
+  renderer) + a JS→wasm copy. At minimum 2 copies per chunk.
+- **`blob.bytes()`** (Chrome 140+, Firefox 128, Safari 18, all
+  shipped in 2025): newer Promise<Uint8Array> API, "collapses the
+  two-step ritual into a single call" but no published MB/s numbers.
+- **`FileSystemSyncAccessHandle`** (OPFS, Chrome 121+ supports
+  multiple concurrent handles per file): described as "the entry
+  point to the fastest possible file operations" — qualitatively
+  ~1 GB/s, requires a one-time copy into OPFS (~20-40 s for our
+  20.81 GB BED).
+- **Producer-consumer pattern (padenot/ringbuf.js + Audio
+  Worklet)** is the canonical "dedicated I/O Worker + SAB ring"
+  shape used by mature WASM projects (ffmpeg.wasm,
+  mediabunny). NOT `wasm_bindgen_futures` async-everything.
+- **Concurrent reads on the same Blob** likely don't scale 8×
+  in Chrome (single `MojoBlobReader` per handle in the browser
+  process; reads serialize through it).
+
+### Attack A — surface per-phase telemetry in the L2 panel (LANDED)
+
+Commit `b8e71d6`. Per-phase walls (`bed_read`, `norm`, `sketch`,
+`bb_dot`, `ab_dot`, `ring_store`) were already collected per
+outer Worker in `WireL2Perf` and logged to console via
+`tracing::info!`, but the UI only showed the overall pool wall.
+
+Now `WorkerComputeResult` carries `per_worker_perf:
+Vec<WireL2Perf>` + `per_worker_wall_seconds: Vec<f64>`, and the
+L2 panel renders a horizontal-bar "Where the wall went"
+breakdown for the long-tail worker (the one whose
+`wall_seconds == max(per_worker_walls)` — that worker defines
+the pool wall, its phases are the ones that matter). Amber bars
+= I/O stall (FileReaderSync bandwidth-bound); blue = CPU work.
+Lets us iterate empirically without DevTools archaeology.
+
+### Attack B — async pre-load chr-shard via `blob.arrayBuffer()` (LANDED)
+
+Builds on the research finding that one big `blob.slice(start,
+end).arrayBuffer()` call collapses N FileReaderSync per-chunk
+reads into ONE Mojo data-pipe copy.
+
+- New `PreloadedShardSource` in `ldsc-web/src/worker.rs` —
+  `Read + Seek` shim backed by an in-memory `Vec<u8>` holding
+  one chr's BED bytes + the 3-byte BED magic header. Serves
+  reads from the cache; errors on out-of-range reads (which
+  shouldn't happen because we only feed it the BIM records for
+  this chr's `bed_idx` range).
+- `worker_compute_l2_chrs` is now `async fn` (`worker.js`
+  updated to `await` it). Per chr inside the existing per-chr
+  decomposition loop:
+  - Check that the chr's SNPs are contiguous in BED (true in
+    the no-`--extract` common case).
+  - If contiguous: pre-load via
+    `PreloadedShardSource::load_blob_range` (single
+    `await slice.arrayBuffer()`), build a Bed from the
+    in-memory shard, then run compute.
+  - If non-contiguous (future-proofing for an `--extract`
+    feature): fall back to the streaming `BlobBedSource` path.
+- The cached shard for chr1 at biobank is ~1.55 GB and lives in
+  the outer worker's wasm linear memory for that chr's compute,
+  then drops at the end of the iteration. Other chrs are
+  smaller; the peak is bounded by `max(chr_size) per outer`.
+  Fits comfortably under the 4 GB wasm32 cap.
+- Bundle size unchanged at 1.1 MB wasm (the change is in
+  worker.rs / worker.js, no new deps).
+
+**Expected impact (theory):** if per-call FileReaderSync
+overhead is the dominant cost (per the WORKERFS issue's 50-100×
+finding), this should drop biobank d=200 wall by a non-trivial
+fraction. If bandwidth is the dominant cost (i.e. the FRS
+streaming path is already near the Mojo data-pipe ceiling), the
+win is bounded by whatever `arrayBuffer()` saves on internal
+copies. Either way, the change is foundational: subsequent
+attacks (OPFS, ring-buffer prefetch) build on this shape.
+
+**Verification:** Native gates clean (cargo check/test/clippy/fmt
++ 20 tests pass). Wasm clippy + trunk build clean. **Browser
+smoke pending** — needs foregrounded Chrome tab. Look for:
+
+1. **Attack A**: the new "Where the wall went" card in the
+   L2 results, showing per-phase breakdown.
+2. **Attack B**: `bed_read(stall)` should drop substantially
+   vs pre-I; total wall should drop on biobank d=200.
+
+If post-I `bed_read` is still &gt;30% of wall, the next attack
+is OPFS + `FileSystemSyncAccessHandle` (research recommends as
+the second-strongest play after async pre-load).
+
 ## 2026-05-16 (Speed-optimize button + browser sketch sweep)
 
 - Change: added `⚡ Speed-optimize for your data` button to the

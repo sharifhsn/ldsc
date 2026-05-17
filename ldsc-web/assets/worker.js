@@ -160,7 +160,11 @@ self.onmessage = async (e) => {
         if (kind === 'compute_l2_chrs') {
             const { bedFile, bimFile, famText, chrsFilterJson, configJson } = data;
             const t0 = performance.now();
-            const result = wasm.worker_compute_l2_chrs(
+            // `worker_compute_l2_chrs` is now `async fn` on the Rust
+            // side (workstream I — async pre-load of chr-shard bytes
+            // via `await blob.slice(...).arrayBuffer()` per chr). The
+            // wasm export therefore returns a Promise; await it.
+            const result = await wasm.worker_compute_l2_chrs(
                 bedFile, bimFile, famText, chrsFilterJson, configJson,
             );
             const dt = performance.now() - t0;

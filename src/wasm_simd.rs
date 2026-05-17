@@ -2265,6 +2265,15 @@ pub mod pool {
     /// f64 sibling of [`parallel_scatter_f32`]. Same dispatch shape;
     /// only the args cell, `JOB_KIND` (4 instead of 3) and per-worker
     /// slice fn change.
+    ///
+    /// # Safety
+    ///
+    /// Same preconditions as [`parallel_scatter_f32`]: all pointers
+    /// inside `args` must remain valid for the duration of the call,
+    /// `out` must be exclusively owned, and all read-only inputs
+    /// must outlive the call without concurrent mutation. See
+    /// [`super::scatter::scatter_one_column_f64`] for per-pointer
+    /// length requirements.
     pub unsafe fn parallel_scatter_f64(args: ScatterArgsF64) -> bool {
         let n = POOL_SIZE.load(Ordering::Acquire);
         if n <= 1 {

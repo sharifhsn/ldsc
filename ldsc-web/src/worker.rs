@@ -229,6 +229,155 @@ impl Seek for BlobBedSource {
     }
 }
 
+/// `Read + Seek` shim that serves a single contiguous chromosome's
+/// BED bytes from a pre-loaded `Vec<u8>` cached in wasm linear
+/// memory. Plus the 3-byte BED magic header at offset `[0, 3)` so
+/// `Bed::from_source`'s validation passes without touching the
+/// underlying Blob a second time.
+///
+/// # Why it exists
+///
+/// Workstream I (async pre-load) attacks the I/O bottleneck the
+/// post-H scatter parallelism could only partially hide. Pre-H, the
+/// compute path read each 2.5 MB chunk on demand via
+/// `FileReaderSync.readAsArrayBuffer(blob.slice(...))` from inside
+/// the outer Worker. At biobank N=50K that's 8,324 chunks × ~30-100
+/// ms each (8 MB BufReader amortizes the call latency but not the
+/// per-call Mojo data-pipe copy from browser process → renderer);
+/// per the [Emscripten WORKERFS perf issue][1] and the [Chrome blob
+/// storage notes][2], FileReaderSync of `Blob.slice()` has 50-100×
+/// overhead vs typed-array cache on Chrome.
+///
+/// Replacing the streaming source with one big `Promise<ArrayBuffer>`
+/// upfront (`blob.slice(chr_start, chr_end).arrayBuffer().await`)
+/// collapses N FileReaderSync calls per chr into ONE call that the
+/// browser can serve as a single contiguous Mojo copy. The compute
+/// path then reads from RAM, eliminating per-chunk JS↔wasm dispatch.
+///
+/// [1]: https://github.com/emscripten-core/emscripten/issues/6955
+/// [2]: https://chromium.googlesource.com/chromium/src/+/HEAD/storage/browser/blob/README.md
+///
+/// # Layout
+///
+/// The wrapped `Bed::from_source` validates a 3-byte BED magic
+/// header at offset 0 and computes `expected_len = 3 + sid_count *
+/// bytes_per_snp`, comparing to the supplied `file_len`. We pass
+/// the FULL file length (not the chr-shard's bytes) so this check
+/// passes; reads at offsets outside `[chr_data_start,
+/// chr_data_start + chr_bytes.len())` return an error because the
+/// caller (downstream `ChunkReader`) should never seek there: the
+/// per-chr BIM slice we feed compute only references SNPs with
+/// `bed_idx` in this chr's range.
+pub struct PreloadedShardSource {
+    /// `[0x6c, 0x1b, 0x01]` — the BED magic + SNP-major mode bytes.
+    /// Served by `read` when `offset < 3`.
+    header: [u8; 3],
+    /// Pre-loaded chr-shard bytes (no header). Indexed by
+    /// `(offset - chr_data_start_byte)` for reads in the shard range.
+    chr_bytes: Vec<u8>,
+    /// File-relative byte offset where `chr_bytes[0]` lives in the
+    /// original BED. `= 3 + first_bed_idx * bytes_per_snp`.
+    chr_data_start_byte: u64,
+    /// Current seek position (file-relative).
+    offset: u64,
+    /// Total original-file length, passed unchanged to
+    /// `Bed::from_source` for validation.
+    file_len: u64,
+}
+
+impl PreloadedShardSource {
+    pub fn new(chr_bytes: Vec<u8>, chr_data_start_byte: u64, file_len: u64) -> Self {
+        Self {
+            header: [0x6c, 0x1b, 0x01],
+            chr_bytes,
+            chr_data_start_byte,
+            offset: 0,
+            file_len,
+        }
+    }
+
+    /// Async-load a chr-shard byte range from a JS `Blob` via
+    /// `await blob.slice(start, end).arrayBuffer()`. Returns the
+    /// raw bytes in a `Vec<u8>` ready to hand to
+    /// [`PreloadedShardSource::new`].
+    ///
+    /// This is the single FRS-equivalent call per chr that replaces
+    /// the N (typically 50-200) FileReaderSync reads the streaming
+    /// path would issue.
+    pub async fn load_blob_range(
+        blob: &Blob,
+        start_byte: u64,
+        end_byte: u64,
+    ) -> Result<Vec<u8>, JsValue> {
+        let slice = blob.slice_with_f64_and_f64(start_byte as f64, end_byte as f64)?;
+        let array_buf_js = wasm_bindgen_futures::JsFuture::from(slice.array_buffer()).await?;
+        let array_buf: js_sys::ArrayBuffer = array_buf_js
+            .dyn_into()
+            .map_err(|_| JsValue::from_str("array_buffer() returned non-ArrayBuffer"))?;
+        let u8_array = js_sys::Uint8Array::new(&array_buf);
+        let mut bytes = vec![0u8; u8_array.byte_length() as usize];
+        u8_array.copy_to(&mut bytes);
+        Ok(bytes)
+    }
+}
+
+impl Read for PreloadedShardSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.offset >= self.file_len {
+            return Ok(0);
+        }
+        // Serve the 3-byte BED magic header for reads in [0, 3).
+        // `Bed::from_source` reads exactly these 3 bytes once before
+        // the BufReader is wrapped, so this only fires during init.
+        if self.offset < 3 {
+            let from = self.offset as usize;
+            let avail = 3 - from;
+            let want = avail.min(buf.len());
+            buf[..want].copy_from_slice(&self.header[from..from + want]);
+            self.offset += want as u64;
+            return Ok(want);
+        }
+        // Serve from the cached chr-shard. `Read::read` is allowed
+        // to return short, so we cap at the remaining shard length.
+        let shard_end = self.chr_data_start_byte + self.chr_bytes.len() as u64;
+        if self.offset < self.chr_data_start_byte || self.offset >= shard_end {
+            return Err(std::io::Error::other(format!(
+                "PreloadedShardSource: read at offset {} outside cached shard \
+                 [{}, {}) — caller (ChunkReader) should never seek outside \
+                 the chr's bed_idx range",
+                self.offset, self.chr_data_start_byte, shard_end,
+            )));
+        }
+        let local_offset = (self.offset - self.chr_data_start_byte) as usize;
+        let avail = (shard_end - self.offset) as usize;
+        let want = avail.min(buf.len());
+        buf[..want].copy_from_slice(&self.chr_bytes[local_offset..local_offset + want]);
+        self.offset += want as u64;
+        Ok(want)
+    }
+}
+
+impl Seek for PreloadedShardSource {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(n) => n as i64,
+            SeekFrom::End(n) => self.file_len as i64 + n,
+            SeekFrom::Current(n) => self.offset as i64 + n,
+        };
+        if new < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "PreloadedShardSource: seek before start",
+            ));
+        }
+        self.offset = new as u64;
+        Ok(self.offset)
+    }
+}
+
 /// `Read`-only shim over a JS [`Blob`] for streaming UTF-8 parsing
 /// (BIM, FAM, etc.). Sequential — no `Seek` needed because the BIM
 /// parser is single-pass.
@@ -468,8 +617,12 @@ pub fn worker_scan_bim(bim_file: web_sys::File) -> Result<JsValue, JsError> {
 /// `chrs_filter_json` is a JSON-encoded `Vec<u8>` (e.g. `"[1,3,5]"`).
 /// An empty array means "all chromosomes" — this is the back-compat
 /// path that mirrors today's single-worker behavior.
+/// Async — returns a JS `Promise<WireL2Output>`. The JS caller in
+/// `worker.js` `await`s it. Async because each chr's BED bytes are
+/// pre-loaded via `await blob.slice(...).arrayBuffer()` before
+/// `compute_l2_from_bed_with_progress` runs (workstream I).
 #[wasm_bindgen]
-pub fn worker_compute_l2_chrs(
+pub async fn worker_compute_l2_chrs(
     bed_file: web_sys::File,
     bim_file: web_sys::File,
     fam_text: String,
@@ -566,6 +719,11 @@ pub fn worker_compute_l2_chrs(
     let n_indiv = count_fam_str(&fam_text);
     let bed_blob: Blob = bed_file.into();
     let bed_len = bed_blob.size() as u64;
+    // Pre-compute bytes_per_snp once so the per-chr loop can
+    // calculate each chr's byte range without re-deriving it.
+    // PLINK BED layout: 2 bits per individual, rounded UP to the
+    // nearest byte. Matches `Bed::from_source`'s computation.
+    let bytes_per_snp: u64 = (n_indiv as u64).saturating_add(3) / 4;
 
     let cfg_wire: WireL2Config = serde_json::from_str(&config_json)
         .map_err(|e| JsError::new(&format!("config JSON: {e}")))?;
@@ -598,13 +756,53 @@ pub fn worker_compute_l2_chrs(
         // snps_remaining; preserves order).
         let chr_snps: Vec<BimRecord> = snps_remaining.drain(..chr_n).collect();
 
-        // Fresh Bed handle per chr — Bed is consumed by
-        // compute_l2_from_bed. BlobBedSource just wraps a Blob
-        // reference (cheap clone in JS, refcounted by the browser).
-        let bed_source_chr = BlobBedSource::new(bed_blob.clone())
-            .map_err(|e| JsError::new(&format!("BlobBedSource (chr {start}..{end}): {e:?}")))?;
-        let bed_chr = Bed::from_source(bed_source_chr, n_indiv, total_bim_snps, bed_len)
-            .map_err(|e| JsError::new(&format!("Bed::from_source (chr {start}..{end}): {e:#}")))?;
+        // Check whether the chr's SNPs are contiguous in the BED
+        // file (i.e. `bed_idx` increases by exactly 1 per SNP). The
+        // common case is YES — no `--extract` means BIM rows map
+        // straight to BED rows, and we filter BIM by chr in
+        // BIM-sorted order. If contiguous, we can pre-load the
+        // chr's bytes in ONE `await blob.slice(...).arrayBuffer()`
+        // call and serve all subsequent reads from RAM. If NOT
+        // contiguous (currently only possible if a future
+        // `--extract`-like feature lands), fall back to the
+        // streaming `BlobBedSource` path.
+        let first_bed_idx = chr_snps[0].bed_idx;
+        let last_bed_idx = chr_snps[chr_n - 1].bed_idx;
+        let contiguous = (last_bed_idx - first_bed_idx + 1) == chr_n;
+
+        let bed_chr = if contiguous {
+            // Async pre-load this chr's BED bytes. One JS↔wasm
+            // round-trip per chr instead of ~50-200 (8 MB BufReader
+            // serves 50-200 chunks per chr at biobank c=200). The
+            // browser fulfils `arrayBuffer()` as a single contiguous
+            // Mojo data-pipe copy, which is meaningfully faster
+            // than N back-to-back `FileReaderSync` slice reads.
+            let chr_data_start = 3u64 + first_bed_idx as u64 * bytes_per_snp;
+            let chr_data_end = 3u64 + (last_bed_idx as u64 + 1) * bytes_per_snp;
+            let chr_bytes =
+                PreloadedShardSource::load_blob_range(&bed_blob, chr_data_start, chr_data_end)
+                    .await
+                    .map_err(|e| {
+                        JsError::new(&format!(
+                            "PreloadedShardSource::load_blob_range (chr {start}..{end}): {e:?}",
+                        ))
+                    })?;
+            let source = PreloadedShardSource::new(chr_bytes, chr_data_start, bed_len);
+            Bed::from_source(source, n_indiv, total_bim_snps, bed_len).map_err(|e| {
+                JsError::new(&format!(
+                    "Bed::from_source (preloaded shard, chr {start}..{end}): {e:#}",
+                ))
+            })?
+        } else {
+            // Fall back to the streaming BlobBedSource path. Cheap
+            // Blob clone (refcounted by the browser); each per-SNP
+            // read still pays the FileReaderSync round-trip cost.
+            let bed_source_chr = BlobBedSource::new(bed_blob.clone())
+                .map_err(|e| JsError::new(&format!("BlobBedSource (chr {start}..{end}): {e:?}")))?;
+            Bed::from_source(bed_source_chr, n_indiv, total_bim_snps, bed_len).map_err(|e| {
+                JsError::new(&format!("Bed::from_source (chr {start}..{end}): {e:#}"))
+            })?
+        };
 
         // Per-chr progress callback wraps the shared throttle +
         // cumulative-offset state. `is_first` / `is_last` semantics
