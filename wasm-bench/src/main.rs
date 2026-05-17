@@ -347,11 +347,31 @@ fn compute_stats(raw: &[u8], c: usize, n_indiv: usize) -> (Vec<f32>, Vec<f32>) {
     (mean_buf, inv_std_buf)
 }
 
-/// Run `scatter_one_column_f32` over a single contiguous slice
-/// `[j_start, j_end)` of output columns. Equivalent to one worker's
-/// share when n_workers > 1.
+/// Scatter kernel variant under test.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScatterKernel {
+    /// Public dispatcher — picks SIMD on wasm32+simd128. This is what
+    /// production code calls.
+    Dispatch,
+    /// Scalar reference. Used as the baseline for the speedup ratio
+    /// and as the parity oracle for SIMD output.
+    Scalar,
+}
+
+impl ScatterKernel {
+    fn label(self) -> &'static str {
+        match self {
+            ScatterKernel::Dispatch => "simd",
+            ScatterKernel::Scalar => "scalar",
+        }
+    }
+}
+
+/// Run one scatter kernel over a single contiguous slice
+/// `[j_start, j_end)` of output columns.
 #[allow(clippy::too_many_arguments)]
 fn run_scatter_slice(
+    kernel: ScatterKernel,
     j_start: usize,
     j_end: usize,
     raw: &[u8],
@@ -370,30 +390,51 @@ fn run_scatter_slice(
     // this slice.
     for j in j_start..j_end {
         unsafe {
-            wasm_simd::scatter::scatter_one_column_f32(
-                j,
-                raw.as_ptr(),
-                bytes_per_snp,
-                n_indiv,
-                cs.bucket.as_ptr(),
-                cs.sign.as_ptr(),
-                core::ptr::null::<bed::IidPos>(),
-                0,
-                true, // all_iids
-                mean_buf[j],
-                inv_std_buf[j],
-                n_norm,
-                out_ptr,
-                out_col_stride,
-                d,
-            );
+            match kernel {
+                ScatterKernel::Dispatch => wasm_simd::scatter::scatter_one_column_f32(
+                    j,
+                    raw.as_ptr(),
+                    bytes_per_snp,
+                    n_indiv,
+                    cs.bucket.as_ptr(),
+                    cs.sign.as_ptr(),
+                    core::ptr::null::<bed::IidPos>(),
+                    0,
+                    true, // all_iids
+                    mean_buf[j],
+                    inv_std_buf[j],
+                    n_norm,
+                    out_ptr,
+                    out_col_stride,
+                    d,
+                ),
+                ScatterKernel::Scalar => wasm_simd::scatter::scatter_one_column_f32_scalar(
+                    j,
+                    raw.as_ptr(),
+                    bytes_per_snp,
+                    n_indiv,
+                    cs.bucket.as_ptr(),
+                    cs.sign.as_ptr(),
+                    core::ptr::null::<bed::IidPos>(),
+                    0,
+                    true,
+                    mean_buf[j],
+                    inv_std_buf[j],
+                    n_norm,
+                    out_ptr,
+                    out_col_stride,
+                    d,
+                ),
+            }
         }
     }
 }
 
 /// Time one full chunk-scatter: c output columns, n_workers serial
 /// slices (when n_workers=1, one whole serial pass).
+#[allow(clippy::too_many_arguments)]
 fn bench_scatter_one(
+    kernel: ScatterKernel,
     raw: &[u8],
     n_indiv: usize,
     c: usize,
@@ -419,6 +460,7 @@ fn bench_scatter_one(
             continue;
         }
         run_scatter_slice(
+            kernel,
             j_start,
             j_end,
             raw,
@@ -454,47 +496,188 @@ fn bench_scatter_one(
 ///   shared L2/L3 bandwidth contention. The Workstream H expected
 ///   per-outer speedup is ~3-3.5× on 4 cores, so use that as the
 ///   realistic target instead.
-fn bench_scatter_shape(label: &str, n_indiv: usize, c: usize, d: usize, iters: usize, warmup: usize) {
+fn bench_scatter_shape(
+    label: &str,
+    n_indiv: usize,
+    c: usize,
+    d: usize,
+    iters: usize,
+    warmup: usize,
+) {
     let raw = make_synthetic_bed(42, c, n_indiv);
     let cs = make_cs_proj(7, n_indiv, d);
     let (mean_buf, inv_std_buf) = compute_stats(&raw, c, n_indiv);
 
-    // Warmup at n_workers=1.
-    for _ in 0..warmup {
-        let _ = bench_scatter_one(&raw, n_indiv, c, d, &cs, &mean_buf, &inv_std_buf, 1);
+    // Per-kernel min times so we can report SIMD/scalar speedup at
+    // the end. Bench scalar AND the dispatcher (SIMD on +simd128
+    // builds, scalar otherwise — the dispatch lookup is constant-
+    // folded by the optimiser since `target_feature` is a build-time
+    // cfg).
+    let kernels = [ScatterKernel::Scalar, ScatterKernel::Dispatch];
+    let mut min_times: [(ScatterKernel, f64); 2] = [
+        (ScatterKernel::Scalar, f64::INFINITY),
+        (ScatterKernel::Dispatch, f64::INFINITY),
+    ];
+
+    for (kern_idx, &kernel) in kernels.iter().enumerate() {
+        // Warmup at n_workers=1.
+        for _ in 0..warmup {
+            let _ =
+                bench_scatter_one(kernel, &raw, n_indiv, c, d, &cs, &mean_buf, &inv_std_buf, 1);
+        }
+        for &n_workers in &[1usize, 4] {
+            let mut times = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t = bench_scatter_one(
+                    kernel, &raw, n_indiv, c, d, &cs, &mean_buf, &inv_std_buf, n_workers,
+                );
+                times.push(t);
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let min = times[0];
+            let median = times[times.len() / 2];
+            let per_col = min / c as f64;
+            let per_slice_ceiling = min / n_workers as f64;
+            println!(
+                "{:14} [{:>7} n_workers={n_workers}] N={n_indiv:>6} c={c:>3} d={d:>4}  \
+                 iters={iters:>2}  min={:>8.5}s  median={:>8.5}s  \
+                 per_col={:>9.3}µs  ⇒ ideal_parallel_wall≈{:>8.5}s",
+                label,
+                kernel.label(),
+                min,
+                median,
+                per_col * 1e6,
+                per_slice_ceiling,
+            );
+            if n_workers == 1 && min < min_times[kern_idx].1 {
+                min_times[kern_idx] = (kernel, min);
+            }
+        }
     }
 
-    for &n_workers in &[1usize, 4] {
-        let mut times = Vec::with_capacity(iters);
-        for _ in 0..iters {
-            let t = bench_scatter_one(&raw, n_indiv, c, d, &cs, &mean_buf, &inv_std_buf, n_workers);
-            times.push(t);
+    let scalar_min = min_times[0].1;
+    let simd_min = min_times[1].1;
+    let speedup = scalar_min / simd_min;
+    let verdict = if speedup >= 1.5 {
+        "≥1.5× ✓ (proceed)"
+    } else if speedup >= 1.3 {
+        "1.3-1.5× △ (marginal)"
+    } else if speedup >= 1.0 {
+        "<1.3× ✗ (revisit design)"
+    } else {
+        "<1.0× ✗✗ (REGRESSION)"
+    };
+    println!(
+        "{:14} [speedup] simd={:>7.4}s scalar={:>7.4}s  ⇒  simd/scalar = {:.2}×  [{}]",
+        label, simd_min, scalar_min, speedup, verdict,
+    );
+}
+
+/// Verify that SIMD scatter output matches scalar within tolerance.
+/// Workstream J added a multi-lane SIMD scatter kernel which reorders
+/// the f32 accumulation across 4 lanes — same operation, different
+/// summation order. Relative tolerance bounded by `~ε·sqrt(K)` ≈ 3e-7
+/// at K=4 for the scatter sum; the f64 renorm is order-shuffled but
+/// stays in f64 so the renorm error stays at 1 ULP of f32.
+///
+/// Acceptance: max relative error ≤ 1e-4 across all c columns.
+fn verify_scatter_simd_matches_scalar(label: &str, n_indiv: usize, c: usize, d: usize) {
+    let raw = make_synthetic_bed(11, c, n_indiv);
+    let cs = make_cs_proj(22, n_indiv, d);
+    let (mean_buf, inv_std_buf) = compute_stats(&raw, c, n_indiv);
+    let bytes_per_snp = n_indiv.div_ceil(4);
+    let n_norm = n_indiv as f64;
+
+    let mut out_scalar = Mat::<f32>::zeros(d, c);
+    let mut out_simd = Mat::<f32>::zeros(d, c);
+    let stride_scalar = out_scalar.col_stride();
+    let stride_simd = out_simd.col_stride();
+    let p_scalar = out_scalar.as_mut().as_ptr_mut();
+    let p_simd = out_simd.as_mut().as_ptr_mut();
+
+    for j in 0..c {
+        unsafe {
+            wasm_simd::scatter::scatter_one_column_f32_scalar(
+                j,
+                raw.as_ptr(),
+                bytes_per_snp,
+                n_indiv,
+                cs.bucket.as_ptr(),
+                cs.sign.as_ptr(),
+                core::ptr::null::<bed::IidPos>(),
+                0,
+                true,
+                mean_buf[j],
+                inv_std_buf[j],
+                n_norm,
+                p_scalar,
+                stride_scalar,
+                d,
+            );
+            wasm_simd::scatter::scatter_one_column_f32(
+                j,
+                raw.as_ptr(),
+                bytes_per_snp,
+                n_indiv,
+                cs.bucket.as_ptr(),
+                cs.sign.as_ptr(),
+                core::ptr::null::<bed::IidPos>(),
+                0,
+                true,
+                mean_buf[j],
+                inv_std_buf[j],
+                n_norm,
+                p_simd,
+                stride_simd,
+                d,
+            );
         }
-        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let min = times[0];
-        let median = times[times.len() / 2];
-        let per_col = min / c as f64;
-        // Per-slice ceiling: equivalent wall if all `n_workers`
-        // slices ran in parallel on separate cores (linear scaling).
-        let per_slice_ceiling = min / n_workers as f64;
-        println!(
-            "{:14} [n_workers={n_workers}] N={n_indiv:>6} c={c:>3} d={d:>4}  iters={iters:>2}  \
-             min={:>8.5}s  median={:>8.5}s  per_col={:>9.3}µs  \
-             ⇒ ideal_parallel_wall≈{:>8.5}s",
-            label,
-            min,
-            median,
-            per_col * 1e6,
-            per_slice_ceiling,
-        );
     }
+
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    let mut max_loc = (0usize, 0usize);
+    for j in 0..c {
+        for i in 0..d {
+            let s = out_scalar[(i, j)];
+            let m = out_simd[(i, j)];
+            let abs_err = (s - m).abs();
+            let denom = s.abs().max(1e-6);
+            let rel_err = abs_err / denom;
+            if abs_err > max_abs {
+                max_abs = abs_err;
+                max_loc = (i, j);
+            }
+            if rel_err > max_rel {
+                max_rel = rel_err;
+            }
+        }
+    }
+    let pass = max_rel < 1e-4 || max_abs < 1e-4;
+    println!(
+        "verify_scatter [{:14}] N={n_indiv:>6} c={c:>3} d={d:>4}  \
+         max_abs={max_abs:>9.2e}  max_rel={max_rel:>9.2e} at ({},{}) -> {}",
+        label,
+        max_loc.0,
+        max_loc.1,
+        if pass { "PASS" } else { "FAIL" },
+    );
 }
 
 fn run_scatter_benches() {
-    println!("\n== scatter parallelism microbench (Workstream H) ==");
-    println!("(wasmtime single-threaded; n_workers=4 row is the per-slice");
-    println!(" ceiling = serial_wall / 4, an upper bound on what the SAB");
-    println!(" pool will achieve with 4 inner Workers.)");
+    println!("\n== scatter SIMD vs scalar microbench (Workstream J) ==");
+    println!("Per-shape rows: scalar baseline + SIMD dispatcher.");
+    println!("Speedup row at the bottom = scalar_min / simd_min on n_workers=1.");
+    println!("Acceptance: ≥1.5× on biobank N=50K c=200 d=200.");
+
+    println!("\n-- scatter correctness sweep (simd vs scalar parity) --");
+    verify_scatter_simd_matches_scalar("1000G",       2_490, 200, 200);
+    verify_scatter_simd_matches_scalar("biobank-200", 50_000, 200, 200);
+    verify_scatter_simd_matches_scalar("biobank-500", 50_000, 500, 200);
+    verify_scatter_simd_matches_scalar("d=1000",      50_000, 200, 1000);
+    verify_scatter_simd_matches_scalar("small-odd",      503,  17,  47);
+
+    println!("\n-- scatter perf sweep (simd vs scalar) --");
 
     // 1000G N=2,490: per-chunk scatter at the default c=200, d=200
     // sketch. Browser per-chunk is ~5-15 ms range.

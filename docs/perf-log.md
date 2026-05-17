@@ -256,6 +256,108 @@ browser, 1.25× of warm-cache CLI**. Cumulative wall reduction
 from H+I ≈ **6-7×**, vs the planned ~2× from scatter
 parallelism alone. Async pre-load was the unforeseen big win.
 
+## 2026-05-17 (Workstream J — wasm32 SIMD scatter kernel)
+
+Followup to Workstream I's discovery that scatter (52 % of wall)
+became the new bottleneck after async pre-load shrank I/O. The
+attack: rewrite `wasm_simd::scatter::scatter_one_column_f32` as a
+**multi-lane (K=4) parallel-accumulator kernel** with `+simd128`
+intrinsics. K=4 buffers break the serial dependency chain on the
+indirect store `dst[bucket[i]] +=`, letting the CPU keep 4
+scatter streams in flight concurrently. The 4 vals decoded per
+BED byte distribute 1:1 onto lanes 0..3; the fold step (K-way
+sum) and renorm tail (`||col||²` + scale) are vectorised with
+`f32x4`/`f64x2` SIMD.
+
+### wasmtime microbench (M5 Pro, single-threaded, cranelift JIT)
+
+After fixing a 64 KB lane-buffer memset that was dragging small
+N down (use `MaybeUninit` + zero only the `d`-sized prefix):
+
+| Shape | Scalar | SIMD | Speedup |
+|---|---|---|---|
+| 1000G N=2,490, c=200, d=200 | 247 µs | 185 µs | **1.33×** |
+| Biobank N=50,000, c=200, d=200 | 3.98 ms | 2.79 ms | **1.43×** |
+| Biobank N=50,000, c=500, d=200 | 10.07 ms | 7.12 ms | **1.41×** |
+
+All shapes positive (vs the pre-fix 0.88× regression at 1000G).
+Parity vs scalar: max abs error 4.6e-5 across all shapes
+including subsample-d=1000 and small-odd; well within the
+displayed-precision tolerance.
+
+### Browser smoke (foregrounded Chrome, M5 Pro 18 cores, warm cache)
+
+Biobank d=200 + masking + fast-f32 (same protocol as Workstream
+I — local trunk serve + CORS data server + JS-fetch injection).
+Three back-to-back runs:
+
+| | Wall | Long-tail sketch | Long-tail bed_read | Mean L2 |
+|---|---|---|---|---|
+| **CLI (warm cache, ref)** | **7.70 s** | — | — | 22.5728 |
+| Post-I run 1 (pre-J ref) | 9.61 s | 4.96 s | 3.28 s | 22.573 |
+| Post-I run 2 (pre-J ref) | 10.61 s | 5.35 s | 4.07 s | 22.573 |
+| **Post-J run 1** | **9.60 s** | 4.56 s | 3.83 s | 22.573 |
+| **Post-J run 2** | **7.87 s** | 4.56 s | 2.28 s | 22.573 |
+| **Post-J run 3** | **8.34 s** | 4.32 s | 2.66 s | 22.573 |
+
+L2 output **bit-identical** to CLI to displayed precision in
+all 3 runs (mean 22.573, max 305.45). **Per-worker average
+sketch phase: ~4.41 s post-J vs ~5.36 s post-I = 1.21× scatter
+speedup** in the browser (less than the wasmtime 1.43×, because
+8 outer × 2 inner = 16 concurrent threads share L2/L3 bandwidth
+in-browser — the K=4 lane buffers' 3.2 KB per thread is fine in
+isolation but cumulative).
+
+**Wall improvement**: median post-J ~8.34 s vs median post-I
+~10.11 s = **1.2× wall speedup**. Best run (7.87 s) is **within
+2 % of CLI parity (7.70 s)** — the ratio that was 3-9× pre-I
+and 1.25-1.38× post-I is now **~1.0-1.1× post-J on the best
+runs**, with run-to-run variance dominating.
+
+### Interpretation
+
+The scatter speedup is **real and bounded**. K=4 multi-lane
+hides the indirect-store dep chain → ~1.2× browser scatter
+speedup. The remaining gap to CLI is now run-to-run variance
+(I/O timing across 8 concurrent FRS streams + which chr drew
+the long-tail worker). Further compute SIMD on scatter would
+hit diminishing returns; the kernel is now bandwidth-bound
+rather than dep-chain-bound.
+
+### Net of workstreams H + I + J
+
+Pre-H predicted biobank wall ~70 s → **post-J best 7.87 s**,
+cumulative **~9× wall reduction**, browser/CLI ratio
+**~1.0-1.1× on best runs** (was 3-9× pre-I).
+
+The "Where the wall went" card (Attack A) confirmed the
+bottleneck shift across each workstream:
+- Pre-H: I/O dominant
+- Post-H: per-outer scatter dominant on shared cores
+- Post-I: scatter dominant on each worker
+- Post-J: scatter ↓ ~18 %; bottleneck now run-to-run I/O variance
+
+### What's next (when worth it)
+
+Likely diminishing returns from further scatter work. Headroom
+candidates if wall reduction is still desired:
+- **L2 cache locality** on scatter — current K=4 lanes touch
+  3.2 KB each = 12.8 KB per thread total. At 16 concurrent
+  threads on M5 Pro's shared 18 MB L2, this is well under
+  contention. Probably not the bottleneck.
+- **I/O bandwidth** — FRS still costs ~3 s per long-tail worker.
+  OPFS sync-handles could halve this, but the 20-30 s upfront
+  copy makes it net-negative for the single-run flow (revisit
+  if multi-run flows land).
+- **Better load balancing** — chr partition is LPT; the
+  long-tail worker now varies run-to-run by ±2 s. Could
+  reshuffle chrs across runs for more consistent walls.
+
+None of these are clear-win opportunities. **The current state
+(post-J) appears to be near the practical floor** for browser
+LD-score compute on biobank-scale data with the FRS-based I/O
+path.
+
 ## 2026-05-16 (Speed-optimize button + browser sketch sweep)
 
 - Change: added `⚡ Speed-optimize for your data` button to the
