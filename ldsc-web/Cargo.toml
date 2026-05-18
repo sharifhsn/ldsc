@@ -104,6 +104,14 @@ anyhow = "1"
 # `passArrayF64ToWasm0` allocator issue; see Workstream L probe sweep).
 web-time = "1"
 
+# Gzip decompression for `.sumstats.gz` (the canonical LDSC sumstats
+# file format — `munge_sumstats.py` always writes gzipped). flate2
+# auto-selects miniz_oxide as the inflation backend on wasm32, which
+# is pure-Rust and works fine inside Web Workers. We detect the gzip
+# magic bytes (`0x1f 0x8b`) at the head of the uploaded blob and
+# decompress before parsing.
+flate2 = "1"
+
 # Multi-threaded GEMM (workstream G — manual SAB worker pool).
 # wasm-bindgen-rayon was attempted but the bundler-mode
 # `workerHelpers.js` ships an `import('../../..')` that resolves to

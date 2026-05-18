@@ -363,12 +363,17 @@ pub fn L2Panel() -> impl IntoView {
                 <FileUploadRow ext=".bed" read_as=ReadAs::BlobHandle file=bed />
                 <FileUploadRow ext=".bim" read_as=ReadAs::BlobHandle file=bim />
                 <FileUploadRow ext=".fam" read_as=ReadAs::Text file=fam />
-                <FileUploadRow ext=".sumstats" read_as=ReadAs::BlobHandle file=sumstats />
+                <FileUploadRow
+                    ext=".sumstats"
+                    accept=".sumstats,.sumstats.gz"
+                    read_as=ReadAs::BlobHandle
+                    file=sumstats
+                />
                 <p class="text-muted mt-2 mb-0" style="font-size: 0.825rem;">
                     "Files stay in your browser — no data is uploaded anywhere. \
-                    Compute runs locally via WebAssembly. The .sumstats file is optional; \
-                    upload it (LDSC munge_sumstats output) to also run h² heritability \
-                    after L2 finishes."
+                    Compute runs locally via WebAssembly. The .sumstats file is optional \
+                    (uncompressed or .gz — both work; LDSC's munge_sumstats writes .gz \
+                    by default); upload it to also run h² heritability after L2 finishes."
                 </p>
             </div>
         </div>
@@ -560,7 +565,8 @@ pub fn L2Panel() -> impl IntoView {
                         {move || if !h2_ready {
                             view! {
                                 <p class="text-muted mb-0" style="font-size: 0.9rem;">
-                                    "Upload a "<code>".sumstats"</code>" file (output of "
+                                    "Upload a "<code>".sumstats"</code>" or "
+                                    <code>".sumstats.gz"</code>" file (output of "
                                     <code>"ldsc munge-sumstats"</code>") in the upload card \
                                     above to run heritability regression against the LD scores \
                                     you just computed. Need columns "<code>"SNP"</code>", "

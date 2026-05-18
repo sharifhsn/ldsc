@@ -919,6 +919,34 @@ pub async fn worker_compute_l2_chrs(
     serde_wasm_bindgen::to_value(&wire).map_err(|e| JsError::new(&format!("output serialise: {e}")))
 }
 
+/// Decode a sumstats payload: if it starts with the gzip magic
+/// (`0x1f 0x8b`), inflate it via `flate2`; otherwise interpret as
+/// UTF-8. Returns the decoded text plus the original compressed size
+/// (`Some(z)` if gz, `None` if plain).
+///
+/// Separated from [`worker_compute_h2`] so it's testable on native —
+/// the actual h² entry is wasm-only because it speaks `web_sys` /
+/// `Blob`, but this helper is pure-Rust.
+pub fn decode_sumstats_bytes(
+    bytes: Vec<u8>,
+) -> std::result::Result<(String, Option<usize>), String> {
+    let is_gzipped = bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b;
+    if is_gzipped {
+        use std::io::Read;
+        let compressed_size = bytes.len();
+        let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut text = String::new();
+        decoder
+            .read_to_string(&mut text)
+            .map_err(|e| format!("decompress sumstats.gz: {e}"))?;
+        Ok((text, Some(compressed_size)))
+    } else {
+        let text =
+            String::from_utf8(bytes).map_err(|e| format!("sumstats not valid UTF-8: {e}"))?;
+        Ok((text, None))
+    }
+}
+
 /// Run LDSC's h² regression in a Web Worker against:
 ///
 /// * `l2` — LD scores per BIM row (output of [`worker_compute_l2_chrs`]).
@@ -934,8 +962,9 @@ pub async fn worker_compute_l2_chrs(
 ///   Same length as `l2`.
 /// * `bim_file` — the user's `.bim`. Re-streamed here to get the
 ///   per-SNP rsID strings (those aren't returned by the L2 worker).
-/// * `sumstats_file` — a `.sumstats` text Blob (compressed `.gz` NOT
-///   supported in v1; uncompress before upload). Columns:
+/// * `sumstats_file` — a `.sumstats` Blob, either plain text or
+///   gzipped. The header on the bytes (`0x1f 0x8b`) decides; LDSC's
+///   `munge_sumstats` writes gzipped by default. Columns:
 ///   `SNP \t Z \t N` with a header line. Whitespace-tolerant.
 /// * `n_blocks` — block jackknife block count. LDSC default = 200.
 /// * `two_step` — chi² cutoff for the two-step estimator (None ⇒
@@ -1044,22 +1073,47 @@ pub async fn worker_compute_h2(
         .into(),
     );
 
-    // Async-load the sumstats file as text. `Blob.text()` returns a
-    // Promise<DOMString>; await it then parse line-by-line.
+    // Async-load the sumstats file as raw bytes (need bytes, not a
+    // pre-decoded String, so we can detect + decompress gzip).
+    // `Blob.arrayBuffer()` returns a Promise<ArrayBuffer> on the
+    // worker-thread; await it then copy into a Vec<u8>.
+    //
+    // We detect gzip by the two-byte magic (`0x1f 0x8b`) at the head
+    // of the blob, NOT by filename — users sometimes rename
+    // `.sumstats.gz` to `.sumstats` (or vice versa), and `munge_sumstats`
+    // canonically writes gzipped. Magic-byte sniffing always wins
+    // over file-extension parsing.
     let sumstats_blob: Blob = sumstats_file.into();
-    let sumstats_text_js = wasm_bindgen_futures::JsFuture::from(sumstats_blob.text())
+    let array_buf_js = wasm_bindgen_futures::JsFuture::from(sumstats_blob.array_buffer())
         .await
-        .map_err(|e| JsError::new(&format!("sumstats Blob.text(): {e:?}")))?;
-    let sumstats_text = sumstats_text_js
-        .as_string()
-        .ok_or_else(|| JsError::new("sumstats Blob.text() returned non-string"))?;
-    web_sys::console::log_1(
-        &format!(
-            "worker_compute_h2: sumstats loaded ({} chars)",
-            sumstats_text.len(),
-        )
-        .into(),
-    );
+        .map_err(|e| JsError::new(&format!("sumstats Blob.arrayBuffer(): {e:?}")))?;
+    let array_buf: js_sys::ArrayBuffer = array_buf_js
+        .dyn_into()
+        .map_err(|_| JsError::new("sumstats Blob.arrayBuffer() returned non-ArrayBuffer"))?;
+    let u8_array = js_sys::Uint8Array::new(&array_buf);
+    let mut sumstats_bytes = vec![0u8; u8_array.byte_length() as usize];
+    u8_array.copy_to(&mut sumstats_bytes);
+
+    let (sumstats_text, compressed_size) = decode_sumstats_bytes(sumstats_bytes)
+        .map_err(|e| JsError::new(&format!("sumstats: {e}")))?;
+    if let Some(z) = compressed_size {
+        web_sys::console::log_1(
+            &format!(
+                "worker_compute_h2: sumstats loaded ({} compressed bytes → {} chars)",
+                z,
+                sumstats_text.len(),
+            )
+            .into(),
+        );
+    } else {
+        web_sys::console::log_1(
+            &format!(
+                "worker_compute_h2: sumstats loaded ({} chars)",
+                sumstats_text.len(),
+            )
+            .into(),
+        );
+    }
 
     // Parse `.sumstats`: header line (SNP, Z, N — order-independent),
     // then tab-separated rows. We accept arbitrary whitespace
@@ -1182,4 +1236,74 @@ pub async fn worker_compute_h2(
 
     serde_wasm_bindgen::to_value(&wire)
         .map_err(|e| JsError::new(&format!("h2 output serialise: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_sumstats_bytes;
+
+    /// Plain-text path: returns the bytes verbatim, with `None` for
+    /// the compressed-size sentinel.
+    #[test]
+    fn decode_plain_text_sumstats() {
+        let plain = b"SNP\tZ\tN\nrs1\t1.5\t1000\nrs2\t-0.3\t1000\n";
+        let (text, compressed) = decode_sumstats_bytes(plain.to_vec()).unwrap();
+        assert_eq!(compressed, None);
+        assert_eq!(text, std::str::from_utf8(plain).unwrap());
+    }
+
+    /// Gzip path: round-trip through flate2 produces the same text
+    /// as the plain-text version, with `Some(z)` for the compressed
+    /// size. Compresses identical content + verifies decompression.
+    #[test]
+    fn decode_gzipped_sumstats_roundtrips() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+
+        let plain = b"SNP\tZ\tN\nrs1\t1.5\t1000\nrs2\t-0.3\t1000\nrs3\t2.1\t1000\n";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(plain).unwrap();
+        let gz_bytes = encoder.finish().unwrap();
+
+        // Smoke check that the gz wrapping actually fired (first two
+        // bytes are the magic).
+        assert_eq!(gz_bytes[0], 0x1f);
+        assert_eq!(gz_bytes[1], 0x8b);
+
+        let (text, compressed) = decode_sumstats_bytes(gz_bytes.clone()).unwrap();
+        assert_eq!(compressed, Some(gz_bytes.len()));
+        assert_eq!(text.as_bytes(), &plain[..]);
+    }
+
+    /// Truncated gz payload surfaces as an error string, NOT a panic.
+    /// The h² UI path catches the error and routes it to `on_error`.
+    #[test]
+    fn decode_truncated_gzipped_errors() {
+        // Gzip magic but no body — decoder errors part-way through.
+        let bad = vec![0x1f, 0x8b, 0x08, 0x00];
+        let err = decode_sumstats_bytes(bad).unwrap_err();
+        assert!(
+            err.contains("sumstats.gz"),
+            "expected decompress error string, got: {err}"
+        );
+    }
+
+    /// Empty input: shorter than the 2-byte gz magic check, so
+    /// falls through to the plain-text branch and returns an empty
+    /// string.
+    #[test]
+    fn decode_empty_bytes() {
+        let (text, compressed) = decode_sumstats_bytes(Vec::new()).unwrap();
+        assert_eq!(compressed, None);
+        assert_eq!(text, "");
+    }
+
+    /// Non-UTF-8 bytes (and no gz magic) surface as an error, not a
+    /// panic.
+    #[test]
+    fn decode_invalid_utf8_errors() {
+        let bad = vec![0xfe, 0xfe, 0xfe];
+        let err = decode_sumstats_bytes(bad).unwrap_err();
+        assert!(err.contains("UTF-8"), "expected utf-8 error, got: {err}");
+    }
 }

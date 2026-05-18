@@ -54,14 +54,26 @@ impl LoadedFile {
 
 #[component]
 pub fn FileUploadRow(
-    /// Visible extension label (e.g. `".bed"`) — also used to set
-    /// the file picker's `accept` attribute.
+    /// Visible extension label shown in the row chrome (e.g. `".bed"`).
+    /// Used as a default for the picker's `accept` attribute when
+    /// `accept` is not supplied.
     ext: &'static str,
     read_as: ReadAs,
     /// Parent-owned signal that receives the loaded file.
     file: RwSignal<LoadedFile>,
+    /// Optional comma-separated `accept` value for the underlying
+    /// `<input type="file">`. Use to broaden what the OS picker shows
+    /// vs the displayed label — e.g. `ext=".sumstats"` (label) with
+    /// `accept=".sumstats,.sumstats.gz"` (picker accepts both). When
+    /// `None`, the picker accepts exactly `ext`.
+    #[prop(optional)]
+    accept: Option<&'static str>,
 ) -> impl IntoView {
-    let input_id = format!("file-upload-{}", ext.trim_start_matches('.'));
+    let accept_attr: &'static str = accept.unwrap_or(ext);
+    let input_id = format!(
+        "file-upload-{}",
+        ext.trim_start_matches('.').split(',').next().unwrap_or(ext),
+    );
     let input_id_for_click = input_id.clone();
     let input_id_for_label = input_id.clone();
 
@@ -187,7 +199,7 @@ pub fn FileUploadRow(
             <input
                 id=input_id
                 type="file"
-                accept=ext
+                accept=accept_attr
                 on:change=on_change
                 on:click=|ev: MouseEvent| ev.stop_propagation()
                 style="display: none;"
