@@ -84,6 +84,11 @@ type AbortCb = Rc<dyn Fn(String)>;
 /// single-worker result was; SNPs are in BIM order.
 #[derive(Clone, Debug)]
 pub struct WorkerComputeResult {
+    /// Per-SNP `bed_idx` (original BIM row index) in the same order
+    /// as `l2`/`maf`. Used by the h² worker to map SNPs back to BIM
+    /// rsIDs for sumstats join. Sorted ascending by construction
+    /// (BIM order) since `assemble_partials` sorts by `bed_idx`.
+    pub bed_idx: Vec<u32>,
     pub l2: Vec<f64>,
     pub maf: Vec<f64>,
     /// Wall time = max across workers (parallel; this is the
@@ -593,10 +598,11 @@ fn spawn_compute_worker(
                         .map(|opt| opt.as_ref().map(|o| o.perf.clone()).unwrap_or_default())
                         .collect();
                     let result = WorkerComputeResult {
-                        l2: assembled.0,
-                        maf: assembled.1,
+                        bed_idx: assembled.0,
+                        l2: assembled.1,
+                        maf: assembled.2,
                         wall_seconds: max_wall,
-                        n_snps: assembled.2,
+                        n_snps: assembled.3,
                         per_worker_perf,
                         per_worker_wall_seconds,
                     };
@@ -652,8 +658,10 @@ fn spawn_compute_worker(
     Ok(())
 }
 
-/// Concatenate per-worker partial outputs into a global L2 / MAF
-/// pair, sorted by `bed_idx` so the result follows BIM order.
+/// Concatenate per-worker partial outputs into a global bed_idx /
+/// L2 / MAF triple, sorted by `bed_idx` so all three follow BIM
+/// order. The h² flow needs `bed_idx` to look up rsIDs in the BIM
+/// for the sumstats join.
 ///
 /// Length consistency `bed_idx.len() == l2.len() == maf.len()` is
 /// enforced upstream by `worker_compute_l2_chrs` (`worker.rs`); the
@@ -662,13 +670,13 @@ fn spawn_compute_worker(
 /// assertion is bypassed.
 fn assemble_partials(
     partials: &[Option<crate::worker::WireL2Output>],
-) -> (Vec<f64>, Vec<f64>, usize) {
+) -> (Vec<u32>, Vec<f64>, Vec<f64>, usize) {
     let n_total: usize = partials
         .iter()
         .filter_map(|p| p.as_ref().map(|o| o.n_snps))
         .sum();
 
-    let mut tuples: Vec<(usize, f64, f64)> = Vec::with_capacity(n_total);
+    let mut tuples: Vec<(u32, f64, f64)> = Vec::with_capacity(n_total);
     for partial in partials.iter().flatten() {
         debug_assert_eq!(partial.bed_idx.len(), partial.l2.len());
         debug_assert_eq!(partial.l2.len(), partial.maf.len());
@@ -678,18 +686,20 @@ fn assemble_partials(
             .zip(partial.l2.iter())
             .zip(partial.maf.iter())
         {
-            tuples.push((*b, *l, *m));
+            tuples.push((*b as u32, *l, *m));
         }
     }
     tuples.sort_by_key(|t| t.0);
 
+    let mut bed_idx = Vec::with_capacity(n_total);
     let mut l2 = Vec::with_capacity(n_total);
     let mut maf = Vec::with_capacity(n_total);
-    for (_, l, m) in tuples {
+    for (b, l, m) in tuples {
+        bed_idx.push(b);
         l2.push(l);
         maf.push(m);
     }
-    (l2, maf, n_total)
+    (bed_idx, l2, maf, n_total)
 }
 
 // ── Watchdog ────────────────────────────────────────────────────────
@@ -816,4 +826,152 @@ fn number_field(data: &JsValue, key: &str) -> f64 {
         .ok()
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0)
+}
+
+// ── h² compute (Workstream L) ───────────────────────────────────────
+//
+// Spawns a single sibling Worker that reads the BIM (for SNP rsID
+// lookup) + sumstats (for χ² / N per SNP), joins against the
+// already-computed LD scores from the L2 panel, and runs LDSC's
+// IRWLS regression with block jackknife SE. Returns the canonical
+// 5-tuple stat geneticists quote in papers: h² (SE), intercept (SE),
+// ratio, mean χ², λ_GC.
+//
+// Lifecycle:
+//   1. Spawn one fresh Worker (no rayon pool; the h² regression is
+//      sequential and tiny — biobank-scale wall is < 1 s).
+//   2. Init wasm bundle with innerThreads=1.
+//   3. Post `compute_h2` with the L2 array + bed_idx (from prior L2
+//      run) + the BIM and sumstats File handles + jackknife config.
+//   4. On `compute_h2_done`, hand back the H2Result and terminate.
+//   5. On `error`, fire `on_error` with the message and terminate.
+//
+// Why one-shot vs reusing the L2 pool: each L2 worker is terminated
+// after its compute completes, and the regression has different
+// arg-shape needs (no BED, but yes sumstats). Cleaner to spin up a
+// dedicated worker than retrofit the pool dispatch.
+pub fn spawn_compute_h2(
+    l2: Vec<f64>,
+    maf: Vec<f64>,
+    bed_idx: Vec<u32>,
+    bim_file: web_sys::File,
+    sumstats_file: web_sys::File,
+    n_blocks: usize,
+    two_step: Option<f64>,
+    on_done: impl FnOnce(crate::worker::WireH2Result) + 'static,
+    on_error: impl FnOnce(String) + 'static,
+) -> Result<(), JsValue> {
+    let (wasm_js_url, wasm_bg_url) = discover_wasm_urls()?;
+    let wasm_js_url = absolutize(&wasm_js_url)?;
+    let wasm_bg_url = absolutize(&wasm_bg_url)?;
+
+    let worker = Rc::new(new_module_worker()?);
+    let on_done: Rc<RefCell<Option<Box<dyn FnOnce(crate::worker::WireH2Result)>>>> =
+        Rc::new(RefCell::new(Some(Box::new(on_done))));
+    let on_error: Rc<RefCell<Option<Box<dyn FnOnce(String)>>>> =
+        Rc::new(RefCell::new(Some(Box::new(on_error))));
+    // Pack the L2 + MAF + bed_idx + file handles into a closure that
+    // fires on `ready`. Doing it this way means the heavy payload
+    // doesn't outlive the worker's first dispatch.
+    let payload: Rc<
+        RefCell<Option<(Vec<f64>, Vec<f64>, Vec<u32>, web_sys::File, web_sys::File)>>,
+    > = Rc::new(RefCell::new(Some((l2, maf, bed_idx, bim_file, sumstats_file))));
+
+    let worker_for_handler = worker.clone();
+    let on_done_for_handler = on_done.clone();
+    let on_error_for_handler = on_error.clone();
+    let payload_for_handler = payload.clone();
+
+    let on_msg: Closure<dyn FnMut(MessageEvent)> = Closure::new(move |ev: MessageEvent| {
+        let data = ev.data();
+        let kind = string_field(&data, "kind");
+        match kind.as_str() {
+            "ready" => {
+                let Some((l2v, mafv, bedv, bim, sumstats)) =
+                    payload_for_handler.borrow_mut().take()
+                else {
+                    return;
+                };
+                // Marshal L2 + MAF + bed_idx as typed arrays (proven
+                // safe by the Workstream L probe sweep).
+                let l2_ta = js_sys::Float64Array::new_with_length(l2v.len() as u32);
+                l2_ta.copy_from(&l2v);
+                let maf_ta = js_sys::Float64Array::new_with_length(mafv.len() as u32);
+                maf_ta.copy_from(&mafv);
+                let bed_ta = js_sys::Uint32Array::new_with_length(bedv.len() as u32);
+                bed_ta.copy_from(&bedv);
+                let msg = js_sys::Object::new();
+                let _ = Reflect::set(&msg, &"kind".into(), &"compute_h2".into());
+                let _ = Reflect::set(&msg, &"l2".into(), &l2_ta);
+                let _ = Reflect::set(&msg, &"maf".into(), &maf_ta);
+                let _ = Reflect::set(&msg, &"bedIdx".into(), &bed_ta);
+                let _ = Reflect::set(&msg, &"bimFile".into(), bim.as_ref());
+                let _ = Reflect::set(&msg, &"sumstatsFile".into(), sumstats.as_ref());
+                let _ = Reflect::set(&msg, &"nBlocks".into(), &(n_blocks as f64).into());
+                if let Some(t) = two_step {
+                    let _ = Reflect::set(&msg, &"twoStep".into(), &t.into());
+                }
+                if let Err(e) = worker_for_handler.post_message(&msg) {
+                    if let Some(cb) = on_error_for_handler.borrow_mut().take() {
+                        cb(format!("compute_h2 postMessage: {e:?}"));
+                    }
+                    terminate_worker(&worker_for_handler);
+                }
+            }
+            "compute_h2_done" => {
+                let result_js = match Reflect::get(&data, &"result".into()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if let Some(cb) = on_error_for_handler.borrow_mut().take() {
+                            cb(format!("compute_h2 missing .result: {e:?}"));
+                        }
+                        terminate_worker(&worker_for_handler);
+                        return;
+                    }
+                };
+                let parsed: crate::worker::WireH2Result =
+                    match serde_wasm_bindgen::from_value(result_js) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if let Some(cb) = on_error_for_handler.borrow_mut().take() {
+                                cb(format!("compute_h2 result deserialise: {e}"));
+                            }
+                            terminate_worker(&worker_for_handler);
+                            return;
+                        }
+                    };
+                if let Some(cb) = on_done_for_handler.borrow_mut().take() {
+                    cb(parsed);
+                }
+                terminate_worker(&worker_for_handler);
+            }
+            "error" => {
+                let err = string_field(&data, "error");
+                if let Some(cb) = on_error_for_handler.borrow_mut().take() {
+                    cb(format!("compute_h2 worker error: {err}"));
+                }
+                terminate_worker(&worker_for_handler);
+            }
+            _ => {
+                tracing::warn!("[compute_h2] unexpected message kind: {kind}");
+            }
+        }
+    });
+    worker.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
+    on_msg.forget();
+
+    let worker_for_err = worker.clone();
+    let on_error_for_err = on_error.clone();
+    let on_err: Closure<dyn FnMut(JsValue)> = Closure::new(move |ev: JsValue| {
+        if let Some(cb) = on_error_for_err.borrow_mut().take() {
+            cb(format!("compute_h2 worker.onerror: {ev:?}"));
+        }
+        terminate_worker(&worker_for_err);
+    });
+    worker.set_onerror(Some(on_err.as_ref().unchecked_ref()));
+    on_err.forget();
+
+    // h² is sequential — no rayon pool needed.
+    post_init(&worker, &wasm_js_url, &wasm_bg_url, 1)?;
+    Ok(())
 }

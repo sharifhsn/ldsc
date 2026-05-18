@@ -17,8 +17,10 @@ use leptos::prelude::*;
 
 use super::charts::render_l2_vs_maf;
 use super::file_upload::{FileUploadRow, LoadedFile, ReadAs};
-use super::worker_client::{PoolProgress, WorkerComputeResult, spawn_compute_l2_pool};
-use crate::worker::{WireL2Config, WireWindowMode};
+use super::worker_client::{
+    PoolProgress, WorkerComputeResult, spawn_compute_h2, spawn_compute_l2_pool,
+};
+use crate::worker::{WireH2Result, WireL2Config, WireWindowMode};
 
 /// Mode preset radio (mirrors the "Mode" section of the CLI README's
 /// recommendations table). Selecting one auto-toggles the underlying
@@ -93,6 +95,12 @@ pub fn L2Panel() -> impl IntoView {
     let bed = RwSignal::new(LoadedFile::default());
     let bim = RwSignal::new(LoadedFile::default());
     let fam = RwSignal::new(LoadedFile::default());
+    // .sumstats is optional — only needed if the user wants to run
+    // the h² regression after L2 finishes. Format = LDSC's munged
+    // sumstats text (header + tab-sep SNP/Z/N rows). Uploaded as a
+    // raw File handle so the h² worker can `await blob.text()`
+    // without main-thread copies.
+    let sumstats = RwSignal::new(LoadedFile::default());
 
     // ── Config state ───────────────────────────────────────────────────
     let preset = RwSignal::new(ModePreset::Sketch);
@@ -114,6 +122,17 @@ pub fn L2Panel() -> impl IntoView {
     // (scan worker hasn't reported yet). Updated mid-compute by
     // progress messages from each per-chr worker.
     let progress: RwSignal<(usize, usize)> = RwSignal::new((0, 0));
+
+    // Per-bed_idx mapping from L2 array position back to BIM row.
+    // Held alongside `result` so the h² worker can pass it through
+    // unchanged. Reset to `None` whenever a new L2 run kicks off.
+    let bed_idx_for_h2: RwSignal<Option<Vec<u32>>> = RwSignal::new(None);
+
+    // h² state — separate from L2's `is_running` because they run
+    // sequentially but as independent worker jobs.
+    let h2_running = RwSignal::new(false);
+    let h2_result: RwSignal<Option<WireH2Result>> = RwSignal::new(None);
+    let h2_error: RwSignal<Option<String>> = RwSignal::new(None);
 
     // Re-render the MAF/L2 scatter whenever a new L2 result lands.
     // The histogram was dropped as part of the demo refocus
@@ -162,6 +181,10 @@ pub fn L2Panel() -> impl IntoView {
         result.set(None);
         progress.set((0, 0));
         is_running.set(true);
+        // h² is gated on L2 success; reset its state too.
+        h2_result.set(None);
+        h2_error.set(None);
+        bed_idx_for_h2.set(None);
 
         let preset_now = preset.get();
         let sketch_d_now = sketch_d.get();
@@ -219,6 +242,10 @@ pub fn L2Panel() -> impl IntoView {
         };
         let on_done = move |out: WorkerComputeResult| {
             tracing::info!("L2 done: {} SNPs in {:.2}s", out.n_snps, out.wall_seconds);
+            // Stash bed_idx separately so the h² worker can request
+            // it without making the rest of the UI thread through a
+            // bigger payload.
+            bed_idx_for_h2.set(Some(out.bed_idx.clone()));
             result.set(Some(out));
             is_running.set(false);
         };
@@ -243,20 +270,106 @@ pub fn L2Panel() -> impl IntoView {
         }
     };
 
+    // h² run handler. Fires the dedicated h² worker against the
+    // already-computed L2 + bed_idx + the uploaded BIM and sumstats.
+    // Gated on (L2 done && sumstats loaded) by the button's
+    // `disabled` predicate below.
+    //
+    // `#[allow(unused_variables)]` on the binding: the Leptos `view!`
+    // macro's nested-closure capture path defers `on_run_h2`'s
+    // capture to a per-render closure, which rustc's static analyser
+    // misses. The button works (verified end-to-end). Suppress the
+    // false positive instead of an underscore prefix (which would
+    // misleadingly imply the binding is dead).
+    #[allow(unused_variables)]
+    let on_run_h2 = move |ev: MouseEvent| {
+        ev.prevent_default();
+        if h2_running.get() {
+            return;
+        }
+        let Some(l2_out) = result.get() else {
+            h2_error.set(Some("Run L2 first.".into()));
+            return;
+        };
+        let Some(bed_idx) = bed_idx_for_h2.get() else {
+            h2_error.set(Some("L2 result is missing bed_idx — re-run L2.".into()));
+            return;
+        };
+        let Some(bim_handle) = bim.with(|f| f.file_handle.clone()).map(|h| h.take()) else {
+            h2_error.set(Some("BIM file not loaded.".into()));
+            return;
+        };
+        let Some(sumstats_handle) =
+            sumstats.with(|f| f.file_handle.clone()).map(|h| h.take())
+        else {
+            h2_error.set(Some(
+                "Upload a .sumstats file (LDSC munge_sumstats output) to run h².".into(),
+            ));
+            return;
+        };
+
+        h2_error.set(None);
+        h2_result.set(None);
+        h2_running.set(true);
+
+        let on_done_h2 = move |r: WireH2Result| {
+            tracing::info!(
+                "[h²] done: h²={:.4} (±{:.4}), intercept={:.4} (±{:.4}), mean χ²={:.4}, λ_GC={:.4}, n={}",
+                r.h2,
+                r.h2_se,
+                r.intercept,
+                r.intercept_se,
+                r.mean_chi2,
+                r.lambda_gc,
+                r.n_snps_used,
+            );
+            h2_result.set(Some(r));
+            h2_running.set(false);
+        };
+        let on_err_h2 = move |msg: String| {
+            tracing::error!("[h²] failed: {msg}");
+            h2_error.set(Some(msg));
+            h2_running.set(false);
+        };
+
+        // LDSC defaults: 200 jackknife blocks, two-step at χ² = 30
+        // (the standard cutoff in the original LDSC paper). Bypass
+        // both knobs in v1 — they're exposed in the CLI but not in
+        // the demo UI.
+        if let Err(e) = spawn_compute_h2(
+            l2_out.l2.clone(),
+            l2_out.maf.clone(),
+            bed_idx,
+            bim_handle,
+            sumstats_handle,
+            200,
+            Some(30.0),
+            on_done_h2,
+            on_err_h2,
+        ) {
+            tracing::error!("spawn_compute_h2 failed: {e:?}");
+            h2_error.set(Some(format!("h² worker spawn: {e:?}")));
+            h2_running.set(false);
+        }
+    };
+
     view! {
         // ── Upload card ────────────────────────────────────────────────
         <div class="card">
             <div class="card-header">
                 "L2 — LD scores from .bed/.bim/.fam"
-                <span class="subtitle">"Upload your PLINK genotype trio"</span>
+                <span class="subtitle">"Upload your PLINK genotype trio (.sumstats optional, for h²)"</span>
             </div>
             <div class="card-body">
                 <FileUploadRow ext=".bed" read_as=ReadAs::BlobHandle file=bed />
                 <FileUploadRow ext=".bim" read_as=ReadAs::BlobHandle file=bim />
                 <FileUploadRow ext=".fam" read_as=ReadAs::Text file=fam />
+                <FileUploadRow ext=".sumstats" read_as=ReadAs::BlobHandle file=sumstats />
                 <p class="text-muted mt-2 mb-0" style="font-size: 0.825rem;">
                     "Files stay in your browser — no data is uploaded anywhere. \
-                    Compute runs locally via WebAssembly."
+                    Compute runs locally via WebAssembly. The .sumstats file is optional; \
+                    upload it (LDSC munge_sumstats output) to also run h² heritability \
+                    after L2 finishes."
                 </p>
             </div>
         </div>
@@ -422,6 +535,178 @@ pub fn L2Panel() -> impl IntoView {
                 </div>
             }
         })}
+
+        // ── h² heritability card (gated on L2 result + sumstats) ─────
+        //
+        // Renders below the L2 results card whenever L2 has finished.
+        // The button is disabled until the user uploads a .sumstats
+        // file, with inline help to point them at LDSC's munge_sumstats.
+        {move || {
+            // Show the card only after the user has finished an L2 run.
+            // (Before that, the .sumstats picker is still visible in
+            // the upload card, but there's nothing to regress against.)
+            if result.get().is_none() {
+                return view! { <span></span> }.into_any();
+            }
+            let h2_ready = sumstats.with(|f| f.file_handle.is_some());
+            view! {
+                <div class="card">
+                    <div class="card-header">
+                        "h² — Heritability"
+                        <span class="subtitle">
+                            "LDSC regression with block jackknife SE; 5-tuple matches the CLI output"
+                        </span>
+                    </div>
+                    <div class="card-body">
+                        {move || if !h2_ready {
+                            view! {
+                                <p class="text-muted mb-0" style="font-size: 0.9rem;">
+                                    "Upload a "<code>".sumstats"</code>" file (output of "
+                                    <code>"ldsc munge-sumstats"</code>") in the upload card \
+                                    above to run heritability regression against the LD scores \
+                                    you just computed. Need columns "<code>"SNP"</code>", "
+                                    <code>"Z"</code>", "<code>"N"</code>"."
+                                </p>
+                            }.into_any()
+                        } else {
+                            view! {
+                                <div class="d-flex justify-content-end mb-3">
+                                    <button class="btn btn-primary"
+                                        disabled=move || h2_running.get()
+                                        on:click=on_run_h2>
+                                        {move || if h2_running.get() {
+                                            "Running h²…"
+                                        } else {
+                                            "Run h²"
+                                        }}
+                                    </button>
+                                </div>
+                            }.into_any()
+                        }}
+
+                        {move || h2_error.get().map(|msg| view! {
+                            <div class="error-box">{msg}</div>
+                        })}
+
+                        {move || h2_result.get().map(|r| view! {
+                            <H2ResultCard r=r />
+                        })}
+                    </div>
+                </div>
+            }.into_any()
+        }}
+    }
+}
+
+/// Renders the 5-tuple stat-geneticists quote in papers, plus the
+/// MAF/L2 r badge equivalent (sign-and-magnitude checks on h² and
+/// intercept).
+#[component]
+fn H2ResultCard(r: WireH2Result) -> impl IntoView {
+    // Quick sanity classifiers — h² should be in [0, 1] for a sane
+    // run on a single complex trait; LDSC commonly returns slightly
+    // negative values for noisy / low-h² traits (those are valid
+    // point estimates that the SE swallows). Intercept ≈ 1 means
+    // no confounding; > 1.05 hints at stratification.
+    let h2_class = if (0.0..=1.0).contains(&r.h2) {
+        "h2-good"
+    } else {
+        "h2-warn"
+    };
+    let intercept_class = if (0.95..=1.05).contains(&r.intercept) {
+        "h2-good"
+    } else if (0.90..=1.10).contains(&r.intercept) {
+        "h2-warn"
+    } else {
+        "h2-bad"
+    };
+    let ratio_view = match (r.ratio, r.ratio_se) {
+        (Some(rv), Some(se)) => view! {
+            <div class="stat">
+                <div class="label">"Ratio"</div>
+                <div class="value">{format!("{:.3}", rv)}</div>
+                <div class="text-muted" style="font-size: 0.7rem; margin-top: 0.15rem;">
+                    {format!("± {:.3} SE", se)}
+                </div>
+            </div>
+        }.into_any(),
+        _ => view! {
+            <div class="stat">
+                <div class="label">"Ratio"</div>
+                <div class="value">"—"</div>
+                <div class="text-muted" style="font-size: 0.7rem; margin-top: 0.15rem;">
+                    "NA (mean χ² ≈ 1)"
+                </div>
+            </div>
+        }.into_any(),
+    };
+    let snps_used = r.n_snps_used;
+    let snps_sumstats = r.n_snps_sumstats;
+    let m_snps_ref = r.m_snps_ref;
+    let mean_n = r.mean_n;
+    let wall = r.wall_seconds;
+    view! {
+        <div class="stat-grid">
+            <div class="stat">
+                <div class="label">"h²"</div>
+                <div class="value">{format!("{:.4}", r.h2)}</div>
+                <div class=h2_class style="font-size: 0.7rem; margin-top: 0.15rem;">
+                    {format!("± {:.4} SE", r.h2_se)}
+                </div>
+            </div>
+            <div class="stat">
+                <div class="label">"Intercept"</div>
+                <div class="value">{format!("{:.4}", r.intercept)}</div>
+                <div class=intercept_class style="font-size: 0.7rem; margin-top: 0.15rem;">
+                    {format!("± {:.4} SE", r.intercept_se)}
+                </div>
+            </div>
+            {ratio_view}
+            <div class="stat">
+                <div class="label">"Mean χ²"</div>
+                <div class="value">{format!("{:.4}", r.mean_chi2)}</div>
+            </div>
+            <div class="stat">
+                <div class="label">"λ_GC"</div>
+                <div class="value">{format!("{:.4}", r.lambda_gc)}</div>
+            </div>
+        </div>
+
+        <p class="text-muted mt-3 mb-0" style="font-size: 0.825rem;">
+            {format!(
+                "Joined {} of {} sumstats SNPs against {} LD-score reference SNPs (mean N = {:.0}). \
+                 Regression completed in {:.3} s.",
+                format_int(snps_used),
+                format_int(snps_sumstats),
+                format_int(m_snps_ref),
+                mean_n,
+                wall,
+            )}
+        </p>
+
+        <details class="mt-3">
+            <summary class="text-muted" style="font-size: 0.825rem;">
+                "How to read this"
+            </summary>
+            <div class="mt-2 text-muted" style="font-size: 0.825rem;">
+                <p class="mb-2">
+                    <strong>"h²"</strong>" — narrow-sense heritability captured by common SNPs in
+                    the reference panel. For most complex traits this is roughly 0.1–0.5; values
+                    near 0 (or slightly negative) are LDSC's natural point estimate for
+                    low-heritability traits — the SE is the honest measure of uncertainty."
+                </p>
+                <p class="mb-2">
+                    <strong>"Intercept"</strong>" — should be ≈ 1.0 under the LDSC null (no
+                    confounding). Values > 1.05 suggest population stratification or cryptic
+                    relatedness; the "<strong>"Ratio"</strong>" = (intercept − 1) / (mean χ² − 1)
+                    is the share of inflation attributable to confounding (Bulik-Sullivan 2015)."
+                </p>
+                <p class="mb-0">
+                    <strong>"Mean χ², λ_GC"</strong>" — pre-regression diagnostics. λ_GC > 1 is
+                    expected for polygenic traits and does not by itself indicate confounding."
+                </p>
+            </div>
+        </details>
     }
 }
 

@@ -549,6 +549,62 @@ pub struct WireChrSummary {
     pub snp_count: usize,
 }
 
+/// Serialisable mirror of [`ldsc::h2::H2Result`] — the canonical
+/// 5-tuple working stat geneticists quote in papers:
+///   h² (SE), intercept (SE), ratio (SE), mean χ², λ_GC
+///
+/// Plus diagnostic counters: how many sumstats SNPs joined against
+/// the LD scores, and the wall-time spent inside the regression.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireH2Result {
+    pub h2: f64,
+    pub h2_se: f64,
+    pub intercept: f64,
+    pub intercept_se: f64,
+    pub mean_chi2: f64,
+    pub lambda_gc: f64,
+    pub ratio: Option<f64>,
+    pub ratio_se: Option<f64>,
+    /// Count of SNPs that overlapped between the LD-score input and
+    /// the sumstats file (after χ² > max_chi2 filter, if any).
+    pub n_snps_used: usize,
+    /// Total SNPs in the sumstats file (before overlap with LD).
+    pub n_snps_sumstats: usize,
+    /// Total SNPs in the LD-score input (= total reference panel size
+    /// `M` used by the regression).
+    pub m_snps_ref: usize,
+    /// Mean N (sample size) across joined SNPs.
+    pub mean_n: f64,
+    /// Wall time inside the worker, measured with `web_time::Instant`
+    /// (not `std::time::Instant` — the latter panics on
+    /// wasm32-unknown-unknown; see Workstream L diagnosis).
+    pub wall_seconds: f64,
+}
+
+impl From<ldsc::h2::H2Result> for WireH2Result {
+    fn from(r: ldsc::h2::H2Result) -> Self {
+        let (ratio, ratio_se) = match r.ratio {
+            Some((r, se)) => (Some(r), Some(se)),
+            None => (None, None),
+        };
+        Self {
+            h2: r.h2,
+            h2_se: r.h2_se,
+            intercept: r.intercept,
+            intercept_se: r.intercept_se,
+            mean_chi2: r.mean_chi2,
+            lambda_gc: r.lambda_gc,
+            ratio,
+            ratio_se,
+            n_snps_used: 0,
+            n_snps_sumstats: 0,
+            m_snps_ref: 0,
+            mean_n: 0.0,
+            wall_seconds: 0.0,
+        }
+    }
+}
+
 // ── Worker entry points ─────────────────────────────────────────────
 
 /// Quick scan over a BIM Blob: returns the chromosomes present plus
@@ -861,4 +917,269 @@ pub async fn worker_compute_l2_chrs(
         perf: accum_perf,
     };
     serde_wasm_bindgen::to_value(&wire).map_err(|e| JsError::new(&format!("output serialise: {e}")))
+}
+
+/// Run LDSC's h² regression in a Web Worker against:
+///
+/// * `l2` — LD scores per BIM row (output of [`worker_compute_l2_chrs`]).
+/// * `maf` — MAF per BIM row, same length as `l2`. Used to compute
+///   `M_5_50` (= count of SNPs with MAF in [0.05, 0.5]) — the
+///   reference-panel size LDSC's h² normalisation expects. This is
+///   the value written to the `.l2.M_5_50` files by the CLI and
+///   loaded by `ldsc h2 --ref-ld-chr …`; passing the full BIM count
+///   instead overestimates h² by roughly `M_full / M_5_50` (≈ 1.3×
+///   on 1000G EUR).
+/// * `bed_idx` — `bed_idx` from the same L2 output. Maps L2 array
+///   positions back to BIM rows so we can join sumstats by SNP rsID.
+///   Same length as `l2`.
+/// * `bim_file` — the user's `.bim`. Re-streamed here to get the
+///   per-SNP rsID strings (those aren't returned by the L2 worker).
+/// * `sumstats_file` — a `.sumstats` text Blob (compressed `.gz` NOT
+///   supported in v1; uncompress before upload). Columns:
+///   `SNP \t Z \t N` with a header line. Whitespace-tolerant.
+/// * `n_blocks` — block jackknife block count. LDSC default = 200.
+/// * `two_step` — chi² cutoff for the two-step estimator (None ⇒
+///   single-step regression). LDSC default = 30.0.
+///
+/// Returns [`WireH2Result`] = the canonical 5-tuple plus join
+/// diagnostics. All timing uses [`web_time::Instant`] — `std::time::Instant`
+/// panics on `wasm32-unknown-unknown` ("time not implemented"), which
+/// was the original undiagnosed cause of the rolled-back
+/// `worker_h2_demo` trap (see Workstream L probe sweep).
+///
+/// `async` purely so we can `await blob.text()` on the sumstats Blob
+/// — that's the simplest path to get the file contents into Rust
+/// without a `FileReaderSync` round-trip per chunk. For typical
+/// `.sumstats` files (a few MB; ~1.2M SNPs) this loads in <100 ms.
+#[wasm_bindgen]
+pub async fn worker_compute_h2(
+    l2: Vec<f64>,
+    maf: Vec<f64>,
+    bed_idx: Vec<u32>,
+    bim_file: web_sys::File,
+    sumstats_file: web_sys::File,
+    n_blocks: usize,
+    two_step: Option<f64>,
+) -> Result<JsValue, JsError> {
+    // CRITICAL: NEVER import `std::time::Instant` here. It panics on
+    // wasm32-unknown-unknown with "time not implemented on this
+    // platform". Use `web_time::Instant` (already a dep) which routes
+    // to `performance.now()` and works inside Web Workers.
+    let t_start = web_time::Instant::now();
+
+    if l2.len() != bed_idx.len() || l2.len() != maf.len() {
+        return Err(JsError::new(&format!(
+            "worker_compute_h2: length mismatch (l2={}, maf={}, bed_idx={})",
+            l2.len(),
+            maf.len(),
+            bed_idx.len(),
+        )));
+    }
+    if l2.is_empty() {
+        return Err(JsError::new(
+            "worker_compute_h2: L2 input is empty — nothing to regress against",
+        ));
+    }
+    // M_5_50: the count of common SNPs (MAF in [0.05, 0.5]) in the
+    // reference panel. LDSC normalises h² by this M, NOT the full BIM
+    // count — passing the full count overestimates h² by `M_full /
+    // M_5_50` (≈ 1.3× on 1000G EUR). Computed inline from the maf
+    // vector the L2 worker already returns.
+    let m_5_50: usize = maf.iter().filter(|&&m| m >= 0.05).count();
+    if m_5_50 == 0 {
+        return Err(JsError::new(
+            "worker_compute_h2: no SNPs have MAF ≥ 0.05 — h² regression \
+             requires common variants for the M_5_50 normalisation",
+        ));
+    }
+
+    web_sys::console::log_1(
+        &format!(
+            "worker_compute_h2: l2.len={} bim.size={} sumstats.size={}",
+            l2.len(),
+            bim_file.size(),
+            sumstats_file.size(),
+        )
+        .into(),
+    );
+
+    // Stream BIM via `FileReaderSync` (Worker-only) and build a map
+    // from rsID → position in the `l2` / `bed_idx` arrays.
+    //
+    // The full BIM has the same row count as the reference panel; we
+    // only need the subset whose `bed_idx` matches our `bed_idx` set.
+    // Doing one streaming pass with a HashSet of expected bed_idx is
+    // cheaper than parsing every row and discarding the rest at
+    // biobank scale (1.66M SNPs).
+    use std::collections::HashMap;
+    let expected_bed_idx: std::collections::HashSet<u32> = bed_idx.iter().copied().collect();
+    let bim_blob: Blob = bim_file.into();
+    let bim_source =
+        BlobBimSource::new(bim_blob).map_err(|e| JsError::new(&format!("BlobBimSource: {e:?}")))?;
+    let bim_snps: Vec<BimRecord> = parse_bim_reader_filtered(
+        BufReader::with_capacity(BIM_BUFREADER_CAP, bim_source),
+        |_chr| true, // need all rows so bed_idx assignment is correct
+    )
+    .map_err(|e| JsError::new(&format!("parse BIM: {e:#}")))?;
+    // Build rsID → position-in-l2 map. `bed_idx_to_l2_pos[bed_idx]`
+    // tells us which slot of the `l2` array a given BIM-row maps to.
+    let mut bed_idx_to_l2_pos: HashMap<u32, usize> = HashMap::with_capacity(bed_idx.len());
+    for (pos, &bi) in bed_idx.iter().enumerate() {
+        bed_idx_to_l2_pos.insert(bi, pos);
+    }
+    let mut rsid_to_l2_pos: HashMap<String, usize> = HashMap::with_capacity(bed_idx.len());
+    for snp in &bim_snps {
+        let bi = snp.bed_idx as u32;
+        if expected_bed_idx.contains(&bi)
+            && let Some(&pos) = bed_idx_to_l2_pos.get(&bi)
+        {
+            rsid_to_l2_pos.insert(snp.snp.clone(), pos);
+        }
+    }
+    web_sys::console::log_1(
+        &format!(
+            "worker_compute_h2: rsid→pos map built ({} entries)",
+            rsid_to_l2_pos.len(),
+        )
+        .into(),
+    );
+
+    // Async-load the sumstats file as text. `Blob.text()` returns a
+    // Promise<DOMString>; await it then parse line-by-line.
+    let sumstats_blob: Blob = sumstats_file.into();
+    let sumstats_text_js = wasm_bindgen_futures::JsFuture::from(sumstats_blob.text())
+        .await
+        .map_err(|e| JsError::new(&format!("sumstats Blob.text(): {e:?}")))?;
+    let sumstats_text = sumstats_text_js
+        .as_string()
+        .ok_or_else(|| JsError::new("sumstats Blob.text() returned non-string"))?;
+    web_sys::console::log_1(
+        &format!(
+            "worker_compute_h2: sumstats loaded ({} chars)",
+            sumstats_text.len(),
+        )
+        .into(),
+    );
+
+    // Parse `.sumstats`: header line (SNP, Z, N — order-independent),
+    // then tab-separated rows. We accept arbitrary whitespace
+    // separators to match LDSC's loose parser.
+    let mut snp_col: Option<usize> = None;
+    let mut z_col: Option<usize> = None;
+    let mut n_col: Option<usize> = None;
+    let mut lines = sumstats_text.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| JsError::new("sumstats: empty file"))?;
+    for (i, col) in header.split_whitespace().enumerate() {
+        match col.to_ascii_uppercase().as_str() {
+            "SNP" | "RSID" => snp_col = Some(i),
+            "Z" => z_col = Some(i),
+            "N" => n_col = Some(i),
+            _ => {}
+        }
+    }
+    let snp_col =
+        snp_col.ok_or_else(|| JsError::new("sumstats header missing required column SNP"))?;
+    let z_col = z_col.ok_or_else(|| JsError::new("sumstats header missing required column Z"))?;
+    let n_col = n_col.ok_or_else(|| JsError::new("sumstats header missing required column N"))?;
+
+    let mut chi2_vec: Vec<f64> = Vec::new();
+    let mut l2_vec: Vec<f64> = Vec::new();
+    let mut n_vec: Vec<f64> = Vec::new();
+    let mut n_sumstats_total: usize = 0;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let needed = snp_col.max(z_col).max(n_col);
+        if cols.len() <= needed {
+            continue;
+        }
+        n_sumstats_total += 1;
+        let rsid = cols[snp_col];
+        let Some(&pos) = rsid_to_l2_pos.get(rsid) else {
+            continue;
+        };
+        let Ok(z) = cols[z_col].parse::<f64>() else {
+            continue;
+        };
+        let Ok(n) = cols[n_col].parse::<f64>() else {
+            continue;
+        };
+        if !z.is_finite() || !n.is_finite() || n <= 0.0 {
+            continue;
+        }
+        chi2_vec.push(z * z);
+        l2_vec.push(l2[pos]);
+        n_vec.push(n);
+    }
+
+    let n_joined = chi2_vec.len();
+    if n_joined < 200 {
+        return Err(JsError::new(&format!(
+            "worker_compute_h2: only {n_joined} SNPs overlapped between LD scores and sumstats — \
+             need at least 200 for jackknife. Check that the sumstats SNP column matches the \
+             rsIDs in your BIM file."
+        )));
+    }
+
+    let mean_n: f64 = n_vec.iter().sum::<f64>() / (n_vec.len() as f64);
+    web_sys::console::log_1(
+        &format!(
+            "worker_compute_h2: joined {} / {} sumstats SNPs (mean N = {:.0}); running regression",
+            n_joined, n_sumstats_total, mean_n,
+        )
+        .into(),
+    );
+
+    // Call into the lib's regression. `m_snps` is `M_5_50` (common-
+    // variant count from the reference panel) — matches what the CLI
+    // reads from `.l2.M_5_50` files. Using the full BIM count instead
+    // overestimates h² by `M_full / M_5_50` (verified vs CLI on
+    // 1000G_eur + simulated sumstats: identical intercept / mean χ² /
+    // λ_GC / ratio across browser and CLI, h² recovers to within
+    // M-ratio precision once M_5_50 is used).
+    use ldsc::la::col_from_vec;
+    let chi2 = col_from_vec(chi2_vec);
+    let l2_col = col_from_vec(l2_vec);
+    let n_vec_col = col_from_vec(n_vec.clone());
+    let n_blocks = n_blocks.max(2).min(n_joined / 2);
+    let result = ldsc::h2::run_h2_ldsc(
+        &chi2,
+        &l2_col,
+        &l2_col, // weights LD = ref LD (single-annotation regression)
+        &n_vec_col,
+        m_5_50 as f64,
+        n_blocks,
+        two_step,
+        None, // unconstrained intercept
+    )
+    .map_err(|e| JsError::new(&format!("run_h2_ldsc: {e:#}")))?;
+
+    let mut wire = WireH2Result::from(result);
+    wire.n_snps_used = n_joined;
+    wire.n_snps_sumstats = n_sumstats_total;
+    wire.m_snps_ref = m_5_50;
+    wire.mean_n = mean_n;
+    wire.wall_seconds = t_start.elapsed().as_secs_f64();
+
+    web_sys::console::log_1(
+        &format!(
+            "worker_compute_h2: done in {:.3}s — h²={:.4} (±{:.4}), intercept={:.4} (±{:.4}), \
+             mean χ²={:.4}, λ_GC={:.4}",
+            wire.wall_seconds,
+            wire.h2,
+            wire.h2_se,
+            wire.intercept,
+            wire.intercept_se,
+            wire.mean_chi2,
+            wire.lambda_gc,
+        )
+        .into(),
+    );
+
+    serde_wasm_bindgen::to_value(&wire)
+        .map_err(|e| JsError::new(&format!("h2 output serialise: {e}")))
 }

@@ -43,7 +43,12 @@
 
 // Source-of-truth set of accepted message kinds. Keep in sync with
 // the Rust dispatch table in ldsc-web/src/components/worker_client.rs.
-const KNOWN_KINDS = new Set(['init', 'scan_bim', 'compute_l2_chrs']);
+const KNOWN_KINDS = new Set([
+    'init',
+    'scan_bim',
+    'compute_l2_chrs',
+    'compute_h2',
+]);
 
 let wasm = null;
 let initPromise = null;
@@ -174,6 +179,21 @@ self.onmessage = async (e) => {
             );
             const dt = performance.now() - t0;
             self.postMessage({ kind: 'compute_l2_chrs_done', result, wallSecondsJs: dt / 1000 });
+            return;
+        }
+
+        if (kind === 'compute_h2') {
+            const { l2, maf, bedIdx, bimFile, sumstatsFile, nBlocks, twoStep } = data;
+            const t0 = performance.now();
+            // `worker_compute_h2` is async on the Rust side — parses
+            // the sumstats Blob via `Blob.text()` (await) before
+            // joining against the LD scores.
+            const result = await wasm.worker_compute_h2(
+                l2, maf, bedIdx, bimFile, sumstatsFile,
+                nBlocks ?? 200, twoStep ?? null,
+            );
+            const dt = performance.now() - t0;
+            self.postMessage({ kind: 'compute_h2_done', result, wallSecondsJs: dt / 1000 });
             return;
         }
 

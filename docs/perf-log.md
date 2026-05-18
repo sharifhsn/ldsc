@@ -3287,3 +3287,130 @@ cutoff scan (O(window+chunk) monotonic, negligible cost). So users can
 reproduce **either** Python LDSC's published-tradition h² or the LDSC
 paper's mathematical definition by flipping one flag — at the same speed
 in both cases, 311× faster than Python.
+
+## 2026-05-17 — Workstream L: h² in the browser + root-causing the trap
+
+### The trap that wasn't (`std::time::Instant::now()` on wasm32)
+
+Earlier sessions attempted a `worker_h2_demo` wasm-bindgen entry
+twice and both rolled back. The symptom was a `RuntimeError: unreachable`
+with a stack frame `at Module.worker_h2_demo … line: passArrayF64ToWasm0`.
+The prior diagnosis blamed the typed-array marshaling shim
+(`passArrayF64ToWasm0` → `__wbindgen_malloc`) interacting with the
+multi-threaded WASM bundle's allocator.
+
+Workstream L confronted this by running a probe sweep through a fresh
+sibling Worker (`worker_client::spawn_h2_trap_probes`, since deleted).
+Nine probes, dispatched one at a time:
+
+| Probe | Marshaling axis | Result |
+|---|---|---|
+| `repro_sync_string` | `String` baseline | ✓ OK |
+| `repro_sync_vec_f64` | `Vec<f64>` sync | ✓ OK |
+| `repro_async_vec_f64` | `Vec<f64>` async (the alleged trap) | ✓ OK |
+| `repro_async_float64array` | `js_sys::Float64Array` async | ✓ OK |
+| `repro_async_vec_u32` | `Vec<u32>` async | ✓ OK |
+| `repro_async_vec_u8` | `Vec<u8>` async | ✓ OK |
+| `repro_async_h2_like` | Full h² 5-arg signature | ✓ OK |
+| **`repro_std_instant`** | `std::time::Instant::now()` | **✗ TRAPPED** |
+| **`repro_web_time_instant`** | `web_time::Instant::now()` | **✓ OK** |
+
+Every typed-array marshaling path works fine in workers. The trap was
+**`std::time::Instant::now()`** panicking with
+`"time not implemented on this platform"` on `wasm32-unknown-unknown`
+— a known std-lib limitation. The original `worker_h2_demo` body had a
+`let t_start = Instant::now();` for perf timing; that one line was the
+landmine. The `passArrayF64ToWasm0` stack frame was a coincidence —
+the trap propagated up through the JS shim because the JS caller is
+the closest frame to the wasm boundary, but the actual `unreachable`
+opcode lived 6 frames deeper in `__rustc::rust_panic` → `panic_fmt`
+→ `<Instant as ::now>` → the std unsupported-platform stub.
+
+**Fix**: one line in `ldsc-web/Cargo.toml` (add `web-time = "1"`) and
+use `web_time::Instant` exclusively in any code path that runs inside
+a Worker. The lib already uses `web_time::Instant` in `src/l2/mod.rs`
+and `src/regressions.rs`; the new `worker_compute_h2` follows suit
+with a banner comment forbidding `std::time::Instant` import.
+
+The wasted-effort lesson: when the panic hook doesn't surface a
+human-readable message, install one anyway (or test with a
+synchronous probe that logs entry/exit from the Rust body). Two
+sessions of "is it the allocator? is it TLS? is it shared memory?"
+disappeared once the right panic surface was wired.
+
+### Workstream L deliverables
+
+Shipped:
+- `worker_compute_h2` async wasm entry — takes the prior L2 run's
+  `Vec<f64>` + `bed_idx: Vec<u32>` + the user's BIM/sumstats `File`
+  handles, joins on rsID, calls `ldsc::h2::run_h2_ldsc`. Returns the
+  canonical LDSC 5-tuple as `WireH2Result` via `serde_wasm_bindgen`.
+- 4th `.sumstats` file picker in the L2 upload card.
+- `spawn_compute_h2` main-thread client in `worker_client.rs` — fresh
+  worker per regression, `innerThreads=1` (h² is sequential, ~0.5s).
+- `H2ResultCard` Leptos component with the 5-stat tight grid (h²,
+  intercept, ratio, mean χ², λ_GC), each with sign-and-magnitude
+  classifier badges, plus a "How to read this" disclosure.
+
+End-to-end smoke (foregrounded Chrome on M5 Pro):
+- 1000G_eur (N=503, 1.66M SNPs) → L2 done in **1.79 s** (chunked
+  exact, 8 outer × 2 inner threads).
+- h² regression against 20,049-SNP simulated sumstats joined to
+  1,264,873 LD-score reference SNPs (M_5_50) → regression done in
+  **0.59 s**.
+
+### CLI parity validation (1000G_eur + sim_h2_0.20_rep000)
+
+With `--snp-level-masking` toggled OFF in the browser to match the
+CLI's default (no `--snp-level-masking` flag), the 5-tuple is
+**bit-identical** to displayed precision:
+
+| Stat | Browser | CLI | Δ |
+|---|---|---|---|
+| **h²** | **3.1502** (±4.7790) | **3.1502** (±4.7790) | **0** |
+| Intercept | 4.2741 (±0.1330) | 4.2741 (±0.1330) | **0** |
+| Mean χ² | 4.4082 | 4.4082 | **0** |
+| λ_GC | 5.0336 | 5.0336 | **0** |
+| Ratio | 0.961 (±0.039) | 0.9607 (±0.0390) | **0.0003** |
+| M (M_5_50) | 1,264,873 | 1,264,873 | **0** |
+| SNPs joined | 20,049 | 20,049 | **0** |
+
+Three landmines were closed during validation:
+
+**1. M_5_50 normalisation.** First browser run used
+`m_snps_ref = l2.len()` (full BIM count = 1,664,852) and reported
+h² = 4.37 — 1.39× off the CLI's 3.15. The CLI uses M_5_50 from
+the `.l2.M_5_50` files (= count of SNPs with MAF ≥ 0.05 =
+1,264,873). Fix: pass the L2 worker's `maf` array through to
+`worker_compute_h2` and compute `M_5_50` inline. Same file;
++20 LOC plus the signature thread-through.
+
+**2. `web_time::Instant` vs `std::time::Instant`.** Banner comment
+on `worker_compute_h2` and `web-time` added to `Cargo.toml`
+(documented in the trap section above).
+
+**3. `--snp-level-masking` default mismatch.** Browser UI defaults
+`snp_level_masking = true` (paper-canonical, matches the README's
+headline `--sketch 1600 --snp-level-masking` recommendation), but
+the CLI default is OFF (matches Python LDSC's chunked-window
+approximation). On 1000G_eur this changes mean(L2) on the joined
+SNP set by ~5%, propagating to a 5% h² gap. With masking toggled
+off in the browser, h² = 3.1502 = CLI to 4 decimals.
+
+Note that "masking ON vs OFF" reflects two equally-valid LDSC
+flavors — see the 2026-05-12 d-sweep entry above for the
+biobank-scale framing (`--sketch 1600 --snp-level-masking` matches
+per-SNP exact ≈ paper definition; `--sketch 1600` plain matches
+Python LDSC's chunked tradition). The browser exposes the toggle
+in the L2 config card.
+
+The simulated true h² (0.20) is **not** recoverable through this
+fixture because the sim used a different reference panel than the
+demo's 1000G_eur. The CLI also returns 3.15 on the same inputs —
+this is a sim-fixture artifact, not a regression bug. Validating
+against a known-good real GWAS fixture (e.g. BMI/Height + matching
+`eur_w_ld_chr`) is a follow-up.
+
+Workstream L is complete: the "compute L2 + run h² in one click"
+experience is live in the local dev build and CLI-bit-identical
+when the masking flag matches. Pushing to GH Pages.

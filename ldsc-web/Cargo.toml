@@ -96,6 +96,14 @@ plotters-canvas = "0.3"
 # Error helper consistent with the lib crate.
 anyhow = "1"
 
+# Wasm-safe Instant replacement (delegates to `performance.now()` on
+# wasm32, works in both main thread and Workers). Required because
+# `std::time::Instant::now()` on `wasm32-unknown-unknown` panics with
+# "time not implemented on this platform" — the root cause of the
+# original `worker_h2_demo` trap (initially misdiagnosed as a
+# `passArrayF64ToWasm0` allocator issue; see Workstream L probe sweep).
+web-time = "1"
+
 # Multi-threaded GEMM (workstream G — manual SAB worker pool).
 # wasm-bindgen-rayon was attempted but the bundler-mode
 # `workerHelpers.js` ships an `import('../../..')` that resolves to
