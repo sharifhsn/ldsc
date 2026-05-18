@@ -299,8 +299,7 @@ pub fn L2Panel() -> impl IntoView {
             h2_error.set(Some("BIM file not loaded.".into()));
             return;
         };
-        let Some(sumstats_handle) =
-            sumstats.with(|f| f.file_handle.clone()).map(|h| h.take())
+        let Some(sumstats_handle) = sumstats.with(|f| f.file_handle.clone()).map(|h| h.take())
         else {
             h2_error.set(Some(
                 "Upload a .sumstats file (LDSC munge_sumstats output) to run h².".into(),
@@ -629,7 +628,8 @@ fn H2ResultCard(r: WireH2Result) -> impl IntoView {
                     {format!("± {:.3} SE", se)}
                 </div>
             </div>
-        }.into_any(),
+        }
+        .into_any(),
         _ => view! {
             <div class="stat">
                 <div class="label">"Ratio"</div>
@@ -638,7 +638,8 @@ fn H2ResultCard(r: WireH2Result) -> impl IntoView {
                     "NA (mean χ² ≈ 1)"
                 </div>
             </div>
-        }.into_any(),
+        }
+        .into_any(),
     };
     let snps_used = r.n_snps_used;
     let snps_sumstats = r.n_snps_sumstats;

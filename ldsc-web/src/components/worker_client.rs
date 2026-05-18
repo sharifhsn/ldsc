@@ -873,9 +873,14 @@ pub fn spawn_compute_h2(
     // Pack the L2 + MAF + bed_idx + file handles into a closure that
     // fires on `ready`. Doing it this way means the heavy payload
     // doesn't outlive the worker's first dispatch.
-    let payload: Rc<
-        RefCell<Option<(Vec<f64>, Vec<f64>, Vec<u32>, web_sys::File, web_sys::File)>>,
-    > = Rc::new(RefCell::new(Some((l2, maf, bed_idx, bim_file, sumstats_file))));
+    let payload: Rc<RefCell<Option<(Vec<f64>, Vec<f64>, Vec<u32>, web_sys::File, web_sys::File)>>> =
+        Rc::new(RefCell::new(Some((
+            l2,
+            maf,
+            bed_idx,
+            bim_file,
+            sumstats_file,
+        ))));
 
     let worker_for_handler = worker.clone();
     let on_done_for_handler = on_done.clone();
