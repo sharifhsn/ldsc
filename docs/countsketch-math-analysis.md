@@ -653,8 +653,11 @@ section records the empirical evidence that motivated removing it.
 | 200 | +0.022 (quadratic better) | +0.005 |
 | 500 | −0.011 (linear better, in MC noise) | +0.002 |
 
-**Findings**:
-- At the recommended d=200, quadratic reduces mean bias by 0.022
+**Findings** (note: d=200 below is the historical default at the time of
+this analysis; the current recommendation is `--sketch 1000
+--snp-level-masking` per the 2026-05-18 N×d sweep — see
+`docs/perf-log.md`):
+- At the historical default d=200, quadratic reduces mean bias by 0.022
   (~0.12% relative) at the cost of marginally higher variance. MSE is
   essentially identical.
 - At d=50 and d=500, the means are within MC noise (one sketch seed; a

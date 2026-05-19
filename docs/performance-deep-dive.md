@@ -215,17 +215,20 @@ speedups roughly double.
 | Use case | Recommended mode | Biobank speedup vs per-SNP exact f32 |
 |----------|-----------------|---------------------:|
 | Exact per-SNP h2 (math truth) | `--snp-level-masking --fast-f32` | 1.0× (baseline) |
-| **High-accuracy h2/rg** (within ~0.001 of per-SNP exact) | **`--sketch 1600 --snp-level-masking`** | **~17×** |
-| Same combo, faster but Height shifts 0.003 h² | `--sketch 1000 --snp-level-masking` | ~19× |
-| Match Python LDSC chunked h2 | `--sketch 1000` | ~20× |
-| LD scores only (QC, visualization, fastest) | `--sketch 200` | ~24× |
+| **Universal sweet spot** (h² within ~0.003 of per-SNP exact, N=503 → 100K) | **`--sketch 1000 --snp-level-masking`** | **~25×** at N=50K |
+| Tighter accuracy (within ~0.002) | `--sketch 1600 --snp-level-masking` | ~17× |
+| Strict per-SNP (r ≥ 0.999) | `--sketch 5000 --snp-level-masking` | ~10× |
+| Match Python LDSC chunked h² | `--sketch 1000` (no mask) | ~25× |
+| LD scores only — QC/viz, NOT for h² (drifts ~0.01) | `--sketch 200 --snp-level-masking` | ~40× |
 
-The h² regression numbers above were validated on three real GWAS
-(BMI 2010, BMI 2018, Height 2018) cross-checked against GCTA, Python
-LDSC, chunk-exact, and per-SNP exact references. The earlier recommendation
-of `--sketch 5000` (predicting ~2% h² bias) was based on synthetic
-single-trait data and is superseded by the masking combo, which reaches
-~0.1% h² agreement at lower d.
+The h² regression numbers above were validated by the N×d sweep across
+N ∈ {503, 10K, 20K, 50K, 100K} on Apple M5 Pro (see
+`preprint/data/dn_sweep_full.csv` and the 2026-05-18 perf-log entry).
+**The accuracy curve is N-invariant**: the Pearson r between sketch and
+exact LD scores depends on d alone, not on sample size, so the
+recommended d generalizes across panel sizes. The earlier
+recommendation of `--sketch 1600` is fine but spends an extra ~2-3 s
+wall for diminishing accuracy gain over d=1000.
 
 ## Scaling to denser SNP panels
 

@@ -4,6 +4,83 @@ This log captures **post-change** performance measurements and parity checks.
 Each entry should list the dataset, command, and key timings so we can track
 how changes affect runtime.
 
+## 2026-05-18 — N×d sweep: optimal sketch d as a function of N
+
+Triggered by the question: "given the synthetic biobanks at N ∈ {10K, 20K,
+100K}, can we characterize the optimal sketch d per N for both speed AND
+accuracy?" Result: **optimal d is essentially N-invariant** at d=1000 when
+`--snp-level-masking` is on. The Pearson-r-of-LD-scores curve depends on
+d alone, not N — five N traces nearly coincide.
+
+**Setup.** 5 N × 9 modes = 45 cells, all with `--snp-level-masking`,
+measured on Apple M5 Pro 18-core laptop. N ∈ {503, 10K, 20K, 50K, 100K}
+on 1000G_eur + synthetic biobanks (21×-replicated 1000G with 1% noise).
+d ∈ {50, 100, 200, 500, 1000, 1600, 2000, 5000} plus exact-mask baseline.
+Per cell: wall, peak RSS, Pearson r vs same-N exact-mask LD scores, h²
+on Yengo 2018 BMI sumstats. Raw at `preprint/data/dn_sweep_full.csv`;
+sweep harness at `/tmp/dn_sweep.sh` (regenerable); analysis script at
+`/tmp/dn_analyze.py`.
+
+**Wall vs d** (s, locally):
+
+| d \ N | 503 | 10K | 20K | 50K | 100K |
+|---:|---:|---:|---:|---:|---:|
+| 50 | 1.7 | 2.6 | 4.1 | 6.8 | 12.5 |
+| 100 | 1.9 | 2.9 | 3.5 | 6.9 | 12.6 |
+| 200 | 2.3 | 3.2 | 3.4 | 7.1 | 12.4 |
+| 500 | 3.0 | 10.5 | 4.8 | 7.7 | 13.8 |
+| 1000 | --- | 7.4 | 6.4 | 9.7 | 14.4 |
+| 1600 | --- | 9.6 | 13.3 | 12.1 | 17.5 |
+| 2000 | --- | 11.4 | 10.2 | 14.8 | 19.2 |
+| 5000 | --- | 23.9 | 29.4 | 27.4 | 32.1 |
+| exact-mask | 2.9 | 43.1 | 83.3 | 233.5 | 845.1 |
+
+**Pearson r vs same-N exact-mask** (curves nearly coincide across N):
+
+| d | r at N=503 | N=10K | N=20K | N=50K | N=100K |
+|---:|---:|---:|---:|---:|---:|
+| 50 | 0.912 | 0.868 | 0.836 | 0.863 | 0.860 |
+| 100 | 0.967 | 0.932 | 0.933 | 0.934 | 0.931 |
+| 200 | 0.986 | 0.968 | 0.968 | 0.967 | 0.965 |
+| 500 | 0.994 | 0.987 | 0.988 | 0.986 | 0.986 |
+| 1000 | --- | 0.994 | 0.993 | 0.994 | 0.993 |
+| 1600 | --- | 0.996 | 0.996 | 0.996 | 0.995 |
+| 2000 | --- | 0.997 | 0.997 | 0.997 | 0.997 |
+| 5000 | --- | 0.999 | 0.999 | 0.999 | 0.998 |
+
+**|Δh²| vs same-N exact-mask** on Yengo 2018 BMI (regression SE ≈ 0.006):
+
+| d | N=503 | N=10K | N=20K | N=50K | N=100K |
+|---:|---:|---:|---:|---:|---:|
+| 50 | 0.050 | 0.020 | 0.033 | 0.004 | 0.022 |
+| 100 | 0.021 | 0.004 | 0.004 | 0.008 | 0.014 |
+| 200 | 0.008 | 0.007 | 0.004 | 0.006 | 0.007 |
+| 500 | 0.006 | 0.001 | 0.000 | 0.004 | 0.001 |
+| 1000 | --- | 0.003 | 0.003 | 0.000 | 0.002 |
+| 1600 | --- | 0.002 | 0.000 | 0.000 | 0.003 |
+| 2000 | --- | 0.001 | 0.001 | 0.002 | 0.000 |
+| 5000 | --- | 0.000 | 0.000 | 0.001 | 0.001 |
+
+**Conclusion.** d=1000 + masking is the universal sweet spot. The
+previously-recommended d=1600 is fine but spends extra wall (~2-3 s)
+for diminishing accuracy gain. d=200 is faster (~2 s) but drifts h² by
+~0.01 — not in the truth cluster. d=5000 needed only when per-SNP
+accuracy matters (partitioned h², fine-mapping); wall ~30 s.
+
+**Impact propagated to:** `preprint/main.typ` (new §"Optimal d as a
+function of N" subsection with @fig:optimal-d and @tbl:optimal-d-by-N),
+`README.md` (recommendation table updated, d=1600 → d=1000),
+`CLAUDE.md` (Performance Summary + practical-guidance prose updated),
+`docs/tutorial.md` (tutorial example bumped from `--sketch 200` to
+`--sketch 1000 --snp-level-masking`), `ldsc-web/src/components/l2_panel.rs`
+(default `sketch_d` 1600 → 1000; speed-optimize button now picks d=1000
+not d=200 with new rationale).
+
+This entry **supersedes** the 2026-05-12 single-N biobank d-sweep entry
+below for the question "what d to use" (that entry's wall measurements
+on AWS r6a.8xlarge are still authoritative for biobank-only sizing,
+just not for per-N optimization).
+
 ## 2026-05-16 (Workstream H: scatter parallelism via SAB pool)
 
 - Change: extended the manual SAB-backed worker pool in

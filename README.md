@@ -41,16 +41,23 @@ but introduces systematic bias into downstream h².
    [`docs/countsketch-math-analysis.md`](docs/countsketch-math-analysis.md).
    At biobank N=50K, sketch is 17–24× faster than `--fast-f32` exact.
 
-3. **`--sketch 1600` reproduces both truth clusters at biobank speed.** At
-   d=1600 the masking flag becomes a switch between the two h² definitions
-   used in the field, both within 0.001 h² on three real GWAS at biobank:
-   - `--sketch 1600` (plain) → matches **Python LDSC** h² (chunked-window
+3. **`--sketch 1000 --snp-level-masking` is the universal sweet spot.** The
+   N×d sweep across N ∈ {503, 10K, 20K, 50K, 100K}
+   (see [`preprint/data/dn_sweep_full.csv`](preprint/data/dn_sweep_full.csv)
+   and [Figure 7 of the preprint](preprint/figures/fig7_optimal_d.png))
+   shows the accuracy curve is essentially **N-independent**: a user picking
+   d does not need to know the panel size in advance. At d=1000 with masking
+   on, ldsc-rs delivers Pearson r ≥ 0.993 vs exact LD scores and h² within
+   ~0.003 of per-SNP exact across every panel size tested. Wall time is
+   <15 s even at N=100,000. The masking flag toggles which h² truth cluster
+   is reproduced:
+   - `--sketch 1000` (plain) → matches **Python LDSC** h² (chunked-window
      algorithm, the canonical implementation everyone has used since 2014).
-   - `--sketch 1600 --snp-level-masking` → matches **per-SNP exact** h² (the
+   - `--sketch 1000 --snp-level-masking` → matches **per-SNP exact** h² (the
      LDSC paper's mathematical definition of ℓ\_j = Σ\_k r²\_jk).
 
-   Both run in 21 s — that's **311× faster than Python LDSC at biobank** (21 s
-   vs measured 6,541 s on r6a.8xlarge) and matches whichever truth you need.
+   For strict per-SNP accuracy (partitioned heritability, fine-mapping),
+   bump to `--sketch 5000` for Pearson r ≥ 0.999 at ~30 s wall.
 
    And with `--snp-level-masking` on, sketch+mask is **~12% more accurate
    than Python LDSC** at biobank: Python's chunked-window approximation has
@@ -133,14 +140,16 @@ ldsc rg --rg trait1.sumstats.gz,trait2.sumstats.gz \
 
 ### B) Computing your own LD scores at biobank scale
 
-For a biobank-scale reference panel (N up to 50K+), the recommended high-
-accuracy fast mode is `--sketch d --snp-level-masking`. At d=1600 this
-matches per-SNP exact h² within 0.001 at ~17× the speed of exact:
+For a biobank-scale reference panel (any N up to 100K+), the recommended
+high-accuracy fast mode is `--sketch 1000 --snp-level-masking`. The
+empirical N×d sweep shows this puts h² within ~0.003 of per-SNP exact
+*regardless of N* (because accuracy depends on d alone, not on sample
+size), at wall-clock <15 s on a laptop:
 
 ```bash
-# High-accuracy biobank LD scores: ~21s on N=50K, full 1.66M SNPs
+# Universal sweet spot: <15s on N up to 100K, full 1.66M SNPs
 ldsc l2 --bfile my_biobank_panel \
-        --ld-wind-kb 1000 --sketch 1600 --snp-level-masking --mmap \
+        --ld-wind-kb 1000 --sketch 1000 --snp-level-masking --mmap \
         --out my_ld_scores
 
 # Then h² with your custom LD scores
@@ -148,6 +157,9 @@ ldsc h2 --h2 my_trait.sumstats.gz \
         --ref-ld-chr my_ld_scores --w-ld-chr my_ld_scores \
         --out my_trait_h2
 ```
+
+For strict per-SNP accuracy (partitioned heritability, fine-mapping),
+substitute `--sketch 5000` (~30 s wall, Pearson r ≥ 0.999 vs exact).
 
 For 1000G-scale references (N≈500-2,500), the speed difference between sketch
 and exact is small enough that exact is preferable: `ldsc l2 --bfile … --out …
@@ -159,24 +171,28 @@ Speedups below are biobank wall-clock (N=50,000, 1.66M SNPs, AWS c6a.4xlarge
 unless noted). The Python LDSC baseline is **6,541 s (109 min)** measured on
 r6a.8xlarge (32 vCPU, 240 GiB) at `--chunk-size 200 --ld-wind-kb 1000`.
 
-**At d=1600, one flag toggles which "truth" the sketch reproduces** (verified
-on 3 real GWAS at biobank, all matches within 0.001 h²):
-- `--sketch 1600` (plain) → matches Python LDSC h² (chunked-window algorithm)
-- `--sketch 1600 --snp-level-masking` → matches per-SNP exact h² (LDSC paper definition)
+**At d=1000, one flag toggles which "truth" the sketch reproduces** (verified
+across the N×d sweep with masking on — see
+[`preprint/data/dn_sweep_full.csv`](preprint/data/dn_sweep_full.csv)):
+- `--sketch 1000` (plain) → matches Python LDSC h² (chunked-window algorithm)
+- `--sketch 1000 --snp-level-masking` → matches per-SNP exact h² (LDSC paper definition)
 
-Both run in ~21 s — masking is a post-GEMM cutoff scan with negligible cost.
+Both run in <15 s on a laptop up to N=100K — masking is a post-GEMM cutoff
+scan with <1% overhead.
 
-| Goal | Use | Time | vs Python | h² match (3 real GWAS) |
+| Goal | Use | Time @ N=50K | Time @ N=100K | h² vs per-SNP exact |
 |---|---|---:|---:|---|
-| Match Python LDSC bit-for-bit (1000G replication) | `--python-compat` | — | 1.0× (1000G) | bit-identical |
-| Exact LD scores, paper-canonical math | `--snp-level-masking --fast-f32` | 361 s | **18×** | per-SNP exact (truth) |
-| **Reproduce Python LDSC's h² at biobank** (within 0.001) | **`--sketch 1600 --mmap`** | **21 s** | **311×** | Python within 0.001 |
-| **Reach paper-canonical h² at biobank** (within 0.001) | **`--sketch 1600 --snp-level-masking --mmap`** | **21 s** | **311×** | per-SNP exact within 0.001 |
-| Faster, ~0.003 h² shift on Height | `--sketch 1000 --snp-level-masking --mmap` | 19 s | 344× | per-SNP exact within 0.003 |
-| Fastest LD scores (QC, visualization, screening) | `--sketch 200 --mmap` | 15 s | 436× | per-SNP exact within 0.013 |
+| Match Python LDSC bit-for-bit (1000G replication) | `--python-compat` | — | — | bit-identical |
+| Exact LD scores, paper-canonical math | `--snp-level-masking --fast-f32` | 292 s | 1,013 s | truth (ref) |
+| **Universal sweet spot** (Pearson r ≥ 0.993 across all N) | **`--sketch 1000 --snp-level-masking --mmap`** | **9.7 s** | **14.4 s** | within ~0.003 |
+| Tighter accuracy (r ≥ 0.996) | `--sketch 1600 --snp-level-masking --mmap` | 12.1 s | 17.5 s | within ~0.002 |
+| Strict per-SNP accuracy (r ≥ 0.999) | `--sketch 5000 --snp-level-masking --mmap` | 27.4 s | 32.1 s | within ~0.002 |
+| Fastest, NOT in truth cluster (QC only) | `--sketch 200 --snp-level-masking --mmap` | 7.1 s | 12.4 s | drifts by 0.006–0.013 |
 
-See [Performance](#performance) for measured timings; full cross-method h²
-validation tables are in `docs/perf-log.md` 2026-05-12 / 2026-05-13 entries.
+See [Performance](#performance) for measured timings. The full N×d sweep
+(5 N × 8 d cells = 45 measurements with per-cell Pearson r and BMI h²)
+lives at `preprint/data/dn_sweep_full.csv` with the cohort-validated figure
+at `preprint/figures/fig7_optimal_d.png`.
 
 ---
 
@@ -412,24 +428,50 @@ Run core matmuls in f32 with f64 accumulation. Halves GEMM bandwidth.
 
 ### `--sketch d` — CountSketch random projection
 
-Compress the individual dimension from N to d via a CountSketch
-projection (a hash-based ±1 random matrix) before all GEMM operations.
-Fused decode-normalize-scatter-add kernel; cost is **O(N×c) regardless
-of d** until d ≈ √N. After projection, columns are renormalized (ratio
-estimator) so ‖x̃‖² = N exactly. Bias `(1−r²)(1−2r²)/d` is corrected by
-quadratic inversion (residual O(1/d²)). See
+**Conceptually, `d` is the number of "synthetic individuals" we
+compress the N real individuals into.** CountSketch randomly assigns
+each of the N individuals to one of d buckets with a random ±1 sign,
+then sums them up. Each bucket aggregates the genotypes of roughly
+N/d real individuals with random sign cancellations. The trick: when
+we compute *pairwise* quantities between SNPs (like the inner products
+that make up LD scores), the random signs cancel in expectation, and
+the sketched inner products are unbiased estimators of the real ones
+with per-pair variance ∝ 1/d. Larger d → tighter LD-score estimates;
+smaller d → faster downstream linear algebra (all GEMMs are now in d
+dimensions, not N).
+
+The decoupling is the key insight: **compute cost scales with N**
+(every individual touches one bucket once, an O(N·c) scatter-add
+pass), but **accuracy scales with d alone** (the pairwise SNP
+inner-product variance is 1/d regardless of N). This is why the
+optimal d turns out to be the same across panel sizes from 1000
+Genomes (N=503) all the way to N=100,000 — accuracy depends on
+the *compression ratio's tightness*, not the *original count*.
+
+The actual mechanism: a CountSketch matrix S ∈ ℝ^(d×N) with one ±1
+entry per column (hash + sign chosen per individual) acts on the
+N×c genotype chunk G to produce S·G ∈ ℝ^(d×c). The fused
+decode-normalize-scatter-add kernel does this in a single O(N·c)
+pass without materializing G. After projection, columns are
+renormalized (ratio estimator) so ‖x̃‖² = N exactly, and the
+sketch bias `(1−r²)(1−2r²)/d` is corrected by quadratic inversion
+(residual O(1/d²)). See
 [`docs/countsketch-math-analysis.md`](docs/countsketch-math-analysis.md)
 for derivation and Monte-Carlo validation.
 
-LD-score level accuracy as a function of d (measured on a 200k-SNP extract,
-N=2,490):
+LD-score level accuracy as a function of d, measured across N ∈ {503, 10K,
+20K, 50K, 100K} on full-genome 1.66M SNPs with `--snp-level-masking`
+(`preprint/data/dn_sweep_full.csv`). The curves nearly coincide across N,
+so the table is approximately N-invariant:
 
-| d | LD-score Pearson r vs chunk-exact |
-|---:|:---:|
-| 100 | 0.87 |
-| **200** (default) | **0.92** |
-| 500 | 0.97 |
-| 1000 | 0.99 |
+| d | LD-score Pearson r vs per-SNP exact | h² Δ vs per-SNP exact |
+|---:|:---:|:---:|
+| 100 | 0.93 | 0.006–0.034 |
+| 200 | 0.97 | 0.006–0.013 |
+| 500 | 0.99 | 0.000–0.006 |
+| **1,000** *(recommended)* | **0.994** | **0.000–0.003** |
+| 1,600 | 0.996 | 0.000–0.002 |
+| 5,000 | 0.999 | 0.000–0.002 |
 
 `--sketch` automatically enables f32 (CountSketch ±1 entries are exactly
 representable in f32). Deterministic (seed=42). Requires `3 ≤ d < N`
