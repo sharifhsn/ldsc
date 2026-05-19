@@ -113,7 +113,21 @@ rustflags = [
     "-C", "link-arg=--export=__tls_size",
     "-C", "link-arg=--export=__tls_align",
     "-C", "link-arg=--export=__tls_base",
+    # Drop unwinding tables from user-crate code. Profile-level
+    # `panic = "abort"` cannot be scoped per-package via Cargo
+    # restrictions, so we apply it as a target-scoped rustflag here —
+    # only the wasm32 build is affected, the native CLI (which uses
+    # `std::panic::catch_unwind` inside the optional `gpu` feature)
+    # is untouched. Pairs with `build-std-features =
+    # ["panic_immediate_abort"]` below, which removes panic-message
+    # formatting machinery from libstd (~50 KB additional savings).
+    "-C", "panic=abort",
 ]
 
 [unstable]
-build-std = ["panic_abort", "std"]
+build-std          = ["std", "panic_abort", "core", "alloc"]
+# Removes the panic-message formatter from libstd (panics print only
+# the file:line location, not the panic string). Acceptable tradeoff
+# for a shipped CSR app — the console panic hook (gated behind `debug`
+# feature) covers the development-time legibility case.
+build-std-features = ["panic_immediate_abort"]

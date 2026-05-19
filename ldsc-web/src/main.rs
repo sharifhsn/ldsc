@@ -85,13 +85,23 @@ fn App() -> impl IntoView {
 }
 
 fn main() {
-    // Funnel Rust panics through console.error with a stack trace
-    // (otherwise they become a generic "Unreachable executed").
-    console_error_panic_hook::set_once();
+    // Diagnostics are gated behind the `debug` cargo feature so production
+    // builds drop ~80-150 KB of subscriber + formatter machinery from the
+    // WASM bundle. In release the bundle aborts on panic via the
+    // `-C panic=abort` rustflag + `panic_immediate_abort` build-std
+    // feature, so the legibility win from `console_error_panic_hook`
+    // doesn't apply anyway (panics print only file:line). Enable with:
+    //     trunk serve --features debug
+    #[cfg(feature = "debug")]
+    {
+        // Funnel Rust panics through console.error with a stack trace
+        // (otherwise they become a generic "Unreachable executed").
+        console_error_panic_hook::set_once();
 
-    // Lightweight tracing → console.log. Trust level configurable via
-    // `?log=debug` later; default to info.
-    tracing_wasm::set_as_global_default();
+        // Lightweight tracing → console.log. Trust level configurable
+        // via `?log=debug` later; default to info.
+        tracing_wasm::set_as_global_default();
+    }
 
     // The same wasm bundle loads in two contexts: the main document
     // (where we mount Leptos) and the Web Worker spawned for L2

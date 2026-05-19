@@ -81,16 +81,28 @@ gloo-events = "0.2"
 # values anyway.
 send_wrapper = "0.6"
 
-# Browser console panic hook for legible errors during dev.
-console_error_panic_hook = "0.1"
+# `tracing` macros expand to no-ops without a registered subscriber, so
+# the `tracing` dep itself is cheap to keep in default. The subscriber +
+# fmt formatter is what's expensive (~80-150 KB of formatting machinery
+# in the WASM bundle) — gated behind the `debug` feature so production
+# builds drop it entirely.
+tracing = "0.1"
 
-# Logging through the JS console — useful for trace! / debug! during dev.
-tracing            = "0.1"
-tracing-wasm       = "0.2"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+# Browser console panic hook — produces readable stack traces in
+# `console.error` instead of "RuntimeError: unreachable". Useful in dev,
+# unnecessary in release (panics already abort via `panic=abort` rustflag
+# in `.cargo/config.toml`). Gated behind the `debug` feature.
+console_error_panic_hook = { version = "0.1", optional = true }
+tracing-wasm             = { version = "0.2", optional = true }
+tracing-subscriber       = { version = "0.3", optional = true, default-features = false, features = ["fmt"] }
 
 # Plotters histograms / scatter rendered into a <canvas>.
-plotters        = { version = "0.3", default-features = false, features = ["bitmap_backend", "line_series", "histogram", "all_series"] }
+# Dropped `all_series` (meta-feature that turns on every series type:
+# boxplot, area, errorbar, candlestick, ...). We only render line series
+# + histograms — the unused series cost ~50-100 KB of dead-code in the
+# WASM bundle. `default-features = false` keeps `font-kit` / `fontconfig`
+# (native-only) out.
+plotters        = { version = "0.3", default-features = false, features = ["bitmap_backend", "line_series", "histogram"] }
 plotters-canvas = "0.3"
 
 # Error helper consistent with the lib crate.
@@ -120,3 +132,21 @@ flate2 = "1"
 # instead spawn our own inner workers from `assets/inner_worker.js`
 # and coordinate via raw Atomics on SAB-backed wasm linear memory.
 # See `src/wasm_simd.rs::pool` for the implementation.
+
+[features]
+# `debug` enables the console panic hook + tracing subscriber for local
+# iteration. Production builds (the GitHub Pages deploy) leave it off
+# to drop ~80-150 KB of formatting machinery from the WASM bundle.
+#     trunk serve --features debug      # local
+#     trunk build --release              # production (default)
+default = []
+debug   = [
+    "dep:console_error_panic_hook",
+    "dep:tracing-wasm",
+    "dep:tracing-subscriber",
+]
+
+# NOTE: per-package profile overrides for ldsc-web (opt-level="z",
+# strip="symbols" etc.) live in the WORKSPACE-ROOT Cargo.toml under
+# `[profile.release.package.ldsc-web]`. Cargo ignores per-package
+# profiles defined in non-root workspace members.

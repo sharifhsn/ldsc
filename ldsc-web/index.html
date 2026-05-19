@@ -56,8 +56,22 @@
          - --enable-relaxed-simd: permits `f32x4.relaxed_madd` (FMA
            used by our 4×4 GEMM microkernel for ~1.6× speedup on
            small-m shapes). Without this, wasm-opt strips relaxed
-           ops and the kernel falls back to scalar tail. -->
-    <link data-trunk rel="rust" data-bin="ldsc-web" data-wasm-opt="z" data-wasm-opt-params="--enable-threads --enable-simd --enable-relaxed-simd" />
+           ops and the kernel falls back to scalar tail.
+         - --enable-bulk-memory / --enable-nontrapping-float-to-int:
+           required by LLVM 20+ codegen (Rust 1.87+). Passing them
+           explicitly avoids spurious validation errors on toolchain
+           drift.
+         - --converge: re-run passes until a fixed point. Costs
+           build time, saves 1-5% more on bundle size.
+         - --low-memory-unused: lets wasm-opt assume the first 1024
+           bytes of linear memory are unused, enabling more aggressive
+           constant folding into load/store offsets. Rust's allocator
+           respects this; safe with --shared-memory / --import-memory.
+         - --strip-debug / --strip-producers: drop debug info sections
+           and the "produced by Rust X / wasm-bindgen Y" metadata.
+         - --vacuum: already implied by -Oz but explicit for clarity. -->
+    <link data-trunk rel="rust" data-bin="ldsc-web" data-wasm-opt="z"
+          data-wasm-opt-params="--enable-threads --enable-simd --enable-relaxed-simd --enable-bulk-memory --enable-nontrapping-float-to-int --converge --low-memory-unused --strip-debug --strip-producers --vacuum" />
 </head>
 <body>
     <!-- Leptos mounts the entire UI here at startup. Until the wasm

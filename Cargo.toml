@@ -135,6 +135,20 @@ opt-level     = 3
 lto           = "thin"
 codegen-units = 1
 
+# Per-package profile override for ldsc-web. The WASM bundle is mostly
+# cold component glue at first paint — `opt-level = "z"` consistently
+# wins on bundle size vs `3` here with no user-visible perf delta. The
+# native CLI keeps `opt-level = 3` (where the GEMM hot loops actually
+# matter). `panic` is not a valid per-package profile override (Cargo
+# restriction); the unwinding-table savings come from `-C panic=abort`
+# rustflag scoped to the wasm32 target in `ldsc-web/.cargo/config.toml`.
+[profile.release.package.ldsc-web]
+opt-level     = "z"
+codegen-units = 1
+strip         = "symbols"
+incremental   = false
+debug         = false
+
 [features]
 gpu = ["dep:cubecl", "dep:cubek-matmul"]
 mimalloc = ["dep:mimalloc"]

@@ -73,8 +73,14 @@ fn ensure_worker_tracing() {
     }
     DONE.with(|d| {
         if !d.get() {
-            console_error_panic_hook::set_once();
-            tracing_wasm::set_as_global_default();
+            // Both gated behind the `debug` cargo feature — production
+            // builds drop the panic hook + tracing subscriber (panics
+            // already abort via `-C panic=abort` + `panic_immediate_abort`).
+            #[cfg(feature = "debug")]
+            {
+                console_error_panic_hook::set_once();
+                tracing_wasm::set_as_global_default();
+            }
             d.set(true);
         }
     });
