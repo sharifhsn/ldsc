@@ -29,15 +29,17 @@ use leptos::prelude::document;
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
-use components::{Banner, Footer, L2Panel, NavBar};
+use components::{Banner, Footer, L2Panel, NavBar, PreprintPanel};
 
 /// Module currently shown in the main panel area. h2 / rg are stubbed
-/// in v1 — the L2 panel is the headline.
+/// in v1 — the L2 panel is the headline. `Preprint` is a static
+/// reader that iframes the typst-ts-cli-rendered `preprint.html`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Module {
     L2,
     H2,
     Rg,
+    Preprint,
 }
 
 /// Root component. Lays out the LDLink-style chrome (banner / nav /
@@ -78,6 +80,7 @@ fn App() -> impl IntoView {
                         </div>
                     </div>
                 }.into_any(),
+                Module::Preprint => view! { <PreprintPanel /> }.into_any(),
             }}
         </main>
         <Footer />

@@ -52,6 +52,17 @@
          `assets/inner_worker.js` for the full lifecycle. -->
     <link data-trunk rel="copy-file" href="assets/inner_worker.js" />
 
+    <!-- Preprint reader assets. preprint.html is a standalone
+         self-contained HTML doc produced by `typst-ts-cli` (see
+         preprint/scripts/build_web_artifact.sh) — full preprint as
+         one tall inline SVG with the typst.ts semantic-text overlay
+         (selectable text, native Ctrl-F). The Preprint tab in the
+         Leptos app iframes this file on demand; main bundle load
+         is untouched for users who never visit the tab.
+         ~8 MB raw, ~2.3 MB gzipped over the wire. -->
+    <link data-trunk rel="copy-file" href="assets/preprint.html" />
+    <link data-trunk rel="copy-file" href="assets/preprint.pdf" />
+
     <!-- Compile + bundle the ldsc-web crate. data-bin selects this
          binary in case the workspace ever has more than one.
          data-wasm-opt-params:

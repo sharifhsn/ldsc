@@ -44,6 +44,7 @@ pub fn NavBar(module: RwSignal<Module>) -> impl IntoView {
                     {tab("L2", Module::L2, true)}
                     {tab("H2", Module::H2, true)}
                     {tab("Rg", Module::Rg, true)}
+                    {tab("Preprint", Module::Preprint, true)}
                 </div>
             </div>
         </nav>

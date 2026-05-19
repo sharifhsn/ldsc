@@ -11,9 +11,11 @@ mod file_upload;
 mod footer;
 mod l2_panel;
 mod navbar;
+mod preprint_panel;
 mod worker_client;
 
 pub use banner::Banner;
 pub use footer::Footer;
 pub use l2_panel::L2Panel;
 pub use navbar::NavBar;
+pub use preprint_panel::PreprintPanel;

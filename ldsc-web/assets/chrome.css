@@ -372,6 +372,7 @@ button {
 .mt-4 { margin-top: 1.5rem !important; }
 .my-3 { margin-top: 1rem !important; margin-bottom: 1rem !important; }
 .ms-2 { margin-left: 0.5rem !important; }
+.p-0  { padding: 0 !important; }
 
 /* ── Text utilities ────────────────────────────────────────── */
 .text-muted { color: var(--bs-secondary-color) !important; }
