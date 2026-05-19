@@ -113,21 +113,24 @@ rustflags = [
     "-C", "link-arg=--export=__tls_size",
     "-C", "link-arg=--export=__tls_align",
     "-C", "link-arg=--export=__tls_base",
-    # Drop unwinding tables from user-crate code. Profile-level
-    # `panic = "abort"` cannot be scoped per-package via Cargo
-    # restrictions, so we apply it as a target-scoped rustflag here —
-    # only the wasm32 build is affected, the native CLI (which uses
-    # `std::panic::catch_unwind` inside the optional `gpu` feature)
-    # is untouched. Pairs with `build-std-features =
-    # ["panic_immediate_abort"]` below, which removes panic-message
-    # formatting machinery from libstd (~50 KB additional savings).
-    "-C", "panic=abort",
+    # Drop unwinding tables from user-crate code AND remove
+    # panic-message formatting machinery from libstd. The unstable
+    # `immediate-abort` panic strategy (recently promoted from a
+    # build-std feature flag to a proper strategy in newer nightlies)
+    # collapses panics to a direct abort with no message formatting —
+    # ~50 KB savings on libstd alone, plus removes unwinding tables
+    # from user-crate code. Requires `-Z unstable-options` because
+    # the strategy is still unstable. Profile-level `panic = "..."`
+    # cannot be scoped per-package via Cargo, so we apply it as a
+    # target-scoped rustflag — only the wasm32 build is affected,
+    # the native CLI (which uses `std::panic::catch_unwind` inside
+    # the optional `gpu` feature) is untouched. Acceptable tradeoff
+    # for a shipped CSR app — the console panic hook (gated behind
+    # the `debug` cargo feature) covers the development-time
+    # legibility case.
+    "-Z", "unstable-options",
+    "-C", "panic=immediate-abort",
 ]
 
 [unstable]
-build-std          = ["std", "panic_abort", "core", "alloc"]
-# Removes the panic-message formatter from libstd (panics print only
-# the file:line location, not the panic string). Acceptable tradeoff
-# for a shipped CSR app — the console panic hook (gated behind `debug`
-# feature) covers the development-time legibility case.
-build-std-features = ["panic_immediate_abort"]
+build-std = ["std", "panic_abort", "core", "alloc"]
