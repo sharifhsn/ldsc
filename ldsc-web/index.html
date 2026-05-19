@@ -16,13 +16,20 @@
          back on. -->
     <script src="coi-serviceworker.min.js"></script>
 
-    <!-- Bootstrap 5.3.x: the LDLink-look base. We don't load
-         Bootstrap's JS — Leptos owns reactivity. -->
-    <link data-trunk rel="copy-file" href="assets/bootstrap.min.css" />
-    <link rel="stylesheet" href="bootstrap.min.css">
+    <!-- chrome.css — hand-rolled minimal subset replacing the full
+         227 KB bootstrap.min.css. Same `--bs-*` token names so
+         palette.css overrides keep working. Covers exactly the
+         classes ldsc-web uses: cards, buttons, basic forms, col-sm-6
+         grid, spacing + flex + text utilities, progress bar. ~12 KB
+         raw (~3 KB gzipped on the wire). If a new component needs a
+         Bootstrap class we don't have, add it to chrome.css rather
+         than reintroducing the full bundle. -->
+    <link data-trunk rel="copy-file" href="assets/chrome.css" />
+    <link rel="stylesheet" href="chrome.css">
 
-    <!-- LDLink-derived palette overrides (~80 LOC). Loaded AFTER
-         Bootstrap so these rules win. -->
+    <!-- LDLink-derived palette overrides + custom component CSS
+         (file-row, stat-grid, perf-breakdown, mobile media-query
+         block). Loaded AFTER chrome.css so these rules win. -->
     <link data-trunk rel="copy-file" href="assets/palette.css" />
     <link rel="stylesheet" href="palette.css">
 
