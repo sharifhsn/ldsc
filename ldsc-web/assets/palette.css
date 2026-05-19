@@ -290,6 +290,75 @@ canvas.chart {
     font-size: 1.1rem;
 }
 
+/* ── Mobile / narrow-viewport adjustments ──────────────────────── */
+/* The site is desktop-first (typical LDSC user is on a workstation
+ * processing biobank-scale data), but the demo should still look
+ * presentable on a phone for screenshots / sharing. Real compute on a
+ * phone is impractical (multi-GB BED files, SAB + WASM thread limits)
+ * but the chrome should not break visually. */
+@media (max-width: 600px) {
+    /* Banner: stack the two halves and hide the non-essential
+     * right-side tagline — it collides with the project links. */
+    .project-banner > div {
+        flex-direction: column;
+        align-items: flex-start !important;
+        gap: 0.15rem;
+    }
+    .project-banner > div > span:last-child {
+        display: none;
+    }
+
+    /* NavBar: drop the version subtitle and tighten tab padding so
+     * the wordmark + L2/H2/Rg tabs don't collide. */
+    .app-nav .wordmark .v { display: none; }
+    .app-nav .nav-tab { padding: 0.85rem 0.85rem; }
+    .app-nav > div {
+        padding: 0 0.75rem !important;
+    }
+
+    /* File row: at 4rem the ".sumstats" ext label wraps to two
+     * lines. Widen the ext column (the longest label is ".sumstats"
+     * = 9 chars including the leading dot; ui-monospace is ~9-10px
+     * per char, so 6rem ≈ 96px holds it without wrap with breathing
+     * room) and drop the redundant "✓ loaded" indicator (the size
+     * column already makes it obvious). */
+    .file-row {
+        grid-template-columns: 6rem 1fr auto;
+        gap: 0.5rem;
+        padding: 0.55rem 0.7rem;
+    }
+    .file-row .ext { font-size: 0.85rem; }
+    .file-row .check { display: none; }
+    .file-row .filename { font-size: 0.825rem; }
+    .file-row .size { font-size: 0.78rem; }
+
+    /* Main padding: claw back ~16px each side for the small viewport. */
+    main { padding: 1rem 0.75rem 2rem; }
+
+    /* Card headers: smaller font + tighter padding so long titles
+     * like "L2 — LD scores from .bed/.bim/.fam" don't blow up the
+     * header height. */
+    .card-header { font-size: 0.95rem; }
+    .card-header .subtitle { display: block; margin-left: 0; margin-top: 0.15rem; }
+
+    /* Perf breakdown rows: at 375px the 3-column grid (label, bar,
+     * value) gets squeezed. Stack label above the bar+value pair. */
+    .perf-breakdown .perf-row {
+        grid-template-columns: 1fr auto;
+        grid-template-areas:
+            "label label"
+            "bar value";
+        row-gap: 0.15rem;
+    }
+    .perf-breakdown .perf-label { grid-area: label; }
+    .perf-breakdown .perf-bar-wrap { grid-area: bar; }
+    .perf-breakdown .perf-value { grid-area: value; }
+
+    /* Footer: tighten the cell spacing. */
+    .app-footer { padding: 1.25rem 0.75rem; }
+    .app-footer .footer-grid { gap: 0.9rem; }
+}
+
 /* Dark-mode comfort: invert backgrounds without losing brand cues. */
 @media (prefers-color-scheme: dark) {
     :root {
