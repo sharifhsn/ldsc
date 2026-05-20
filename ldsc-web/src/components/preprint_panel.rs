@@ -51,13 +51,22 @@ pub fn PreprintPanel() -> impl IntoView {
                 <iframe src="preprint.html"
                         class="preprint-iframe"
                         title="ldsc-rs preprint (rendered with typst.ts svg_html)"
-                        // sandbox: scripts disabled (none of our
-                        // own JS runs inside the iframe — it's a
-                        // static SVG-in-HTML doc), allow-same-origin
-                        // so anchor-link cross-refs within the
-                        // preprint can resolve and the embedded
-                        // .tsel selection styling works.
-                        sandbox="allow-same-origin"
+                        // sandbox: allow-same-origin lets in-doc
+                        // cross-refs resolve and lets the embedded
+                        // .tsel selection styling inherit. allow-
+                        // scripts is needed for the tiny ~40-LOC
+                        // drag-selection shim injected by
+                        // preprint/scripts/build_web_artifact.sh —
+                        // typst.ts svg_html puts each text run in
+                        // its own <foreignObject>, and browsers
+                        // refuse to extend a Range across that
+                        // boundary during mouse drag, so the shim
+                        // drives selection manually via
+                        // caretPositionFromPoint. The injected
+                        // script is our own and the iframe loads
+                        // a same-origin static asset (preprint.html)
+                        // — no third-party JS runs here.
+                        sandbox="allow-same-origin allow-scripts"
                         loading="lazy"></iframe>
             </div>
         </div>
