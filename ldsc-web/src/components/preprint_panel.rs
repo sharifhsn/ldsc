@@ -1,26 +1,35 @@
-//! Preprint reader — iframes the standalone HTML rendering of
-//! `preprint/main.typ` (built by `preprint/scripts/build_web_artifact.sh`
-//! and vendored at `ldsc-web/assets/preprint.html`).
+//! Preprint reader — iframes the canonical PDF directly and lets
+//! the browser's built-in PDF viewer handle rendering, selection,
+//! scrolling, zoom, and Ctrl-F search.
 //!
-//! The vendored HTML is a single self-contained doc: one big inline
-//! SVG with all 20 pages stacked, plus a `.tsel` semantic-text
-//! overlay that makes the rendered text selectable and Ctrl-F
-//! searchable in any modern browser. No JS bridge, no typst.ts
-//! renderer WASM, no dynamic imports — just an `<iframe src=...>`
-//! pointed at the pre-rendered file.
+//! Why the browser's PDF viewer instead of a custom HTML rendering?
+//! Each major browser ships a battle-tested PDF reader:
+//!   - Chrome / Edge: PDFium (Google's C++ engine, hardened by
+//!     years of fuzzing).
+//!   - Firefox: pdf.js (Mozilla's JS engine, used by hundreds of
+//!     millions of Firefox users daily).
+//!   - Safari: PDFKit (Apple's Cocoa framework, same engine as
+//!     Preview.app).
+//! Drag-selection, range-select-across-pages, copy-paste, find-on-
+//! page — all native, all rock-solid, zero JS we maintain.
 //!
-//! Architecture trade-offs (decided 2026-05-19):
-//!   - svg_html: 8.1 MB raw, 2.17 MB gzipped on the wire.
-//!   - typst.ts + vector IR alternative: 3.16 MB combined gzipped
-//!     (1 MB renderer WASM + ~2 MB IR + 83 KB JS shim), MORE
-//!     complex, MORE moving parts. We picked svg_html.
+//! An earlier iteration of this component iframed a typst.ts
+//! `svg_html` rendering (preprint.html, 8.1 MB raw / 2.17 MB
+//! gzipped) and tried to compensate for typst.ts wrapping every
+//! text run in its own SVG <foreignObject> (6,946 of them!) with
+//! a hand-rolled selection shim. The shim worked but was custom
+//! code we owned; the PDF iframe is one HTML attribute change
+//! and the selection problem disappears entirely. The PDF is the
+//! same 2 MB payload either way (it was already the download
+//! fallback under the SVG approach), so this is a strict
+//! simplification — less JS, less CSS, less surface area, more
+//! reliable selection.
 //!
-//! Mobile note: the iframe has a fixed CSS height (`--preprint-h`
-//! in palette.css, currently 80vh) and scrolls internally. iOS
-//! Safari renders the iframe lazily, so the giant SVG inside
-//! doesn't get rasterised until scrolled into the iframe's
-//! visible region — no memory-ceiling concerns at 612 × 16632
-//! page extent.
+//! The browser PDF viewer renders its own toolbar (page count,
+//! zoom, download, print) which replaces the seamless dark-themed
+//! card-body look. For a "Preprint" tab this is arguably more
+//! appropriate UX — users immediately recognise it as a paper
+//! and know how to navigate it.
 
 use leptos::prelude::*;
 
@@ -32,41 +41,33 @@ pub fn PreprintPanel() -> impl IntoView {
                 <span>
                     "Preprint — ldsc-rs: a fast Rust reimplementation of LD Score Regression"
                 </span>
-                // Download fallback. `download` attr asks the
-                // browser to save rather than navigate; the
-                // explicit filename keeps the saved file from
-                // being called the generic "preprint.pdf" if the
-                // user is bulk-downloading from multiple sources.
+                // Explicit download link with a friendlier filename
+                // than the generic "preprint.pdf". The browser PDF
+                // viewer's own toolbar also has a Save button, but
+                // some mobile browsers (iOS Safari) hide the
+                // viewer chrome and this gives users a guaranteed
+                // path to the file.
                 <a href="preprint.pdf"
                    download="ldsc-rs-preprint.pdf"
                    class="btn btn-sm btn-outline-primary"
-                   title="Download the high-fidelity PDF (2 MB)">
+                   title="Download the PDF (2 MB)">
                     "Download PDF"
                 </a>
             </div>
             // `p-0` strips the card-body's default padding so the
-            // iframe goes edge-to-edge inside the card — looks
-            // cleaner than a framed reader with extra inner gutter.
+            // iframe goes edge-to-edge inside the card.
             <div class="card-body p-0">
-                <iframe src="preprint.html"
+                // type="application/pdf" hints to the browser to
+                // use the built-in PDF plugin even if it might
+                // otherwise content-sniff. No sandbox attribute:
+                // the browser's PDF viewer is trusted code (not
+                // arbitrary HTML/JS); sandboxing it can break
+                // PDF features (link navigation, page anchors)
+                // on some browsers.
+                <iframe src="preprint.pdf"
+                        type="application/pdf"
                         class="preprint-iframe"
-                        title="ldsc-rs preprint (rendered with typst.ts svg_html)"
-                        // sandbox: allow-same-origin lets in-doc
-                        // cross-refs resolve and lets the embedded
-                        // .tsel selection styling inherit. allow-
-                        // scripts is needed for the tiny ~40-LOC
-                        // drag-selection shim injected by
-                        // preprint/scripts/build_web_artifact.sh —
-                        // typst.ts svg_html puts each text run in
-                        // its own <foreignObject>, and browsers
-                        // refuse to extend a Range across that
-                        // boundary during mouse drag, so the shim
-                        // drives selection manually via
-                        // caretPositionFromPoint. The injected
-                        // script is our own and the iframe loads
-                        // a same-origin static asset (preprint.html)
-                        // — no third-party JS runs here.
-                        sandbox="allow-same-origin allow-scripts"
+                        title="ldsc-rs preprint"
                         loading="lazy"></iframe>
             </div>
         </div>
