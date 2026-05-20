@@ -24,16 +24,406 @@ plt.rcParams.update({
 })
 
 
+def fig7_optimal_d():
+    """3-panel: wall(d|N), accuracy(d|N), h2(d|N) — optimal-d characterization."""
+    import csv
+    csv_path = Path(__file__).parent.parent / "data" / "dn_sweep_full.csv"
+    if not csv_path.exists():
+        print("  SKIP fig7: dn_sweep_full.csv missing — run /tmp/dn_analyze.py first")
+        return
+    rows = []
+    with open(csv_path) as f:
+        for r in csv.DictReader(f):
+            rows.append(r)
+
+    # Parse mode → d (mask suffix); exact-mask treated as d=∞ baseline
+    def mode_to_d(m):
+        if m == "exact-mask":
+            return None
+        # mode like "sk1600-mask" → 1600
+        s = m.removeprefix("sk").removesuffix("-mask")
+        return int(s)
+
+    by_n = {}
+    for r in rows:
+        N = int(r["N"]); d = mode_to_d(r["mode"])
+        by_n.setdefault(N, {})[d] = {
+            "wall": float(r["wall_s"]),
+            "rss": int(r["peak_rss_mb"]),
+            "r": float(r["pearson_r"]) if r["pearson_r"] not in ("", "nan") else float("nan"),
+            "h2": float(r["h2"]) if r["h2"] else float("nan"),
+            "h2_se": float(r["h2_se"]) if r["h2_se"] else float("nan"),
+        }
+
+    Ns = sorted(by_n.keys())
+    cmap = plt.get_cmap("viridis")
+    n_colors = {N: cmap(i / max(1, len(Ns) - 1)) for i, N in enumerate(Ns)}
+
+    fig, axes = plt.subplots(1, 3, figsize=(11, 3.4))
+
+    # Panel A: wall vs d
+    ax = axes[0]
+    for N in Ns:
+        cells = [(d, v["wall"]) for d, v in by_n[N].items()
+                 if d is not None]
+        if not cells:
+            continue
+        cells.sort()
+        ds, ws = zip(*cells)
+        ax.plot(ds, ws, marker="o", markersize=4, color=n_colors[N],
+                linewidth=1.0, label=f"N = {N:,}")
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlabel("Sketch dimension d")
+    ax.set_ylabel("Wall-clock time (s)")
+    ax.set_title("Time vs d", fontsize=9)
+    ax.legend(fontsize=6.5, loc="upper left", framealpha=0.9)
+    ax.grid(True, which="major", alpha=0.3, linewidth=0.4)
+    ax.grid(True, which="minor", alpha=0.15, linewidth=0.3)
+
+    # Panel B: Pearson r vs d (sketch vs exact-mask baseline at same N)
+    ax = axes[1]
+    for N in Ns:
+        cells = [(d, v["r"]) for d, v in by_n[N].items()
+                 if d is not None and not np.isnan(v["r"])]
+        if not cells:
+            continue
+        cells.sort()
+        ds, rs = zip(*cells)
+        ax.plot(ds, rs, marker="o", markersize=4, color=n_colors[N],
+                linewidth=1.0, label=f"N = {N:,}")
+    ax.set_xscale("log")
+    ax.axhline(0.999, color="gray", linestyle=":", linewidth=0.5, alpha=0.7)
+    ax.text(60, 0.9985, "r = 0.999", fontsize=6, color="gray")
+    ax.set_xlabel("Sketch dimension d")
+    ax.set_ylabel("Pearson r (sketch vs exact f32 + mask)")
+    ax.set_title("Accuracy vs d", fontsize=9)
+    ax.set_ylim(0.7, 1.005)
+    ax.grid(True, which="major", alpha=0.3, linewidth=0.4)
+
+    # Panel C: h2 vs d, normalized to exact-mask baseline at same N
+    ax = axes[2]
+    for N in Ns:
+        if None not in by_n[N]:
+            continue
+        truth_h2 = by_n[N][None]["h2"]
+        if np.isnan(truth_h2):
+            continue
+        cells = [(d, v["h2"] - truth_h2) for d, v in by_n[N].items()
+                 if d is not None and not np.isnan(v["h2"])]
+        if not cells:
+            continue
+        cells.sort()
+        ds, dh = zip(*cells)
+        ax.plot(ds, dh, marker="o", markersize=4, color=n_colors[N],
+                linewidth=1.0, label=f"N = {N:,}")
+    ax.set_xscale("log")
+    ax.axhline(0, color="gray", linestyle="-", linewidth=0.6, alpha=0.6)
+    ax.axhspan(-0.001, 0.001, color="green", alpha=0.1)
+    ax.text(60, 0.0012, "truth cluster (±0.001)",
+            fontsize=6, color="green")
+    ax.set_xlabel("Sketch dimension d")
+    ax.set_ylabel(r"$\hat{h}^2_{sketch} - \hat{h}^2_{exact}$ (BMI Yengo 2018)")
+    ax.set_title("Heritability drift vs d", fontsize=9)
+    ax.grid(True, which="major", alpha=0.3, linewidth=0.4)
+
+    for a in axes:
+        a.spines["top"].set_visible(False)
+        a.spines["right"].set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(FIGDIR / "fig7_optimal_d.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print("  fig7_optimal_d.png")
+
+
+def fig6_maf_facet():
+    """Per-SNP L2 error distribution faceted by MAF bin.
+
+    Inputs (set via env or hardcoded /tmp paths):
+      /tmp/gcta_1000G_eur.score.ld    (full-genome GCTA: SNP MAF + L2)
+      /tmp/ldsc_1000G_eur*.l2.ldscore.gz (full-genome ldsc-rs exact, per-chr)
+      /tmp/ldsc_1000G_eur_sketch200*.l2.ldscore.gz (optional sketch=200 per-chr)
+    """
+    import csv
+    gcta_path = Path("/tmp/gcta_1000G_eur.score.ld")
+    if not gcta_path.exists():
+        print("  SKIP fig6: missing GCTA output")
+        return
+
+    # Read GCTA output: SNP chr bp MAF mean_rsq snp_num max_rsq ldscore
+    gcta = {}
+    maf = {}
+    with open(gcta_path) as f:
+        next(f)  # header
+        for line in f:
+            parts = line.split()
+            if len(parts) < 8:
+                continue
+            snp = parts[0]
+            gcta[snp] = float(parts[7])
+            maf[snp] = float(parts[3])
+
+    # Read all ldsc-rs per-chr exact outputs
+    rust_exact = {}
+    for chr_idx in range(1, 23):
+        p = Path(f"/tmp/ldsc_1000G_eur{chr_idx}.l2.ldscore.gz")
+        if not p.exists():
+            continue
+        with gzip.open(p, "rt") as f:
+            next(f)
+            for line in f:
+                parts = line.strip().split("\t")
+                rust_exact[parts[1]] = float(parts[3])
+
+    if not rust_exact:
+        print("  SKIP fig6: missing ldsc-rs full-genome L2 outputs")
+        return
+
+    # Optional sketch=200 outputs
+    rust_sketch = {}
+    for chr_idx in range(1, 23):
+        p = Path(f"/tmp/ldsc_1000G_eur_sketch200_{chr_idx}.l2.ldscore.gz")
+        if not p.exists():
+            p = Path(f"/tmp/ldsc_1000G_eur_sketch200{chr_idx}.l2.ldscore.gz")
+            if not p.exists():
+                continue
+        with gzip.open(p, "rt") as f:
+            next(f)
+            for line in f:
+                parts = line.strip().split("\t")
+                rust_sketch[parts[1]] = float(parts[3])
+
+    snps_ge = sorted(set(gcta) & set(rust_exact))
+    if not snps_ge:
+        print("  SKIP fig6: no SNP overlap between GCTA + ldsc-rs")
+        return
+
+    diff_gcta_rust = np.array(
+        [gcta[s] - rust_exact[s] for s in snps_ge]
+    )
+    maf_arr = np.array([maf[s] for s in snps_ge])
+
+    bins = [(0.05, 0.10), (0.10, 0.20), (0.20, 0.35), (0.35, 0.50)]
+    bin_labels = [f"[{a:.2f}, {b:.2f})" for a, b in bins]
+
+    fig, axes = plt.subplots(1, 2 if rust_sketch else 1,
+                             figsize=(7.0, 3.2), sharey=False)
+    if not rust_sketch:
+        axes = [axes]
+
+    # Panel A: GCTA - ldsc-rs exact
+    bin_data_a = []
+    for lo, hi in bins:
+        mask = (maf_arr >= lo) & (maf_arr < hi)
+        bin_data_a.append(diff_gcta_rust[mask])
+    bp = axes[0].boxplot(bin_data_a, labels=bin_labels, showfliers=False,
+                         patch_artist=True)
+    for patch in bp["boxes"]:
+        patch.set_facecolor("#98df8a")
+    axes[0].axhline(0, color="gray", linestyle=":", linewidth=0.6)
+    axes[0].set_xlabel("MAF bin")
+    axes[0].set_ylabel("L2 difference (GCTA − ldsc-rs exact)")
+    axes[0].set_title(
+        f"(a) GCTA vs ldsc-rs exact (n = {len(snps_ge):,} SNPs)",
+        fontsize=8,
+    )
+
+    # Panel B: Rust exact - Rust sketch=200 (if available)
+    if rust_sketch:
+        snps_es = sorted(set(rust_exact) & set(rust_sketch) & set(maf))
+        diff_es = np.array(
+            [rust_exact[s] - rust_sketch[s] for s in snps_es]
+        )
+        maf_es = np.array([maf[s] for s in snps_es])
+        bin_data_b = []
+        for lo, hi in bins:
+            mask = (maf_es >= lo) & (maf_es < hi)
+            bin_data_b.append(diff_es[mask])
+        bp = axes[1].boxplot(bin_data_b, labels=bin_labels, showfliers=False,
+                             patch_artist=True)
+        for patch in bp["boxes"]:
+            patch.set_facecolor("#1f77b4")
+        axes[1].axhline(0, color="gray", linestyle=":", linewidth=0.6)
+        axes[1].set_xlabel("MAF bin")
+        axes[1].set_ylabel("L2 difference (exact − sketch d=200)")
+        axes[1].set_title(
+            f"(b) Sketch (d=200) error vs MAF (n = {len(snps_es):,})",
+            fontsize=8,
+        )
+
+    for ax in axes:
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(True, axis="y", alpha=0.25, linewidth=0.4)
+
+    fig.tight_layout()
+    fig.savefig(FIGDIR / "fig6_maf_facet.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  fig6_maf_facet.png (n_GCTA_join={len(snps_ge):,})")
+
+
+def fig5_scaling_curve():
+    """T vs N (log-log) for 4 modes, with cost-model fit."""
+    import csv
+    rows = []
+    csv_path = Path(__file__).parent.parent / "data" / "scaling_bench.csv"
+    if not csv_path.exists():
+        print("  SKIP fig5: missing scaling_bench.csv")
+        return
+    with open(csv_path) as f:
+        for r in csv.DictReader(f):
+            rows.append((int(r["N"]), r["mode"], float(r["wall_s"]),
+                         float(r["peak_rss_mb"])))
+
+    modes = ["sketch-1600-mask", "sketch-200", "sketch-1000",
+             "exact-f32", "exact-f64"]
+    labels = {"sketch-1600-mask": "sketch-1600 + mask (truth cluster)",
+              "sketch-200": "sketch-200",
+              "sketch-1000": "sketch-1000",
+              "exact-f32": "exact-f32", "exact-f64": "exact-f64"}
+    colors = {"sketch-1600-mask": "#d62728",
+              "sketch-200": "#aec7e8", "sketch-1000": "#9edae5",
+              "exact-f32": "#98df8a", "exact-f64": "#2ca02c"}
+    markers = {"sketch-1600-mask": "D",
+               "sketch-200": "o", "sketch-1000": "s",
+               "exact-f32": "^", "exact-f64": "v"}
+
+    fig, (ax_t, ax_m) = plt.subplots(1, 2, figsize=(7.2, 3.4))
+
+    # Time panel (left)
+    for mode in modes:
+        pts = [(n, w) for (n, m, w, _r) in rows if m == mode]
+        if not pts:
+            continue
+        ns, ws = zip(*sorted(pts))
+        ax_t.plot(ns, ws, color=colors[mode], marker=markers[mode],
+                  markersize=5, linewidth=1.1, label=labels[mode])
+    ax_t.set_xscale("log"); ax_t.set_yscale("log")
+    ax_t.set_xlabel("Number of individuals (N)")
+    ax_t.set_ylabel("Wall-clock time (seconds)")
+    ax_t.set_title("Time vs N", fontsize=9)
+    ax_t.legend(loc="upper left", fontsize=7, framealpha=0.9)
+    ax_t.grid(True, which="major", alpha=0.3, linewidth=0.5)
+    ax_t.grid(True, which="minor", alpha=0.15, linewidth=0.4)
+
+    # Memory panel (right)
+    for mode in modes:
+        pts = [(n, r) for (n, m, _w, r) in rows if m == mode]
+        if not pts:
+            continue
+        ns, rss = zip(*sorted(pts))
+        ax_m.plot(ns, rss, color=colors[mode], marker=markers[mode],
+                  markersize=5, linewidth=1.1, label=labels[mode])
+    ax_m.set_xscale("log"); ax_m.set_yscale("log")
+    ax_m.set_xlabel("Number of individuals (N)")
+    ax_m.set_ylabel("Peak resident set size (MB)")
+    ax_m.set_title("Memory vs N", fontsize=9)
+    ax_m.grid(True, which="major", alpha=0.3, linewidth=0.5)
+    ax_m.grid(True, which="minor", alpha=0.15, linewidth=0.4)
+
+    for ax in (ax_t, ax_m):
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(FIGDIR / "fig5_scaling_curve.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print("  fig5_scaling_curve.png")
+
+
+def fig0_architecture():
+    """Workflow / architecture diagram: data flow through ldsc-rs."""
+    from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+
+    fig, ax = plt.subplots(figsize=(6.8, 5.0))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 10)
+    ax.axis("off")
+
+    def box(x, y, w, h, text, color="#e6f0ff", edge="#1f77b4", fontsize=7.5,
+            bold=False):
+        ax.add_patch(FancyBboxPatch(
+            (x, y), w, h,
+            boxstyle="round,pad=0.04,rounding_size=0.12",
+            linewidth=0.9, facecolor=color, edgecolor=edge,
+        ))
+        weight = "bold" if bold else "normal"
+        ax.text(x + w / 2, y + h / 2, text, ha="center", va="center",
+                fontsize=fontsize, fontweight=weight)
+
+    def arrow(x0, y0, x1, y1, style="-|>", color="#333", lw=0.9, ls="-"):
+        ax.add_patch(FancyArrowPatch(
+            (x0, y0), (x1, y1),
+            arrowstyle=style, mutation_scale=10, lw=lw, color=color,
+            linestyle=ls, shrinkA=2, shrinkB=2,
+        ))
+
+    # Main vertical path (left column)
+    box(0.3, 8.7, 4.0, 0.9,
+        "PLINK BED / BIM / FAM\n(genotype + metadata)",
+        color="#fff4e6", edge="#ff7f0e", bold=True)
+    box(0.3, 7.4, 4.0, 0.9,
+        "BED decode + normalize\n(256-entry LUT, AVX2 / FMA)",
+        color="#e6f0ff", edge="#1f77b4")
+    box(0.3, 6.1, 4.0, 0.9,
+        "Ring-buffer chunked GEMM\n($B^\\top B$, $A^\\top B$ via faer)",
+        color="#e6f0ff", edge="#1f77b4")
+    box(0.3, 4.8, 4.0, 0.7,
+        "Per-chromosome parallel pool (rayon)",
+        color="#e6f0ff", edge="#1f77b4")
+    box(0.3, 3.6, 4.0, 0.8,
+        "L2 / M / M$_{5,50}$ per-chr outputs",
+        color="#e6f7e6", edge="#2ca02c", bold=True)
+    box(0.3, 1.9, 4.0, 1.2,
+        "h² / r$_g$ / partitioned h²\n(IRWLS + 200-block jackknife)",
+        color="#e6f7e6", edge="#2ca02c")
+
+    # Main-path arrows
+    for y0, y1 in [(8.7, 8.3), (7.4, 7.0), (6.1, 5.5), (4.8, 4.4), (3.6, 3.1)]:
+        arrow(2.3, y0, 2.3, y1)
+
+    # Right column: alt mode branches
+    box(5.5, 7.4, 4.2, 0.9,
+        "Alt: --sketch d\nFused CountSketch O(Nc), bypasses GEMM",
+        color="#fff4f0", edge="#d62728")
+    box(5.5, 6.1, 4.2, 0.9,
+        "Alt: --snp-level-masking\nPost-GEMM r² mask, <1% overhead",
+        color="#fff4f0", edge="#d62728")
+    box(5.5, 4.8, 4.2, 0.7,
+        "Alt: --python-compat (bit-identical)",
+        color="#fff4f0", edge="#d62728")
+
+    # Lateral arrows from main GEMM box to alt modes
+    arrow(4.3, 7.85, 5.5, 7.85, style="-|>", color="#888", lw=0.7, ls="--")
+    arrow(4.3, 6.55, 5.5, 6.55, style="-|>", color="#888", lw=0.7, ls="--")
+    arrow(4.3, 5.15, 5.5, 5.15, style="-|>", color="#888", lw=0.7, ls="--")
+
+    # Deployment row (bottom)
+    box(0.3, 0.3, 4.0, 1.0,
+        "Native CLI binary\n(musl, AVX2 / FMA, mimalloc)",
+        color="#f0f0f0", edge="#444")
+    box(5.5, 0.3, 4.2, 1.0,
+        "ldsc-web (WASM)\nsharifhsn.github.io/ldsc/\nSAB workers, hand-rolled SIMD",
+        color="#f0f0f0", edge="#444")
+    arrow(2.3, 1.9, 2.3, 1.3)
+    arrow(2.3, 1.9, 7.6, 1.3, style="-|>", color="#888", lw=0.7, ls=":")
+
+    fig.tight_layout()
+    fig.savefig(FIGDIR / "fig0_architecture.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print("  fig0_architecture.png")
+
+
 def fig1_performance_1000g():
     """Bar chart: 1000G performance comparison."""
     labels = [
-        "Python\nLDSC", "ldsc_py\n_opt", "ldsc-rs\nexact f64", "ldsc-rs\nexact f32",
+        "Python\nLDSC", "ldsc-rs\nexact f64", "ldsc-rs\nexact f32",
         "sketch\nd=50", "sketch\nd=200", "sketch\nd=500", "sketch\nd=1000",
     ]
     # AWS exact times; local sketch times (Ryzen 5 5600X)
-    times = [1548.5, 508, 41.1, 30.4, 3.7, 5.2, 8.4, 14.2]
-    speedups = ["1.0x", "~3x", "37.7x", "~51x", "~418x", "~298x", "~184x", "~109x"]
-    colors = ["#d62728", "#ff7f0e", "#2ca02c", "#98df8a", "#1f77b4", "#1f77b4", "#1f77b4", "#1f77b4"]
+    times = [1548.5, 41.1, 30.4, 3.7, 5.2, 8.4, 14.2]
+    speedups = ["1.0x", "37.7x", "~51x", "~418x", "~298x", "~184x", "~109x"]
+    colors = ["#d62728", "#2ca02c", "#98df8a", "#1f77b4", "#1f77b4", "#1f77b4", "#1f77b4"]
 
     fig, ax = plt.subplots(figsize=(6.5, 3.2))
     bars = ax.bar(range(len(labels)), times, color=colors, edgecolor="black", linewidth=0.6)
@@ -288,9 +678,13 @@ def fig4_sketch_accuracy():
 
 if __name__ == "__main__":
     print("Generating figures...")
+    fig0_architecture()
     fig1_performance_1000g()
     fig2_biobank_scaling()
     fig4_sketch_accuracy()
+    fig5_scaling_curve()
+    fig6_maf_facet()
+    fig7_optimal_d()
 
     # Fig 3 needs Python + Rust exact + sketch LD score files
     python_path = Path("/tmp/py_ld.l2.ldscore.gz")
